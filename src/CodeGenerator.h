@@ -852,7 +852,7 @@ private:
     {
         if (lit->value.find('.') == std::string::npos)
         {
-            auto* val = m_builder.getInt32(std::stoi(lit->value));
+            auto* val = m_builder.getInt32((int32_t)std::stoll(lit->value));
             return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
         }
         else

@@ -20,6 +20,7 @@ struct Token
 {
     TokenType type;
     std::string value;
+    int line;
 };
 
 class Lexer
@@ -28,9 +29,13 @@ private:
     std::string code;
     size_t pos;
     char current;
+    int line;
 
     void advance()
     {
+        if (current == '\n')
+            line++;
+        
         pos++;
         current = (pos < code.length()) ? code[pos] : '\0';
     }
@@ -75,28 +80,31 @@ private:
 
     Token readIdentifier()
     {
+        int token_line = line;
         std::string value;
         while (current && (std::isalnum(current) || current == '_'))
         {
             value += current;
             advance();
         }
-        return {TokenType_Identifier, value};
+        return {TokenType_Identifier, value, token_line};
     }
 
     Token readNumber()
     {
+        int token_line = line;
         std::string value;
         while (current && (std::isdigit(current) || current == '.'))
         {
             value += current;
             advance();
         }
-        return {TokenType_Number, value};
+        return {TokenType_Number, value, token_line};
     }
 
     Token readString()
     {
+        int token_line = line;
         char quote = current;
         std::string value;
         advance(); // skip opening quote
@@ -127,11 +135,11 @@ private:
         if (current == quote)
             advance(); // skip closing quote
 
-        return {TokenType_String, value};
+        return {TokenType_String, value, token_line};
     }
 
 public:
-    Lexer(const std::string &code) : code(code), pos(0)
+    Lexer(const std::string &code) : code(code), pos(0), line(1)
     {
         current = code.empty() ? '\0' : code[0];
     }
@@ -159,6 +167,9 @@ public:
                 continue;
             }
 
+            // Save current line for token
+            int token_line = line;
+
             // Identifiers and keywords
             if (std::isalpha(current) || current == '_')
                 return readIdentifier();
@@ -176,43 +187,45 @@ public:
             {
                 advance();
                 advance();
-                return {TokenType_Arrow, "->"};
+                return {TokenType_Arrow, "->", token_line};
             }
 
             if (current == '!' && peek() == '=')
             {
                 advance();
                 advance();
-                return {TokenType_NotEqual, "!="};
+                return {TokenType_NotEqual, "!=", token_line};
             }
 
             if (current == '=' && peek() == '=')
             {
                 advance();
                 advance();
-                return {TokenType_EqualEqual, "=="};
+                return {TokenType_EqualEqual, "==", token_line};
             }
 
             if (current == '<' && peek() == '=')
             {
                 advance();
                 advance();
-                return {TokenType_LessEqual, "<="};
+                return {TokenType_LessEqual, "<=", token_line};
             }
 
             if (current == '>' && peek() == '=')
             {
                 advance();
                 advance();
-                return {TokenType_GreaterEqual, ">="};
+                return {TokenType_GreaterEqual, ">=", token_line};
             }
 
             // Single character tokens
             char ch = current;
             advance();
-            return {(TokenType)ch, std::string(1, ch)};
+            return {(TokenType)ch, std::string(1, ch), token_line};
         }
 
-        return {TokenType_EOF, ""};
+        return {TokenType_EOF, "", line};
     }
+
+    int GetCurrentLine(void) const { return line; }
 };

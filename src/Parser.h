@@ -401,6 +401,14 @@ public:
                 member->member = m_last.value;
                 expr = std::move(member);
             }
+            else if (Match(TokenType_Arrow))
+            {
+                auto member = std::make_unique<PointerMemberAccess>();
+                member->object = std::move(expr);
+                Expect(TokenType_Identifier, "Expected member name");
+                member->member = m_last.value;
+                expr = std::move(member);
+            }
             else if (Match('('))
             {
                 if (auto* ident = dynamic_cast<Identifier*>(expr.get()))
@@ -838,7 +846,7 @@ private:
     void Expect(int type, const std::string& msg)
     {
         if (!Match(type))
-            throw std::runtime_error(msg);
+            throw std::runtime_error(msg + " on line " + std::to_string(m_lexer.GetCurrentLine()));
     }
 
     Lexer& m_lexer;
