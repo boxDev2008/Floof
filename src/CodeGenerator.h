@@ -1356,7 +1356,9 @@ private:
     {
         if (node->is_function_type)
         {
-            TypeInfo returnType = ResolveType(node->return_type.get());
+            TypeInfo returnType = node->return_type ?
+                ResolveType(node->return_type.get()) :
+                TypeInfo(Type::getVoidTy(m_context), false);
             
             std::vector<Type*> paramLLVMTypes;
             for (const auto& paramType : node->param_types)

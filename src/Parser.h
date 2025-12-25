@@ -302,9 +302,9 @@ public:
             }
             
             Expect(')', "Expected ')'");
-            Expect(TokenType_Arrow, "Expected '->' in function type");
 
-            type->return_type = ParseType();
+            if (Match(TokenType_Arrow))
+                type->return_type = ParseType();
             
             return type;
         }
