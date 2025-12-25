@@ -180,17 +180,242 @@ private:
     {
         for (const auto& decl : ast.globals)
         {
-            TypeInfo type = ResolveType(decl->type.get());
-            Constant* initializer = decl->init 
-                ? CreateConstant(decl->init.get(), type)
-                : Constant::getNullValue(type.llvmType);
+            TypeInfo type;
+            Constant* initializer = nullptr;
+            
+            if (decl->type)
+            {
+                // Explicit type provided
+                type = ResolveType(decl->type.get());
+                if (decl->init)
+                {
+                    TypedValue initValue = EvaluateConstantExpr(decl->init.get(), &type);
+                    initializer = cast<Constant>(initValue.value);
+                }
+                else
+                    initializer = Constant::getNullValue(type.llvmType);
+            }
+            else if (decl->init)
+            {
+                // Infer type from initializer
+                TypedValue initValue = EvaluateConstantExpr(decl->init.get());
+                type = initValue.type;
+                initializer = cast<Constant>(initValue.value);
+            }
+            else
+                throw std::runtime_error("Global variable '" + decl->name + 
+                    "' must have either a type or an initializer");
             
             auto linkage = decl->is_pub ? GlobalValue::ExternalLinkage : GlobalValue::InternalLinkage;
             auto* globalVar = new GlobalVariable(
-                *m_module, type.llvmType, decl->type->is_const, linkage, initializer, decl->name
+                *m_module, type.llvmType, decl->type ? decl->type->is_const : false, 
+                linkage, initializer, decl->name
             );
             m_globals[decl->name] = {type, globalVar};
         }
+    }
+
+    TypedValue EvaluateConstantExpr(ExprNode* node, const TypeInfo* expectedType = nullptr)
+    {
+        if (auto* num = dynamic_cast<NumberLiteral*>(node))
+        {
+            TypedValue result = EvaluateNumberLiteral(num);
+            if (expectedType && result.type != *expectedType)
+            {
+                Constant* constValue = llvm::cast<Constant>(result.value);
+                return TypedValue(ConstantCast(constValue, result.type, *expectedType), *expectedType);
+            }
+            return result;
+        }
+        
+        if (auto* str = dynamic_cast<::StringLiteral*>(node))
+        {
+            auto* strGlobal = m_builder.CreateGlobalString(str->value, ".str", 0, m_module.get());
+            std::vector<Constant*> indices = {
+                m_builder.getInt64(0),
+                m_builder.getInt64(0)
+            };
+            auto* strPtr = ConstantExpr::getInBoundsGetElementPtr(
+                strGlobal->getValueType(),
+                strGlobal,
+                indices
+            );
+            return TypedValue(strPtr, TypeInfo(m_builder.getInt8PtrTy(), false, m_builder.getInt8Ty()));
+        }
+        
+        if (auto* cast = dynamic_cast<CastExpr*>(node))
+        {
+            TypedValue operand = EvaluateConstantExpr(cast->operand.get());
+            TypeInfo targetType = ResolveType(cast->target_type.get());
+            
+            Constant* constOperand = llvm::cast<Constant>(operand.value);
+            Constant* result = ConstantCast(constOperand, operand.type, targetType);
+            
+            return TypedValue(result, targetType);
+        }
+
+        if (auto* unary = dynamic_cast<UnaryExpr*>(node))
+        {
+            if (unary->op == '-')
+            {
+                TypedValue operand = EvaluateConstantExpr(unary->operand.get());
+                Constant* constOperand = llvm::cast<Constant>(operand.value);
+                
+                Constant* result = operand.type.llvmType->isFloatingPointTy()
+                    ? ConstantExpr::getFNeg(constOperand)
+                    : ConstantExpr::getNeg(constOperand);
+                
+                TypedValue negated(result, operand.type);
+                
+                if (expectedType && negated.type != *expectedType)
+                {
+                    result = ConstantCast(result, operand.type, *expectedType);
+                    return TypedValue(result, *expectedType);
+                }
+                
+                return negated;
+            }
+            throw std::runtime_error("Unsupported unary operator in constant expression");
+        }
+        
+        if (auto* arrInit = dynamic_cast<ArrayInit*>(node))
+        {
+            TypeInfo elemType;
+            size_t arraySize;
+            
+            if (expectedType && expectedType->llvmType->isArrayTy())
+            {
+                auto* arrayType = cast<ArrayType>(expectedType->llvmType);
+                elemType = TypeInfo(arrayType->getElementType(), expectedType->isUnsigned);
+                arraySize = arrayType->getNumElements();
+            }
+            else
+            {
+                if (arrInit->elements.empty())
+                    throw std::runtime_error("Cannot infer array type from empty initializer");
+                
+                elemType = EvaluateConstantExpr(arrInit->elements[0].get()).type;
+                
+                for (size_t i = 1; i < arrInit->elements.size(); i++)
+                    elemType = PromoteToCommonType(elemType, EvaluateConstantExpr(arrInit->elements[i].get()).type);
+                
+                arraySize = arrInit->elements.size();
+            }
+            
+            auto* arrayType = ArrayType::get(elemType.llvmType, arraySize);
+            std::vector<Constant*> elements;
+            for (size_t i = 0; i < arraySize; i++)
+            {
+                if (i < arrInit->elements.size())
+                {
+                    auto constVal = EvaluateConstantExpr(arrInit->elements[i].get(), &elemType);
+                    elements.push_back(llvm::cast<Constant>(constVal.value));
+                }
+                else
+                {
+                    elements.push_back(Constant::getNullValue(elemType.llvmType));
+                }
+            }
+            
+            return TypedValue(ConstantArray::get(arrayType, elements), 
+                            TypeInfo(arrayType, elemType.isUnsigned));
+        }
+        
+        if (auto* structInit = dynamic_cast<StructInit*>(node))
+        {
+            auto it = m_structs.find(structInit->type_name);
+            if (it == m_structs.end())
+                throw std::runtime_error("Unknown struct: " + structInit->type_name);
+            
+            const StructInfo& info = it->second;
+            std::vector<Constant*> fieldValues;
+            
+            for (unsigned i = 0; i < info.fieldIndices.size(); i++)
+            {
+                const TypeInfo* fieldType = FindFieldTypeAtIndex(info, i);
+                if (i < structInit->fields.size())
+                {
+                    auto constVal = EvaluateConstantExpr(structInit->fields[i].get(), fieldType);
+                    fieldValues.push_back(llvm::cast<Constant>(constVal.value));
+                }
+                else
+                {
+                    fieldValues.push_back(Constant::getNullValue(fieldType->llvmType));
+                }
+            }
+            
+            return TypedValue(ConstantStruct::get(info.type, fieldValues), 
+                            TypeInfo(info.type, false));
+        }
+        
+        throw std::runtime_error("Invalid constant expression for global variable");
+    }
+
+    Constant* ConstantCast(Constant* value, const TypeInfo& fromType, const TypeInfo& toType)
+    {
+        if (fromType == toType)
+            return value;
+        
+        Type* fromLLVMType = fromType.llvmType;
+        Type* toLLVMType = toType.llvmType;
+        
+        // Pointer to Pointer
+        if (fromLLVMType->isPointerTy() && toLLVMType->isPointerTy())
+        {
+            if (fromType.pointeeType == toType.pointeeType)
+                return value;
+            return ConstantExpr::getBitCast(value, toLLVMType);
+        }
+        
+        // Integer to Integer
+        if (fromLLVMType->isIntegerTy() && toLLVMType->isIntegerTy())
+        {
+            unsigned fromBits = fromLLVMType->getIntegerBitWidth();
+            unsigned toBits = toLLVMType->getIntegerBitWidth();
+            
+            if (fromBits < toBits)
+            {
+                return (fromBits == 1 || fromType.isUnsigned)
+                    ? ConstantExpr::getZExt(value, toLLVMType)
+                    : ConstantExpr::getSExt(value, toLLVMType);
+            }
+            else if (fromBits > toBits)
+            {
+                return ConstantExpr::getTrunc(value, toLLVMType);
+            }
+            return value;
+        }
+        
+        // Float to Float
+        if (fromLLVMType->isFloatingPointTy() && toLLVMType->isFloatingPointTy())
+        {
+            unsigned fromBits = fromLLVMType->getPrimitiveSizeInBits();
+            unsigned toBits = toLLVMType->getPrimitiveSizeInBits();
+            
+            if (fromBits < toBits)
+                return ConstantExpr::getFPExtend(value, toLLVMType);
+            else if (fromBits > toBits)
+                return ConstantExpr::getFPTrunc(value, toLLVMType);
+            return value;
+        }
+        
+        // Integer to Float
+        if (fromLLVMType->isIntegerTy() && toLLVMType->isFloatingPointTy())
+        {
+            return (fromLLVMType->isIntegerTy(1) || fromType.isUnsigned)
+                ? ConstantExpr::getUIToFP(value, toLLVMType)
+                : ConstantExpr::getSIToFP(value, toLLVMType);
+        }
+        
+        // Float to Integer
+        if (fromLLVMType->isFloatingPointTy() && toLLVMType->isIntegerTy())
+        {
+            return toType.isUnsigned
+                ? ConstantExpr::getFPToUI(value, toLLVMType)
+                : ConstantExpr::getFPToSI(value, toLLVMType);
+        }
+        
+        throw std::runtime_error("Cannot cast between incompatible types in constant expression");
     }
     
     void RegisterBuiltinFunctions()
