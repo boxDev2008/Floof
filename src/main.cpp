@@ -12,6 +12,8 @@
 
 #ifdef _WIN32
 #include <windows.h>
+#else
+#include <sys/wait.h>
 #endif
 
 namespace fs = std::filesystem;
@@ -322,7 +324,19 @@ public:
     " && ./" + config.projectName;
 #endif
 
-        int exitCode = system(command.c_str());
+    int status = system(command.c_str());
+    
+    int exitCode;
+    #ifdef _WIN32
+        exitCode = status;
+    #else
+        if (WIFEXITED(status))
+            exitCode = WEXITSTATUS(status);
+        else if (WIFSIGNALED(status))
+            exitCode = 128 + WTERMSIG(status);
+        else
+            exitCode = status;
+    #endif
 
         std::cout << "\n"
                   << Color::DIM << "─────────────────────────────────────"
