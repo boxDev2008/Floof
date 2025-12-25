@@ -1,0 +1,8 @@
+bin
+obj
+*.sln
+*.filters
+*.vcxproj
+*.vcxproj.filters
+Makefile
+GNUmakefile

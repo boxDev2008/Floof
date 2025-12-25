@@ -1,0 +1,23 @@
+{
+  "name": "floof-lang-syntax",
+  "displayName": "Floof Language Syntax",
+  "description": "Syntax highlighting for floof language",
+  "version": "0.0.1",
+  "engines": {
+    "vscode": "^1.60.0"
+  },
+  "categories": ["Programming Languages"],
+  "contributes": {
+    "languages": [{
+      "id": "flooflang",
+      "aliases": ["FloofLang", "flooflang"],
+      "extensions": [".floof"],
+      "configuration": "./language-configuration.json"
+    }],
+    "grammars": [{
+      "language": "flooflang",
+      "scopeName": "source.flooflang",
+      "path": "./syntaxes/flooflang.tmLanguage.json"
+    }]
+  }
+}
