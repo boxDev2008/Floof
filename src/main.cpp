@@ -347,11 +347,13 @@ int main(int argc, char **argv)
             std::cerr << Color::BOLD << "Commands:\n"
                       << Color::RESET;
             std::cerr << Color::CYAN << "  new" << Color::RESET
-                      << "    - Create a new Floof project\n";
+                      << "       - Create a new Floof project\n";
             std::cerr << Color::CYAN << "  build" << Color::RESET
-                      << "  - Build the project\n";
+                      << "     - Build the project\n";
             std::cerr << Color::CYAN << "  run" << Color::RESET
-                      << "    - Run the compiled project\n";
+                      << "       - Run the compiled project\n";
+            std::cerr << Color::CYAN << "  buildrun" << Color::RESET
+                      << "  - Build and run the project\n";
             return 1;
         }
 
@@ -365,6 +367,11 @@ int main(int argc, char **argv)
             builder.buildProject(projectPath);
         else if (command == "run")
             builder.runProject(projectPath);
+        else if (command == "buildrun")
+        {
+            builder.buildProject(projectPath);
+            builder.runProject(projectPath);
+        }
         else
         {
             std::cerr << Color::RED << "✗ Error: " << Color::RESET
@@ -373,7 +380,8 @@ int main(int argc, char **argv)
             std::cerr << Color::BOLD << "Available commands: " << Color::RESET
                       << Color::CYAN << "new" << Color::RESET << ", "
                       << Color::CYAN << "build" << Color::RESET << ", "
-                      << Color::CYAN << "run" << Color::RESET << "\n";
+                      << Color::CYAN << "run" << Color::RESET << ", "
+                      << Color::CYAN << "buildrun" << Color::RESET << "\n";
             return 1;
         }
     }
