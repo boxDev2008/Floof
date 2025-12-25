@@ -15,6 +15,10 @@ struct TypeNode : ASTNode {
     int pointer_depth = 0;
     bool is_const = false;
     std::vector<int> array_dimensions;
+
+    bool is_function_type = false;
+    std::unique_ptr<TypeNode> return_type;
+    std::vector<std::unique_ptr<TypeNode>> param_types;
 };
 
 struct ExprNode : ASTNode {
@@ -203,8 +207,8 @@ public:
             // Global declarations
             else if (Check(TokenType_Identifier))
             {
-                const bool is_extern = Match("extern");
                 const bool is_pub = Match("pub");
+                const bool is_extern = Match("extern");
 
                 if (Match("proc"))
                 {
@@ -228,7 +232,7 @@ public:
                         
                         var->is_pub = is_pub;
 
-                        if (Check(TokenType_Identifier))
+                        if (Check(TokenType_Identifier) || Check('('))
                             var->type = ParseType();
                         
                         if (Match('='))
@@ -265,23 +269,70 @@ public:
     std::unique_ptr<TypeNode> ParseType(void)
     {
         std::unique_ptr<TypeNode> type = std::make_unique<TypeNode>();
-    
+        
         if (Match("const"))
             type->is_const = true;
+        
+        if (Check('('))
+        {
+            type->is_function_type = true;
+            
+            Expect('(', "Expected '('");
+            
+            if (!Check(')'))
+            {
+                do {
+                    if (Check(TokenType_Identifier))
+                    {
+                        Advance();
+                        if (Match(':'))
+                        {
+                            type->param_types.push_back(ParseType());
+                        }
+                        else
+                        {
+                            throw std::runtime_error("Expected ':' after parameter name in function type");
+                        }
+                    }
+                    else
+                    {
+                        type->param_types.push_back(ParseType());
+                    }
+                } while (Match(','));
+            }
+            
+            Expect(')', "Expected ')'");
+            Expect(TokenType_Arrow, "Expected '->' in function type");
 
-        Expect(TokenType_Identifier, "Expected type name");
-        type->name = m_last.value;
-
+            type->return_type = ParseType();
+            
+            return type;
+        }
+        
+        // Regular type parsing
+        if (Check(TokenType_Identifier))
+        {
+            type->name = m_current.value;
+            Advance();
+        }
+        else
+        {
+            Expect(TokenType_Identifier, "Expected type name");
+            type->name = m_last.value;
+        }
+        
+        // Parse pointer depth
         while (Match('*'))
             type->pointer_depth++;
-
+        
+        // Parse array dimensions
         while (Match('['))
         {
             Expect(TokenType_Number, "Expected array size");
             type->array_dimensions.push_back(std::stoi(m_last.value));
             Expect(']', "Expected ']'");
         }
-    
+        
         return type;
     }
 
@@ -547,7 +598,7 @@ public:
         Expect(':', "Expected ':' after variable name");
         
         // Type
-        if (Check(TokenType_Identifier))
+        if (Check(TokenType_Identifier) || Check('('))  // Added Check('(')
             var->type = ParseType();
         
         // Optional initializer
@@ -659,7 +710,7 @@ public:
                 
                 Expect(':', "Expected ':'");
                 
-                if (Check(TokenType_Identifier))
+                if (Check(TokenType_Identifier) || Check('('))
                     var->type = ParseType();
                 
                 if (Match('='))

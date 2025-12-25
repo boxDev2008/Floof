@@ -49,12 +49,10 @@ class CodeGenerator
     struct Variable
     {
         TypeInfo type;
-        TypedValue initValue;
         Value* storage;  // alloca or global
 
         Variable() = default;
         Variable(const TypeInfo& t, Value* s) : type(t), storage(s) {}
-        Variable(const TypeInfo& t, Value* s, const TypedValue &init) : type(t), storage(s), initValue(init) {}
     };
 
     struct StructInfo
@@ -100,7 +98,7 @@ public:
         DeclareUserFunctions(ast);
         DefineUserFunctionBodies(ast);
         
-        //m_module->print(llvm::outs(), nullptr);
+        m_module->print(llvm::outs(), nullptr);
     }
 
     std::unique_ptr<Module> GetModule() { return std::move(m_module); }
@@ -392,6 +390,18 @@ private:
             uint64_t size = m_module->getDataLayout().getTypeAllocSize(type.llvmType);
             return TypedValue(m_builder.getInt64(size), TypeInfo(m_builder.getInt64Ty(), true));
         }
+
+        if (auto* id = dynamic_cast<Identifier*>(node))
+        {
+            auto funcIt = m_functions.find(id->name);
+            if (funcIt != m_functions.end())
+            {
+                Function* func = funcIt->second.function;
+                return TypedValue(func, TypeInfo(func->getType(), false, func->getFunctionType()));
+            }
+            
+            throw std::runtime_error("Cannot use variable in constant expression: " + id->name);
+        }
         
         throw std::runtime_error("Invalid constant expression for global variable");
     }
@@ -459,6 +469,14 @@ private:
                 ? ConstantExpr::getFPToUI(value, toLLVMType)
                 : ConstantExpr::getFPToSI(value, toLLVMType);
         }
+
+        // Integer to Pointer
+        if (fromLLVMType->isIntegerTy() && toLLVMType->isPointerTy())
+            return ConstantExpr::getIntToPtr(value, toLLVMType);
+
+        // Pointer to Integer  
+        if (fromLLVMType->isPointerTy() && toLLVMType->isIntegerTy())
+            return ConstantExpr::getPtrToInt(value, toLLVMType);
         
         throw std::runtime_error("Cannot cast between incompatible types in constant expression");
     }
@@ -479,34 +497,6 @@ private:
             {TypeInfo(m_builder.getInt8PtrTy(), false)},
             TypeInfo(m_builder.getInt32Ty(), false),
             true  // isVarArg
-        );
-
-        auto* mallocFunc = Function::Create(
-                FunctionType::get(
-                m_builder.getPtrTy(),
-                {m_builder.getInt64Ty()},
-                false
-            ),
-            Function::ExternalLinkage, "malloc", m_module.get()
-        );
-        m_functions["malloc"] = FunctionInfo(
-            mallocFunc,
-            {TypeInfo(m_builder.getInt64Ty(), false)},
-            TypeInfo(m_builder.getPtrTy(), false)
-        );
-
-        auto* freeFunc = Function::Create(
-                FunctionType::get(
-                m_builder.getVoidTy(),
-                {m_builder.getPtrTy()},
-                false
-            ),
-            Function::ExternalLinkage, "free", m_module.get()
-        );
-        m_functions["free"] = FunctionInfo(
-            freeFunc,
-            {TypeInfo(m_builder.getPtrTy(), false)},
-            TypeInfo(m_builder.getVoidTy(), false)
         );
     }
 
@@ -575,28 +565,23 @@ private:
             return;
 
         TypeInfo type;
-        TypedValue initValue;
         
         if (decl->type)
         {
             type = ResolveType(decl->type.get());
-            if (decl->init)
-            {
-                initValue = EvaluateRValue(decl->init.get(), &type);
-                if (initValue.type != type)
-                    initValue = CastValue(initValue, type);
-            }
         }
         else if (decl->init)
         {
-            initValue = EvaluateRValue(decl->init.get());
+            // For type inference, we need to evaluate the init
+            // But we should do this carefully to avoid side effects
+            TypedValue initValue = EvaluateRValue(decl->init.get());
             type = initValue.type;
         }
         else
             throw std::runtime_error("Variable '" + decl->name + "' must have either a type or an initializer");
         
         auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, decl->name);
-        m_locals[decl->name] = Variable(type, alloca, initValue);
+        m_locals[decl->name] = Variable(type, alloca);
     }
 
     void GenerateHostingAllocs(BlockStmt* block)
@@ -647,10 +632,14 @@ private:
 
     void GenerateVarDecl(VarDecl* decl)
     {
+        Variable& variable = m_locals[decl->name];
+        
         if (decl->init)
         {
-            const Variable &variable = m_locals[decl->name];
-            m_builder.CreateStore(variable.initValue.value, variable.storage);
+            TypedValue initValue = EvaluateRValue(decl->init.get(), &variable.type);
+            if (initValue.type != variable.type)
+                initValue = CastValue(initValue, variable.type);
+            m_builder.CreateStore(initValue.value, variable.storage);
         }
     }
 
@@ -829,6 +818,13 @@ private:
     {
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
+            auto funcIt = m_functions.find(id->name);
+            if (funcIt != m_functions.end())
+            {
+                Function* func = funcIt->second.function;
+                return TypedValue(func, TypeInfo(func->getType(), false, func->getFunctionType()));
+            }
+            
             Variable var = LookupVariable(id->name);
             return TypedValue(m_builder.CreateLoad(var.type.llvmType, var.storage), var.type);
         }
@@ -925,43 +921,89 @@ private:
 
     TypedValue EvaluateFunctionCall(CallExpr* call)
     {
+        // First check if it's a direct function call
         auto it = m_functions.find(call->function);
-        if (it == m_functions.end())
-            throw std::runtime_error("Unknown function: " + call->function);
-        
-        const FunctionInfo& func = it->second;
-        
-        // For vararg functions, check minimum argument count
-        // For normal functions, check exact argument count
-        if (func.isVarArg)
+        if (it != m_functions.end())
         {
-            if (call->args.size() < func.paramTypes.size())
-                throw std::runtime_error("Too few arguments for " + call->function);
-        }
-        else
-        {
-            if (call->args.size() != func.paramTypes.size())
-                throw std::runtime_error("Argument count mismatch for " + call->function);
-        }
-        
-        std::vector<Value*> args;
-        for (size_t i = 0; i < call->args.size(); i++)
-        {
-            TypedValue arg = EvaluateRValue(call->args[i].get());
+            const FunctionInfo& func = it->second;
             
-            // Only cast if we're within the fixed parameters range
-            if (i < func.paramTypes.size())
+            if (func.isVarArg)
             {
-                if (arg.type != func.paramTypes[i])
-                    arg = CastValue(arg, func.paramTypes[i]);
+                if (call->args.size() < func.paramTypes.size())
+                    throw std::runtime_error("Too few arguments for " + call->function);
             }
-            // For vararg arguments, they're passed as-is
+            else
+            {
+                if (call->args.size() != func.paramTypes.size())
+                    throw std::runtime_error("Argument count mismatch for " + call->function);
+            }
             
-            args.push_back(arg.value);
+            std::vector<Value*> args;
+            for (size_t i = 0; i < call->args.size(); i++)
+            {
+                TypedValue arg = EvaluateRValue(call->args[i].get());
+                
+                if (i < func.paramTypes.size())
+                {
+                    if (arg.type != func.paramTypes[i])
+                        arg = CastValue(arg, func.paramTypes[i]);
+                }
+                
+                args.push_back(arg.value);
+            }
+            
+            auto* result = m_builder.CreateCall(func.function, args);
+            return TypedValue(result, func.returnType);
         }
         
-        auto* result = m_builder.CreateCall(func.function, args);
-        return TypedValue(result, func.returnType);
+        // It might be a function pointer variable
+        auto varIt = m_locals.find(call->function);
+        if (varIt == m_locals.end())
+            varIt = m_globals.find(call->function);
+        
+        if (varIt != m_globals.end())
+        {
+            Variable& var = varIt->second;
+            
+            // Load the function pointer
+            Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
+            
+            // Get the function type
+            if (!var.type.pointeeType || !var.type.pointeeType->isFunctionTy())
+                throw std::runtime_error(call->function + " is not a function pointer");
+            
+            FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
+            
+            // Check argument count
+            if (call->args.size() != funcType->getNumParams())
+                throw std::runtime_error("Argument count mismatch for function pointer call");
+            
+            // Evaluate and cast arguments
+            std::vector<Value*> args;
+            for (size_t i = 0; i < call->args.size(); i++)
+            {
+                TypedValue arg = EvaluateRValue(call->args[i].get());
+                Type* expectedType = funcType->getParamType(i);
+                
+                if (arg.type.llvmType != expectedType)
+                {
+                    // Determine if parameter type is unsigned
+                    bool isUnsigned = false;  // You may need better heuristics
+                    arg = CastValue(arg, TypeInfo(expectedType, isUnsigned));
+                }
+                
+                args.push_back(arg.value);
+            }
+            
+            // Create indirect call
+            auto* result = m_builder.CreateCall(funcType, funcPtr, args);
+            
+            // Determine return type signedness (may need enhancement)
+            bool isUnsigned = false;
+            return TypedValue(result, TypeInfo(funcType->getReturnType(), isUnsigned));
+        }
+        
+        throw std::runtime_error("Unknown function: " + call->function);
     }
 
     TypedValue EvaluateArrayAccess(ArrayAccess* access)
@@ -1312,27 +1354,66 @@ private:
     
     TypeInfo ResolveType(TypeNode* node)
     {
+        if (node->is_function_type)
+        {
+            TypeInfo returnType = ResolveType(node->return_type.get());
+            
+            std::vector<Type*> paramLLVMTypes;
+            for (const auto& paramType : node->param_types)
+            {
+                TypeInfo paramInfo = ResolveType(paramType.get());
+                paramLLVMTypes.push_back(paramInfo.llvmType);
+            }
+            
+            auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, false);
+            auto* funcPtrType = m_builder.getPtrTy();
+            
+            return TypeInfo(funcPtrType, false, funcType);
+        }
+        
         if (!node->array_dimensions.empty())
         {
-            TypeInfo baseType = ResolveBaseType(node);
+            TypeInfo baseType = ResolveSimpleType(node);
             Type* type = baseType.llvmType;
             for (size_t dim : node->array_dimensions)
                 type = ArrayType::get(type, dim);
             return TypeInfo(type, baseType.isUnsigned);
         }
-        return ResolveBaseType(node);
+        
+        return ResolveSimpleType(node);
     }
 
-    TypeInfo ResolveBaseType(TypeNode* node)
+    // Resolves a type including pointer depth
+    TypeInfo ResolveSimpleType(TypeNode* node)
     {
-        if (node->pointer_depth)
+        // Get the base type (without pointers)
+        Type* baseType = nullptr;
+        bool isUnsigned = false;
+        
+        // Try builtin types first
+        baseType = GetBuiltinType(node->name, isUnsigned);
+        
+        // Try struct types
+        if (!baseType)
         {
-            TypeNode temp = *node;
-            temp.pointer_depth = 0;
-            TypeInfo pointeeType = ResolveBaseType(&temp);
-            return TypeInfo(m_builder.getPtrTy(), false, pointeeType.llvmType);
+            auto structIt = m_structs.find(node->name);
+            if (structIt != m_structs.end())
+                baseType = structIt->second.type;
         }
         
+        if (!baseType)
+            throw std::runtime_error("Unknown type: " + node->name);
+        
+        // Apply pointer depth
+        if (node->pointer_depth > 0)
+            return TypeInfo(m_builder.getPtrTy(), false, baseType);
+        
+        return TypeInfo(baseType, isUnsigned);
+    }
+
+    // Helper to get builtin type - returns nullptr if not found
+    Type* GetBuiltinType(const std::string& name, bool& outIsUnsigned)
+    {
         static const std::unordered_map<std::string, std::function<Type*(IRBuilder<>&)>> typeMap = {
             {"u0", [](auto& b) { return b.getVoidTy(); }},
             {"bool", [](auto& b) { return b.getInt1Ty(); }},
@@ -1350,18 +1431,15 @@ private:
             {"f64", [](auto& b) { return b.getDoubleTy(); }}
         };
         
-        auto it = typeMap.find(node->name);
+        auto it = typeMap.find(name);
         if (it != typeMap.end())
         {
-            bool isUnsigned = node->name[0] == 'u' && node->name != "u0";
-            return TypeInfo(it->second(m_builder), isUnsigned);
+            outIsUnsigned = (name[0] == 'u' && name != "u0");
+            return it->second(m_builder);
         }
         
-        auto structIt = m_structs.find(node->name);
-        if (structIt != m_structs.end())
-            return TypeInfo(structIt->second.type, false);
-        
-        throw std::runtime_error("Unknown type: " + node->name);
+        outIsUnsigned = false;
+        return nullptr;
     }
     
     TypedValue CastValue(TypedValue value, TypeInfo targetType)
@@ -1432,6 +1510,14 @@ private:
                 : m_builder.CreateFPToSI(value.value, toType);
             return TypedValue(result, targetType);
         }
+
+        // Integer to Pointer
+        if (fromType->isIntegerTy() && toType->isPointerTy())
+            return TypedValue(m_builder.CreateIntToPtr(value.value, toType), targetType);
+
+        // Pointer to Integer
+        if (fromType->isPointerTy() && toType->isIntegerTy())
+            return TypedValue(m_builder.CreatePtrToInt(value.value, toType), targetType);
         
         throw std::runtime_error("Cannot cast between incompatible types");
     }
@@ -1463,6 +1549,12 @@ private:
             
             return (leftBits > rightBits) ? left : right;
         }
+
+        // Pointer and Integer - promote integer to pointer type
+        if (leftType->isPointerTy() && rightType->isIntegerTy())
+            return left;
+        if (leftType->isIntegerTy() && rightType->isPointerTy())
+            return right;
         
         return left;
     }
