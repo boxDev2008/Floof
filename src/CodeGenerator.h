@@ -98,7 +98,7 @@ public:
         DeclareUserFunctions(ast);
         DefineUserFunctionBodies(ast);
         
-        m_module->print(llvm::outs(), nullptr);
+        //m_module->print(llvm::outs(), nullptr);
     }
 
     std::unique_ptr<Module> GetModule() { return std::move(m_module); }
