@@ -97,14 +97,15 @@ public:
         RegisterStructs(ast);
         DeclareGlobalVariables(ast);
         RegisterBuiltinFunctions();
-        DefineUserFunctions(ast);
+        DeclareUserFunctions(ast);
+        DefineUserFunctionBodies(ast);
         
         //m_module->print(llvm::outs(), nullptr);
     }
 
     std::unique_ptr<Module> GetModule() { return std::move(m_module); }
 
-private:    
+private:
     void ImportUsedModules(const ModuleAST& ast, std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable)
     {
         for (const auto& use : ast.usings)
@@ -146,6 +147,33 @@ private:
         {
             if (!proc->is_pub) continue;
             DeclareFunction(proc.get(), GlobalValue::ExternalLinkage);
+        }
+    }
+
+    void DeclareUserFunctions(const ModuleAST& ast)
+    {
+        for (const auto& proc : ast.procs)
+        {
+            auto linkage = (proc->is_pub || proc->is_extern) 
+                ? Function::ExternalLinkage 
+                : Function::InternalLinkage;
+            
+            DeclareFunction(proc.get(), linkage);
+        }
+    }
+
+    void DefineUserFunctionBodies(const ModuleAST& ast)
+    {
+        for (const auto& proc : ast.procs)
+        {
+            if (!proc->is_extern)
+            {
+                auto it = m_functions.find(proc->name);
+                if (it == m_functions.end())
+                    throw std::runtime_error("Function not declared: " + proc->name);
+                
+                DefineFunctionBody(proc.get(), it->second);
+            }
         }
     }
     
@@ -463,21 +491,6 @@ private:
             {TypeInfo(m_builder.getPtrTy(), false)},
             TypeInfo(m_builder.getVoidTy(), false)
         );
-    }
-
-    void DefineUserFunctions(const ModuleAST& ast)
-    {
-        for (const auto& proc : ast.procs)
-        {
-            auto linkage = (proc->is_pub || proc->is_extern) 
-                ? Function::ExternalLinkage 
-                : Function::InternalLinkage;
-            
-            FunctionInfo funcInfo = DeclareFunction(proc.get(), linkage);
-            
-            if (!proc->is_extern)
-                DefineFunctionBody(proc.get(), funcInfo);
-        }
     }
 
     FunctionInfo DeclareFunction(const ProcDecl* proc, GlobalValue::LinkageTypes linkage)
