@@ -217,8 +217,12 @@ private:
     void linkObjects(const std::string &objectFiles, const BuildConfig &config)
     {
         std::cout << Color::DIM << "  └─ " << Color::RESET << "Linking...\n";
+        std::string executableName = config.projectName;
+#ifdef _WIN32
+        executableName += ".exe";
+#endif
 
-        std::string outputPath = (projectDir / "build" / (config.projectName + ".exe")).string();
+        std::string outputPath = (projectDir / "build" / executableName).string();
         std::string command = "clang -o " + outputPath + " " + objectFiles;
 
         if (config.isDebug)
@@ -312,7 +316,11 @@ public:
                   << Color::RESET << "\n\n";
 
         std::string command = "cd " + (projectDir / "build").string() +
-                              " && .\\" + config.projectName;
+#ifdef _WIN32
+    " && .\\" + config.projectName;
+#else
+    " && ./" + config.projectName;
+#endif
 
         int exitCode = system(command.c_str());
 

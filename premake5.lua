@@ -3,13 +3,6 @@ workspace "Floof"
     configurations { "Debug", "Release" }
     startproject "floof"
 
-local function get_llvm_config(command)
-    local handle = io.popen("llvm-config " .. command)
-    local result = handle:read("*a")
-    handle:close()
-    return result:gsub("\n", "")
-end
-
 local llvm_prefix = os.getenv("LLVM_DIR")
 local llvm_libdir = llvm_prefix .. "/lib"
 local llvm_includedir = llvm_prefix .. "/include"
@@ -95,44 +88,35 @@ project "floof"
         }
 
     filter "system:linux"
-        local llvm_libs = get_llvm_config("--libs core support irreader codegen mc mcparser option bitwriter target x86codegen x86asmparser x86desc x86info")
-        local llvm_syslibs = get_llvm_config("--system-libs")
-        
-        for lib in llvm_libs:gmatch("-l([%w_]+)") do
-            links { lib }
-        end
-        
+        systemversion "latest"
+
+        -- LLVM on Linux is typically a single shared library: libLLVM.so
         links {
+            "LLVM",
+
+            -- Required system libraries LLVM depends on
             "pthread",
             "dl",
             "z",
             "m",
-            "stdc++"
-        }
-        
-        buildoptions {
-            "`llvm-config --cxxflags 2>/dev/null || llvm-config --cxxflags`"
-        }
-        
-        linkoptions {
-            "`llvm-config --ldflags 2>/dev/null || llvm-config --ldflags`"
+            "tinfo"
         }
 
-    filter "system:macosx"
-        links {
-            "LLVM-15"
-        }
-        
-        libdirs {
-            "/usr/local/opt/llvm@15/lib"
-        }
-        
-        includedirs {
-            "/usr/local/opt/llvm@15/include"
-        }
-        
+        -- Ensure the runtime loader can find libLLVM.so
         linkoptions {
-            "-Wl,-rpath,/usr/local/opt/llvm@15/lib"
+            "-Wl,-rpath," .. llvm_libdir
+        }
+
+        -- LLVM expects these on Linux
+        defines {
+            "__STDC_CONSTANT_MACROS",
+            "__STDC_FORMAT_MACROS",
+            "__STDC_LIMIT_MACROS"
+        }
+
+        -- Clang/GCC warnings LLVM headers expect
+        buildoptions {
+            "-fPIC"
         }
 
     filter "configurations:Debug"

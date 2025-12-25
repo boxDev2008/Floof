@@ -4,5 +4,6 @@ obj
 *.filters
 *.vcxproj
 *.vcxproj.filters
+*.make
 Makefile
 GNUmakefile
