@@ -8,6 +8,7 @@ enum TokenType
     TokenType_Identifier = 256,
     TokenType_Number,
     TokenType_String,
+    TokenType_Char,
     TokenType_Arrow,
     TokenType_EqualEqual,    // ==
     TokenType_NotEqual,      // !=
@@ -138,6 +139,40 @@ private:
         return {TokenType_String, value, token_line};
     }
 
+    Token readChar()
+    {
+        int token_line = line;
+        std::string value;
+        advance(); // skip opening '
+
+        if (current == '\\' && peek())
+        {
+            advance();
+            switch (current)
+            {
+            case 'n': value = "\n"; break;
+            case 't': value = "\t"; break;
+            case 'r': value = "\r"; break;
+            case '\\': value = "\\"; break;
+            case '0': value = "\0"; break;
+            case '\'': value = "'"; break;
+            case '"': value = "\""; break;
+            default: value = std::string(1, current); break;
+            }
+            advance();
+        }
+        else if (current && current != '\'')
+        {
+            value = std::string(1, current);
+            advance();
+        }
+
+        if (current == '\'')
+            advance(); // skip closing '
+
+        return {TokenType_Char, value, token_line};
+    }
+
 public:
     Lexer(const std::string &code) : code(code), pos(0), line(1)
     {
@@ -178,9 +213,13 @@ public:
             if (std::isdigit(current))
                 return readNumber();
 
-            // Strings
-            if (current == '"' || current == '\'')
+            // Strings (double quotes)
+            if (current == '"')
                 return readString();
+
+            // Character literals (single quotes)
+            if (current == '\'')
+                return readChar();
 
             // Arrow operator
             if (current == '-' && peek() == '>')

@@ -40,6 +40,10 @@ struct StringLiteral : ExprNode {
     std::string value;
 };
 
+struct CharLiteral : ExprNode {
+    std::string value;
+};
+
 struct Identifier : ExprNode {
     std::string name;
 };
@@ -71,6 +75,10 @@ struct StructInit : ExprNode {
 
 struct ArrayInit : ExprNode {
     std::vector<std::unique_ptr<ExprNode>> elements;
+};
+
+struct SizeofExpr : ExprNode {
+    std::unique_ptr<TypeNode> type;
 };
 
 struct StmtNode : ASTNode {
@@ -135,6 +143,7 @@ struct StructField {
 
 struct StructDecl : ASTNode {
     std::string name;
+    bool is_packed;
     std::vector<std::unique_ptr<StructField>> fields;
 };
 
@@ -449,6 +458,13 @@ public:
             str->value = m_last.value;
             return str;
         }
+
+        if (Match(TokenType_Char))
+        {
+            auto chr = std::make_unique<CharLiteral>();
+            chr->value = m_last.value;
+            return chr;
+        }
         
         if (Match('('))
         {
@@ -475,6 +491,14 @@ public:
         if (Match(TokenType_Identifier))
         {
             std::string name = m_last.value;
+
+            if (name == "sizeof" && Match('('))
+            {
+                auto sizeofExpr = std::make_unique<SizeofExpr>();
+                sizeofExpr->type = ParseType();
+                Expect(')', "Expected ')' after sizeof type");
+                return sizeofExpr;
+            }
             
             if (name == "cast" && Match('('))
             {
@@ -753,8 +777,19 @@ public:
 
     std::unique_ptr<StructDecl> ParseStructDecl(void)
     {
-        Expect(TokenType_Identifier, "Expected struct name");
         std::unique_ptr<StructDecl> struct_decl = std::make_unique<StructDecl>();
+
+        if (Match('('))
+        {
+            Expect(TokenType_Identifier, "Expected attribute name");
+            if (m_last.value == "packed")
+                struct_decl->is_packed = true;
+            else
+                throw std::runtime_error("Invalid attribute name " + m_last.value + " on line " + std::to_string(m_lexer.GetCurrentLine()));
+            Expect(')', "Expected ')'");
+        }
+
+        Expect(TokenType_Identifier, "Expected struct name");
         struct_decl->name = m_last.value;
         
         if (Match('{'))

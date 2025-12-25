@@ -200,7 +200,7 @@ private:
             info.fieldTypes[field->name] = fieldType;
         }
         
-        structType->setBody(memberTypes);
+        structType->setBody(memberTypes, decl->is_packed);
         m_structs[decl->name] = info;
     }
     
@@ -269,6 +269,16 @@ private:
                 indices
             );
             return TypedValue(strPtr, TypeInfo(m_builder.getInt8PtrTy(), false, m_builder.getInt8Ty()));
+        }
+
+        if (auto* ch = dynamic_cast<CharLiteral*>(node))
+        {
+            if (ch->value.empty())
+                throw std::runtime_error("Empty character literal");
+            
+            uint8_t charValue = static_cast<uint8_t>(ch->value[0]);
+            auto* val = m_builder.getInt8(charValue);
+            return TypedValue(val, TypeInfo(m_builder.getInt8Ty(), false));
         }
         
         if (auto* cast = dynamic_cast<CastExpr*>(node))
@@ -374,6 +384,13 @@ private:
             
             return TypedValue(ConstantStruct::get(info.type, fieldValues), 
                             TypeInfo(info.type, false));
+        }
+
+        if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
+        {
+            TypeInfo type = ResolveType(sizeofExpr->type.get());
+            uint64_t size = m_module->getDataLayout().getTypeAllocSize(type.llvmType);
+            return TypedValue(m_builder.getInt64(size), TypeInfo(m_builder.getInt64Ty(), true));
         }
         
         throw std::runtime_error("Invalid constant expression for global variable");
@@ -822,6 +839,16 @@ private:
         if (auto* str = dynamic_cast<::StringLiteral*>(node))
             return EvaluateStringLiteral(str);
         
+        if (auto* ch = dynamic_cast<CharLiteral*>(node))
+        {
+            if (ch->value.empty())
+                throw std::runtime_error("Empty character literal");
+            
+            uint8_t charValue = static_cast<uint8_t>(ch->value[0]);
+            auto* val = m_builder.getInt8(charValue);
+            return TypedValue(val, TypeInfo(m_builder.getInt8Ty(), false));
+        }
+
         if (auto* arr = dynamic_cast<ArrayAccess*>(node))
         {
             TypedValue ptr = EvaluateLValue(arr);
@@ -838,6 +865,14 @@ private:
         {
             TypedValue ptr = EvaluateLValue(member);
             return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
+        }
+
+        if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
+        {
+            TypeInfo type = ResolveType(sizeofExpr->type.get());
+            uint64_t size = m_module->getDataLayout().getTypeAllocSize(type.llvmType);
+            auto* val = m_builder.getInt64(size);
+            return TypedValue(val, TypeInfo(m_builder.getInt64Ty(), true));
         }
         
         if (auto* cast = dynamic_cast<CastExpr*>(node))
