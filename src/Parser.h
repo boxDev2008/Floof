@@ -344,7 +344,7 @@ public:
     // Assignment: = += -= *= /=
     std::unique_ptr<ExprNode> ParseAssignment(void)
     {
-        auto expr = ParseComparison();
+        auto expr = ParseBitwiseOr();  // Start with lowest precedence binary operator
         
         if (Match('='))
         {
@@ -358,10 +358,61 @@ public:
         return expr;
     }
 
+    // Bitwise OR: |
+    std::unique_ptr<ExprNode> ParseBitwiseOr(void)
+    {
+        auto expr = ParseBitwiseXor();
+        
+        while (Match('|'))
+        {
+            auto binary = std::make_unique<BinaryExpr>();
+            binary->left = std::move(expr);
+            binary->op = '|';
+            binary->right = ParseBitwiseXor();
+            expr = std::move(binary);
+        }
+        
+        return expr;
+    }
+
+    // Bitwise XOR: ^
+    std::unique_ptr<ExprNode> ParseBitwiseXor(void)
+    {
+        auto expr = ParseBitwiseAnd();
+        
+        while (Match('^'))
+        {
+            auto binary = std::make_unique<BinaryExpr>();
+            binary->left = std::move(expr);
+            binary->op = '^';
+            binary->right = ParseBitwiseAnd();
+            expr = std::move(binary);
+        }
+        
+        return expr;
+    }
+
+    // Bitwise AND: &
+    std::unique_ptr<ExprNode> ParseBitwiseAnd(void)
+    {
+        auto expr = ParseComparison();
+        
+        while (Match('&'))
+        {
+            auto binary = std::make_unique<BinaryExpr>();
+            binary->left = std::move(expr);
+            binary->op = '&';
+            binary->right = ParseComparison();
+            expr = std::move(binary);
+        }
+        
+        return expr;
+    }
+
     // Comparison: == != < <= > >=
     std::unique_ptr<ExprNode> ParseComparison(void)
     {
-        auto expr = ParseAdditive();
+        auto expr = ParseShift();  // Changed from ParseAdditive
         
         while (Match(TokenType_EqualEqual) || Match(TokenType_NotEqual) || 
             Match('<') || Match(TokenType_LessEqual) || 
@@ -370,19 +421,40 @@ public:
             auto binary = std::make_unique<BinaryExpr>();
             binary->left = std::move(expr);
             
-            // Store the operator - for multi-char ops, use first char or special encoding
             if (m_last.type == TokenType_EqualEqual)
-                binary->op = 'E'; // Use 'E' for ==
+                binary->op = 'E';
             else if (m_last.type == TokenType_NotEqual)
-                binary->op = 'N'; // Use 'N' for !=
+                binary->op = 'N';
             else if (m_last.type == TokenType_LessEqual)
-                binary->op = 'L'; // Use 'L' for <=
+                binary->op = 'L';
             else if (m_last.type == TokenType_GreaterEqual)
-                binary->op = 'G'; // Use 'G' for >=
+                binary->op = 'G';
             else
-                binary->op = m_last.value[0]; // '<' or '>'
+                binary->op = m_last.value[0];
             
-            binary->right = ParseAdditive();
+            binary->right = ParseShift();  // Changed from ParseAdditive
+            expr = std::move(binary);
+        }
+        
+        return expr;
+    }
+
+    // Shift operators: << >>
+    std::unique_ptr<ExprNode> ParseShift(void)
+    {
+        auto expr = ParseAdditive();  // Call next level down
+        
+        while (Match(TokenType_LeftShift) || Match(TokenType_RightShift))
+        {
+            auto binary = std::make_unique<BinaryExpr>();
+            binary->left = std::move(expr);
+            
+            if (m_last.type == TokenType_LeftShift)
+                binary->op = 'l';
+            else
+                binary->op = 'r';
+            
+            binary->right = ParseAdditive();  // Call next level down
             expr = std::move(binary);
         }
         
@@ -392,7 +464,7 @@ public:
     // Additive: + -
     std::unique_ptr<ExprNode> ParseAdditive(void)
     {
-        auto expr = ParseMultiplicative();
+        auto expr = ParseMultiplicative();  // Back to calling ParseMultiplicative
         
         while (Match('+') || Match('-'))
         {
@@ -423,10 +495,10 @@ public:
         return expr;
     }
 
-    // Unary: - ! & *
+    // Unary: - ! & * ~
     std::unique_ptr<ExprNode> ParseUnary(void)
     {
-        if (Match('-') || Match('!') || Match('&') || Match('*'))
+        if (Match('-') || Match('!') || Match('&') || Match('*') || Match('~'))
         {
             auto unary = std::make_unique<UnaryExpr>();
             unary->op = m_last.value[0];

@@ -2,6 +2,7 @@
 
 #include <string>
 #include <cctype>
+#include <unordered_map>
 
 enum TokenType
 {
@@ -14,6 +15,8 @@ enum TokenType
     TokenType_NotEqual,      // !=
     TokenType_LessEqual,     // <=
     TokenType_GreaterEqual,  // >=
+    TokenType_LeftShift,     // <<
+    TokenType_RightShift,    // >>
     TokenType_EOF
 };
 
@@ -24,6 +27,8 @@ struct Token
     int line;
 };
 
+#include <iostream>
+
 class Lexer
 {
 private:
@@ -31,6 +36,8 @@ private:
     size_t pos;
     char current;
     int line;
+
+    static const std::unordered_map<std::string, TokenType> two_char_ops;
 
     void advance()
     {
@@ -41,7 +48,7 @@ private:
         current = (pos < code.length()) ? code[pos] : '\0';
     }
 
-    char peek(int offset = 1)
+    char peek(int offset = 1) const
     {
         size_t peek_pos = pos + offset;
         return (peek_pos < code.length()) ? code[peek_pos] : '\0';
@@ -83,11 +90,14 @@ private:
     {
         int token_line = line;
         std::string value;
+        value.reserve(32); // Reserve space to reduce allocations
+        
         while (current && (std::isalnum(current) || current == '_'))
         {
             value += current;
             advance();
         }
+        
         return {TokenType_Identifier, value, token_line};
     }
 
@@ -95,11 +105,85 @@ private:
     {
         int token_line = line;
         std::string value;
-        while (current && (std::isdigit(current) || current == '.'))
+        value.reserve(16);
+        
+        if (current == '0' && (peek() == 'x' || peek() == 'X'))
+        {
+            // Hexadecimal
+            value += current;
+            advance();
+            value += current;
+            advance();
+            
+            while (current && std::isxdigit(current))
+            {
+                value += current;
+                advance();
+            }
+        }
+        else if (current == '0' && std::isdigit(peek()))
+        {
+            // Octal
+            value += current;
+            advance();
+            
+            while (current && (current >= '0' && current <= '7'))
+            {
+                value += current;
+                advance();
+            }
+        }
+        else
+        {
+            // Decimal or floating point
+            while (current && std::isdigit(current))
+            {
+                value += current;
+                advance();
+            }
+            
+            // Check for decimal point
+            if (current == '.')
+            {
+                value += current;
+                advance();
+                
+                while (current && std::isdigit(current))
+                {
+                    value += current;
+                    advance();
+                }
+            }
+            
+            // Check for exponent (e.g., 1e10, 3.14e-5)
+            if (current && (current == 'e' || current == 'E'))
+            {
+                value += current;
+                advance();
+                
+                if (current && (current == '+' || current == '-'))
+                {
+                    value += current;
+                    advance();
+                }
+                
+                while (current && std::isdigit(current))
+                {
+                    value += current;
+                    advance();
+                }
+            }
+        }
+        
+        // Read suffixes
+        while (current && (std::tolower(current) == 'u' || 
+                        std::tolower(current) == 'l' || 
+                        std::tolower(current) == 'f'))
         {
             value += current;
             advance();
         }
+        
         return {TokenType_Number, value, token_line};
     }
 
@@ -108,6 +192,7 @@ private:
         int token_line = line;
         char quote = current;
         std::string value;
+        value.reserve(64); // Reserve space
         advance(); // skip opening quote
 
         while (current && current != quote)
@@ -221,40 +306,17 @@ public:
             if (current == '\'')
                 return readChar();
 
-            // Arrow operator
-            if (current == '-' && peek() == '>')
+            // Check for two-character operators using map
+            std::string two_char;
+            two_char += current;
+            two_char += peek();
+            
+            auto it = two_char_ops.find(two_char);
+            if (it != two_char_ops.end())
             {
                 advance();
                 advance();
-                return {TokenType_Arrow, "->", token_line};
-            }
-
-            if (current == '!' && peek() == '=')
-            {
-                advance();
-                advance();
-                return {TokenType_NotEqual, "!=", token_line};
-            }
-
-            if (current == '=' && peek() == '=')
-            {
-                advance();
-                advance();
-                return {TokenType_EqualEqual, "==", token_line};
-            }
-
-            if (current == '<' && peek() == '=')
-            {
-                advance();
-                advance();
-                return {TokenType_LessEqual, "<=", token_line};
-            }
-
-            if (current == '>' && peek() == '=')
-            {
-                advance();
-                advance();
-                return {TokenType_GreaterEqual, ">=", token_line};
+                return {it->second, two_char, token_line};
             }
 
             // Single character tokens
@@ -267,4 +329,15 @@ public:
     }
 
     int GetCurrentLine(void) const { return line; }
+};
+
+// Initialize static maps
+const std::unordered_map<std::string, TokenType> Lexer::two_char_ops = {
+    {"->", TokenType_Arrow},
+    {"==", TokenType_EqualEqual},
+    {"!=", TokenType_NotEqual},
+    {"<=", TokenType_LessEqual},
+    {">=", TokenType_GreaterEqual},
+    {"<<", TokenType_LeftShift},
+    {">>", TokenType_RightShift}
 };

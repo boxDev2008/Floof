@@ -69,12 +69,20 @@
     "numbers": {
       "patterns": [
         {
+          "name": "constant.numeric.hex.flooflang",
+          "match": "\\b0[xX][0-9a-fA-F]+([uUlL]+)?\\b"
+        },
+        {
           "name": "constant.numeric.float.flooflang",
-          "match": "\\b-?[0-9]+\\.[0-9]+\\b"
+          "match": "\\b-?[0-9]+\\.[0-9]+([eE][+-]?[0-9]+)?[fF]?\\b"
+        },
+        {
+          "name": "constant.numeric.float.flooflang",
+          "match": "\\b-?[0-9]+[eE][+-]?[0-9]+[fF]?\\b"
         },
         {
           "name": "constant.numeric.integer.flooflang",
-          "match": "\\b-?[0-9]+\\b"
+          "match": "\\b-?[0-9]+([uUlL]+)?\\b"
         }
       ]
     },
@@ -126,6 +134,10 @@
         {
           "name": "keyword.operator.logical.flooflang",
           "match": "&&|\\|\\||!"
+        },
+        {
+          "name": "keyword.operator.bitwise.flooflang",
+          "match": "<<|>>|\\||\\^|~"
         }
       ]
     }

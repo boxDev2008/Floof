@@ -894,15 +894,62 @@ private:
 
     TypedValue EvaluateNumberLiteral(NumberLiteral* lit)
     {
-        if (lit->value.find('.') == std::string::npos)
+        const std::string &value = lit->value;
+
+        if (value.find('.') == std::string::npos &&
+            value.find('e') == std::string::npos &&
+            value.find('E') == std::string::npos)
         {
-            auto* val = m_builder.getInt32((int32_t)std::stoll(lit->value));
-            return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
+            bool isUnsigned = false;
+            bool isLong = false;
+            
+            size_t pos = value.size();
+            while (pos > 0 && !std::isdigit(value[pos - 1]))
+            {
+                char c = std::tolower(value[pos - 1]);
+                if (c == 'u') isUnsigned = true;
+                else if (c == 'l') isLong = true;
+                pos--;
+            }
+            
+            std::string numericPart = value.substr(0, pos);
+            int64_t intValue = std::stoll(numericPart, nullptr, 0);
+            
+            if (isLong || intValue > INT32_MAX || intValue < INT32_MIN)
+            {
+                auto* val = m_builder.getInt64(intValue);
+                return TypedValue(val, TypeInfo(m_builder.getInt64Ty(), isUnsigned));
+            }
+            else
+            {
+                auto* val = m_builder.getInt32((int32_t)intValue);
+                return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), isUnsigned));
+            }
         }
         else
         {
-            auto* val = ConstantFP::get(m_builder.getDoubleTy(), std::stod(lit->value));
-            return TypedValue(val, TypeInfo(m_builder.getDoubleTy(), false));
+            bool isFloat = false;
+            
+            size_t pos = value.size();
+            if (pos > 0 && std::tolower(value[pos - 1]) == 'f')
+            {
+                isFloat = true;
+                pos--;
+            }
+            
+            std::string numericPart = value.substr(0, pos);
+            double doubleValue = std::stod(numericPart);
+            
+            if (isFloat)
+            {
+                auto* val = ConstantFP::get(m_builder.getFloatTy(), (float)doubleValue);
+                return TypedValue(val, TypeInfo(m_builder.getFloatTy(), false));
+            }
+            else
+            {
+                auto* val = ConstantFP::get(m_builder.getDoubleTy(), doubleValue);
+                return TypedValue(val, TypeInfo(m_builder.getDoubleTy(), false));
+            }
         }
     }
 
@@ -1249,6 +1296,26 @@ private:
             case '*': result = isFloat ? m_builder.CreateFMul(lhs.value, rhs.value) : m_builder.CreateMul(lhs.value, rhs.value); break;
             case '/': result = CreateDivision(lhs.value, rhs.value, isFloat, isUnsigned); break;
             case '%': result = CreateRemainder(lhs.value, rhs.value, isFloat, isUnsigned); break;
+            case '&': 
+                if (isFloat) throw std::runtime_error("Bitwise AND not supported on floating-point types");
+                result = m_builder.CreateAnd(lhs.value, rhs.value); 
+                break;
+            case '|': 
+                if (isFloat) throw std::runtime_error("Bitwise OR not supported on floating-point types");
+                result = m_builder.CreateOr(lhs.value, rhs.value); 
+                break;
+            case '^': 
+                if (isFloat) throw std::runtime_error("Bitwise XOR not supported on floating-point types");
+                result = m_builder.CreateXor(lhs.value, rhs.value); 
+                break;
+            case 'l': // 
+                if (isFloat) throw std::runtime_error("Left shift not supported on floating-point types");
+                result = m_builder.CreateShl(lhs.value, rhs.value); 
+                break;
+            case 'r': // >>
+                if (isFloat) throw std::runtime_error("Right shift not supported on floating-point types");
+                result = isUnsigned ? m_builder.CreateLShr(lhs.value, rhs.value) : m_builder.CreateAShr(lhs.value, rhs.value);
+                break;
             case 'E': result = CreateEquality(lhs.value, rhs.value, isFloat, true); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case 'N': result = CreateEquality(lhs.value, rhs.value, isFloat, false); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case '<': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SLT, CmpInst::ICMP_ULT, CmpInst::FCMP_OLT); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
@@ -1296,9 +1363,11 @@ private:
     {
         if (auto* num = dynamic_cast<NumberLiteral*>(node))
         {
-            if (num->value.find('.') == std::string::npos)
+            if (num->value.find('.') == std::string::npos &&
+                num->value.find('e') == std::string::npos &&
+                num->value.find('E') == std::string::npos)
             {
-                int64_t val = std::stoll(num->value);
+                int64_t val = std::stoll(num->value, nullptr, 0);
                 if (expectedType.llvmType->isIntegerTy())
                     return ConstantInt::get(expectedType.llvmType, val);
                 else if (expectedType.llvmType->isFloatingPointTy())
