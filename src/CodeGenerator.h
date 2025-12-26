@@ -93,9 +93,9 @@ public:
 
         ImportUsedModules(ast, moduleTable);
         RegisterStructs(ast);
+        DeclareUserFunctions(ast);
         DeclareGlobalVariables(ast);
         RegisterBuiltinFunctions();
-        DeclareUserFunctions(ast);
         DefineUserFunctionBodies(ast);
         
         //m_module->print(llvm::outs(), nullptr);
@@ -243,6 +243,18 @@ private:
 
     TypedValue EvaluateConstantExpr(ExprNode* node, const TypeInfo* expectedType = nullptr)
     {
+        if (auto* id = dynamic_cast<Identifier*>(node))
+        {
+            auto funcIt = m_functions.find(id->name);
+            if (funcIt != m_functions.end())
+            {
+                Function* func = funcIt->second.function;
+                return TypedValue(func, TypeInfo(func->getType(), false, func->getFunctionType()));
+            }
+            
+            throw std::runtime_error("Cannot use variable in constant expression: " + id->name);
+        }
+    
         if (auto* num = dynamic_cast<NumberLiteral*>(node))
         {
             TypedValue result = EvaluateNumberLiteral(num);
@@ -389,18 +401,6 @@ private:
             TypeInfo type = ResolveType(sizeofExpr->type.get());
             uint64_t size = m_module->getDataLayout().getTypeAllocSize(type.llvmType);
             return TypedValue(m_builder.getInt64(size), TypeInfo(m_builder.getInt64Ty(), true));
-        }
-
-        if (auto* id = dynamic_cast<Identifier*>(node))
-        {
-            auto funcIt = m_functions.find(id->name);
-            if (funcIt != m_functions.end())
-            {
-                Function* func = funcIt->second.function;
-                return TypedValue(func, TypeInfo(func->getType(), false, func->getFunctionType()));
-            }
-            
-            throw std::runtime_error("Cannot use variable in constant expression: " + id->name);
         }
         
         throw std::runtime_error("Invalid constant expression for global variable");
@@ -1191,6 +1191,16 @@ private:
                 : m_builder.CreateNeg(operand.value);
             return TypedValue(result, operand.type);
         }
+
+        if (unary->op == '!')
+        {
+            TypedValue operand = EvaluateRValue(unary->operand.get());
+            Value* cond = operand.type.llvmType->isFloatingPointTy()
+                ? m_builder.CreateFCmpUNE(operand.value, ConstantFP::get(operand.type.llvmType, 0.0))
+                : m_builder.CreateICmpNE(operand.value, ConstantInt::get(operand.type.llvmType, 0));
+            Value* result = m_builder.CreateNot(cond);
+            return TypedValue(result, TypeInfo(m_builder.getInt1Ty(), false));
+        }
         
         throw std::runtime_error("Unknown unary operator");
     }
@@ -1206,7 +1216,7 @@ private:
             if (rhs.type != lhs.type)
                 rhs = CastValue(rhs, lhs.type);
             m_builder.CreateStore(rhs.value, lhs.value);
-            return rhs;  // Assignment expressions return the assigned value
+            return rhs;
         }
 
         // Handle pointer arithmetic
