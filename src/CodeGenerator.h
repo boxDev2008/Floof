@@ -255,6 +255,12 @@ private:
             {
                 Function* func = funcIt->second.function;
 
+                if (expectedType && expectedType->functionInfo)
+                {
+                    TypeInfo type = *expectedType;
+                    type.functionInfo->function = func;
+                    return TypedValue(func, type);
+                }
                 return TypedValue(
                     func,
                     TypeInfo(
@@ -586,8 +592,6 @@ private:
         }
         else if (decl->init)
         {
-            // For type inference, we need to evaluate the init
-            // But we should do this carefully to avoid side effects
             TypedValue initValue = EvaluateRValue(decl->init.get());
             type = initValue.type;
         }
@@ -836,6 +840,12 @@ private:
             if (funcIt != m_functions.end())
             {
                 Function* func = funcIt->second.function;
+                if (expectedType && expectedType->functionInfo)
+                {
+                    TypeInfo type = *expectedType;
+                    type.functionInfo->function = func;
+                    return TypedValue(func, type);
+                }
                 return TypedValue(
                     func,
                     TypeInfo(
