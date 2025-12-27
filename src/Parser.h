@@ -196,6 +196,11 @@ public:
                 auto using_decl = std::make_unique<UsingDecl>();
                 Expect(TokenType_Identifier, "Expected module name after 'using'");
                 using_decl->name = m_last.value;
+                while (Match('.'))
+                {
+                    Expect(TokenType_Identifier, "Expected identifier after '.'");
+                    using_decl->name += '.' + m_last.value;
+                }
                 Expect(';', "Expected ';' after using declaration");
                 module->usings.push_back(std::move(using_decl));
             }

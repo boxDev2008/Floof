@@ -128,25 +128,30 @@ private:
     std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles()
     {
         std::map<std::string, std::unique_ptr<ModuleAST>> moduleMap;
-
-        for (const auto &entry : fs::directory_iterator(projectDir / "src"))
+        
+        for (const auto &entry : fs::recursive_directory_iterator(projectDir / "src"))
         {
             if (!entry.is_regular_file() || entry.path().extension() != ".floof")
                 continue;
-
+                
             fs::path path = entry.path();
             std::ifstream file(path);
             std::stringstream buffer;
             buffer << file.rdbuf();
-
+            
             Lexer lexer(buffer.str());
             Parser parser(lexer);
             auto module = parser.ParseModule();
-
-            std::string moduleName = path.stem().string();
+            
+            fs::path relativePath = fs::relative(path, projectDir / "src");
+            std::string moduleName = relativePath.replace_extension("").string();
+            
+            std::replace(moduleName.begin(), moduleName.end(), '/', '.');
+            std::replace(moduleName.begin(), moduleName.end(), '\\', '.');
+            
             moduleMap.insert({moduleName, std::move(module)});
         }
-
+        
         return moduleMap;
     }
 
