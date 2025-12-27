@@ -15,16 +15,21 @@
 using namespace llvm;
 
 class CodeGenerator
-{    
+{
+    struct FunctionInfo;
     struct TypeInfo
     {
         Type* llvmType;
-        bool isUnsigned;
         Type* pointeeType;  // For pointer types
+        bool isUnsigned;
+
+        // For function pointers
+        std::shared_ptr<FunctionInfo> functionInfo;
 
         TypeInfo() : llvmType(nullptr), isUnsigned(false), pointeeType(nullptr) {}
-        TypeInfo(Type* t, bool u, Type* pt = nullptr) 
-            : llvmType(t), isUnsigned(u), pointeeType(pt) {}
+        TypeInfo(Type* t, bool u, Type* pt = nullptr, std::shared_ptr<FunctionInfo> fi = nullptr) 
+            : llvmType(t), isUnsigned(u), pointeeType(pt), functionInfo(fi) {}
+
         
         bool operator==(const TypeInfo& other) const {
             return llvmType == other.llvmType && 
@@ -249,7 +254,16 @@ private:
             if (funcIt != m_functions.end())
             {
                 Function* func = funcIt->second.function;
-                return TypedValue(func, TypeInfo(func->getType(), false, func->getFunctionType()));
+
+                return TypedValue(
+                    func,
+                    TypeInfo(
+                        func->getType(),
+                        false,
+                        func->getFunctionType(),
+                        std::make_shared<FunctionInfo>(funcIt->second)
+                    )
+                );
             }
             
             throw std::runtime_error("Cannot use variable in constant expression: " + id->name);
@@ -822,7 +836,16 @@ private:
             if (funcIt != m_functions.end())
             {
                 Function* func = funcIt->second.function;
-                return TypedValue(func, TypeInfo(func->getType(), false, func->getFunctionType()));
+                std::cout << 1;
+                return TypedValue(
+                    func,
+                    TypeInfo(
+                        func->getType(),
+                        false,
+                        func->getFunctionType(),
+                        std::make_shared<FunctionInfo>(funcIt->second)
+                    )
+                );
             }
             
             Variable var = LookupVariable(id->name);
@@ -959,20 +982,21 @@ private:
         return TypedValue(str, TypeInfo(m_builder.getInt8PtrTy(), false, m_builder.getInt8Ty()));
     }
 
-    TypedValue EvaluateCast(CastExpr* cast)
+    TypedValue EvaluateCast(CastExpr *cast)
     {
         TypedValue operand = EvaluateRValue(cast->operand.get());
         TypeInfo targetType = ResolveType(cast->target_type.get());
         return CastValue(operand, targetType);
     }
 
-    TypedValue EvaluateFunctionCall(CallExpr* call)
+    TypedValue EvaluateFunctionCall(CallExpr *call)
     {
-        // First check if it's a direct function call
-        auto it = m_functions.find(call->function);
-        if (it != m_functions.end())
+        // First, try to find it as a direct function name
+        auto funcIt = m_functions.find(call->function);
+        if (funcIt != m_functions.end())
         {
-            const FunctionInfo& func = it->second;
+            // Direct function call
+            const FunctionInfo& func = funcIt->second;
             
             if (func.isVarArg)
             {
@@ -1003,54 +1027,47 @@ private:
             return TypedValue(result, func.returnType);
         }
         
-        // It might be a function pointer variable
-        auto varIt = m_locals.find(call->function);
-        if (varIt == m_locals.end())
-            varIt = m_globals.find(call->function);
+        // Not a direct function - must be a function pointer variable
+        Variable var = LookupVariable(call->function);
         
-        if (varIt != m_globals.end())
+        if (!var.type.functionInfo)
+            throw std::runtime_error("Variable '" + call->function + "' is not callable");
+        
+        const FunctionInfo& funcInfo = *var.type.functionInfo;
+        
+        if (funcInfo.isVarArg)
         {
-            Variable& var = varIt->second;
-            
-            // Load the function pointer
-            Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
-            
-            // Get the function type
-            if (!var.type.pointeeType || !var.type.pointeeType->isFunctionTy())
-                throw std::runtime_error(call->function + " is not a function pointer");
-            
-            FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
-            
-            // Check argument count
-            if (call->args.size() != funcType->getNumParams())
-                throw std::runtime_error("Argument count mismatch for function pointer call");
-            
-            // Evaluate and cast arguments
-            std::vector<Value*> args;
-            for (size_t i = 0; i < call->args.size(); i++)
-            {
-                TypedValue arg = EvaluateRValue(call->args[i].get());
-                Type* expectedType = funcType->getParamType(i);
-                
-                if (arg.type.llvmType != expectedType)
-                {
-                    // Determine if parameter type is unsigned
-                    bool isUnsigned = false;  // You may need better heuristics
-                    arg = CastValue(arg, TypeInfo(expectedType, isUnsigned));
-                }
-                
-                args.push_back(arg.value);
-            }
-            
-            // Create indirect call
-            auto* result = m_builder.CreateCall(funcType, funcPtr, args);
-            
-            // Determine return type signedness (may need enhancement)
-            bool isUnsigned = false;
-            return TypedValue(result, TypeInfo(funcType->getReturnType(), isUnsigned));
+            if (call->args.size() < funcInfo.paramTypes.size())
+                throw std::runtime_error("Too few arguments for " + call->function);
+        }
+        else
+        {
+            if (call->args.size() != funcInfo.paramTypes.size())
+                throw std::runtime_error("Argument count mismatch for " + call->function);
         }
         
-        throw std::runtime_error("Unknown function: " + call->function);
+        // Load the function pointer
+        Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
+        
+        // Get the function type from the pointer type
+        FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
+        
+        std::vector<Value*> args;
+        for (size_t i = 0; i < call->args.size(); i++)
+        {
+            TypedValue arg = EvaluateRValue(call->args[i].get());
+            
+            if (i < funcInfo.paramTypes.size())
+            {
+                if (arg.type != funcInfo.paramTypes[i])
+                    arg = CastValue(arg, funcInfo.paramTypes[i]);
+            }
+            
+            args.push_back(arg.value);
+        }
+        
+        auto* result = m_builder.CreateCall(funcType, funcPtr, args);
+        return TypedValue(result, funcInfo.returnType);
     }
 
     TypedValue EvaluateArrayAccess(ArrayAccess* access)
@@ -1439,17 +1456,24 @@ private:
                 ResolveType(node->return_type.get()) :
                 TypeInfo(Type::getVoidTy(m_context), false);
             
+            FunctionInfo funcInfo;
+            funcInfo.isVarArg = false; // TODO: change this when we have support for varArgs
+            funcInfo.function = nullptr;
+
             std::vector<Type*> paramLLVMTypes;
             for (const auto& paramType : node->param_types)
             {
                 TypeInfo paramInfo = ResolveType(paramType.get());
+                funcInfo.paramTypes.push_back(paramInfo);
                 paramLLVMTypes.push_back(paramInfo.llvmType);
             }
+
+            funcInfo.returnType = returnType;
             
             auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, false);
             auto* funcPtrType = m_builder.getPtrTy();
-            
-            return TypeInfo(funcPtrType, false, funcType);
+
+            return TypeInfo(funcPtrType, false, funcType, std::make_shared<FunctionInfo>(funcInfo));
         }
         
         if (!node->array_dimensions.empty())
