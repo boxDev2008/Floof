@@ -271,6 +271,16 @@ private:
                     )
                 );
             }
+
+            auto globalIt = m_globals.find(id->name);
+            if (globalIt != m_globals.end())
+            {
+                GlobalVariable* globalVar = cast<GlobalVariable>(globalIt->second.storage);
+                if (globalVar->hasInitializer())
+                    return TypedValue(globalVar->getInitializer(), globalIt->second.type);
+                else
+                    return TypedValue(globalVar, globalIt->second.type);
+            }
             
             throw std::runtime_error("Cannot use variable in constant expression: " + id->name);
         }
