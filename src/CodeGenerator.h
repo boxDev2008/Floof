@@ -450,28 +450,6 @@ private:
         // Pointer to Pointer
         if (fromLLVMType->isPointerTy() && toLLVMType->isPointerTy())
         {
-            if (toType.functionInfo)
-            {
-                if (!fromType.functionInfo)
-                    throw std::runtime_error("Cannot assign non-function pointer to function pointer in constant expression");
-                
-                const FunctionInfo& srcFunc = *fromType.functionInfo;
-                const FunctionInfo& dstFunc = *toType.functionInfo;
-                
-                if (srcFunc.returnType != dstFunc.returnType)
-                    throw std::runtime_error("Function pointer return type mismatch in constant expression");
-                
-                if (srcFunc.paramTypes.size() != dstFunc.paramTypes.size())
-                    throw std::runtime_error("Function pointer parameter count mismatch in constant expression");
-                
-                for (size_t i = 0; i < srcFunc.paramTypes.size(); i++)
-                {
-                    if (srcFunc.paramTypes[i] != dstFunc.paramTypes[i])
-                        throw std::runtime_error("Function pointer parameter type mismatch in constant expression");
-                }
-                
-                return value;
-            }
             if (fromType.pointeeType == toType.pointeeType)
                 return value;
             return ConstantExpr::getBitCast(value, toLLVMType);
