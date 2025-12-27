@@ -836,7 +836,6 @@ private:
             if (funcIt != m_functions.end())
             {
                 Function* func = funcIt->second.function;
-                std::cout << 1;
                 return TypedValue(
                     func,
                     TypeInfo(
