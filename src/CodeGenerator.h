@@ -109,6 +109,12 @@ public:
     std::unique_ptr<Module> GetModule() { return std::move(m_module); }
 
 private:
+    struct Scope
+    {
+        int32_t parent;
+        uint32_t id;
+    };
+
     void ImportUsedModules(const ModuleAST& ast, std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable)
     {
         for (const auto& use : ast.usings)
@@ -564,8 +570,12 @@ private:
 
     void DefineFunctionBody(const ProcDecl* proc, const FunctionInfo& funcInfo)
     {
+        m_scopes.clear();
         m_locals.clear();
-        
+
+        m_scopes.push_back(Scope{ -1, 0 });
+        m_currentScopeId = 0;
+        m_highestScopeId = 0;
         auto* entry = BasicBlock::Create(m_context, "entry", funcInfo.function);
         m_builder.SetInsertPoint(entry);
         
@@ -574,12 +584,16 @@ private:
         for (auto& arg : funcInfo.function->args())
         {
             TypeInfo paramType = funcInfo.paramTypes[idx++];
-            auto* alloca = m_builder.CreateAlloca(paramType.llvmType, nullptr, arg.getName());
+            std::string name = arg.getName().str() + ".0";
+            auto* alloca = m_builder.CreateAlloca(paramType.llvmType, nullptr, name);
             m_builder.CreateStore(&arg, alloca);
-            m_locals[std::string(arg.getName())] = Variable(paramType, alloca);
+            m_locals[name] = Variable(paramType, alloca);
         }
         
         GenerateHostingAllocs(proc->body.get());
+
+        m_currentScopeId = 0;
+        m_highestScopeId = 0;
         GenerateBlock(proc->body.get(), funcInfo.returnType);
         
         // Add implicit return if needed
@@ -592,10 +606,23 @@ private:
         }
     }
 
+    bool IsVariableAccessibleInCurrentScope(const std::string& name)
+    {
+        int32_t scopeIdx = m_currentScopeId;
+        while (scopeIdx >= 0)
+        {
+            Scope& scope = m_scopes[scopeIdx];
+            if (m_locals.find(name + '.' + std::to_string(scope.id)) != m_locals.end())
+                return true;
+            scopeIdx = scope.parent;
+        }
+        return false;
+    }
+
     void GenerateVarDeclHosingAlloc(VarDecl *decl)
     {
-        if (m_locals.find(decl->name) != m_locals.end())
-            return;
+        if (IsVariableAccessibleInCurrentScope(decl->name))
+            throw std::runtime_error("Variable already declared in this scope: " + decl->name);
 
         TypeInfo type;
         
@@ -611,35 +638,51 @@ private:
         else
             throw std::runtime_error("Variable '" + decl->name + "' must have either a type or an initializer");
         
-        auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, decl->name);
-        m_locals[decl->name] = Variable(type, alloca);
+        std::string scopedName = decl->name + '.' + std::to_string(m_currentScopeId);
+        auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, scopedName);
+        m_locals[scopedName] = Variable(type, alloca);
     }
 
     void GenerateHostingAllocs(BlockStmt* block)
     {
+        uint32_t scopeId = m_scopes.size() - 1;
+        m_currentScopeId = scopeId;
         for (const auto& stmt : block->statements)
         {
             if (auto* decl = dynamic_cast<VarDecl*>(stmt.get()))
                 GenerateVarDeclHosingAlloc(decl);
             else if (auto* s = dynamic_cast<IfStmt*>(stmt.get()))
             {
+                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
                 GenerateHostingAllocs(s->then_branch.get());
+                m_currentScopeId = scopeId;
                 if (s->else_branch)
+                {
+                    m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
                     GenerateHostingAllocs(s->else_branch.get());
+                    m_currentScopeId = scopeId;
+                }
             }
             else if (auto* s = dynamic_cast<WhileStmt*>(stmt.get()))
+            {
+                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
                 GenerateHostingAllocs(s->then_branch.get());
+                m_currentScopeId = scopeId;
+            }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
             {
                 if (s->init)
                     GenerateVarDeclHosingAlloc(s->init.get());
+                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
                 GenerateHostingAllocs(s->body.get());
+                m_currentScopeId = scopeId;
             }
         }
     }
     
     void GenerateBlock(BlockStmt* block, const TypeInfo& returnType)
     {
+        uint32_t scopeId = m_currentScopeId;
         for (const auto& stmt : block->statements)
         {
             if (auto* s = dynamic_cast<VarDecl*>(stmt.get()))
@@ -649,11 +692,23 @@ private:
             else if (auto* s = dynamic_cast<ReturnStmt*>(stmt.get()))
                 GenerateReturn(s, returnType);
             else if (auto* s = dynamic_cast<IfStmt*>(stmt.get()))
+            {
+                m_currentScopeId = ++m_highestScopeId;
                 GenerateIf(s, returnType);
+                m_currentScopeId = scopeId;
+            }
             else if (auto* s = dynamic_cast<WhileStmt*>(stmt.get()))
+            {
+                m_currentScopeId = ++m_highestScopeId;
                 GenerateWhile(s, returnType);
+                m_currentScopeId = scopeId;
+            }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
+            {
+                m_currentScopeId = ++m_highestScopeId;
                 GenerateFor(s, returnType);
+                m_currentScopeId = scopeId;
+            }
             else if (auto* s = dynamic_cast<BreakStmt*>(stmt.get()))
                 GenerateBreak();
             else if (auto* s = dynamic_cast<ContinueStmt*>(stmt.get()))
@@ -663,7 +718,8 @@ private:
 
     void GenerateVarDecl(VarDecl* decl)
     {
-        Variable& variable = m_locals[decl->name];
+        std::string scopedName = decl->name + '.' + std::to_string(m_currentScopeId);
+        Variable& variable = m_locals[scopedName];
         
         if (decl->init)
         {
@@ -714,6 +770,7 @@ private:
         if (elseBB)
         {
             m_builder.SetInsertPoint(elseBB);
+            m_currentScopeId++;
             GenerateBlock(stmt->else_branch.get(), returnType);
             if (!m_builder.GetInsertBlock()->getTerminator())
                 m_builder.CreateBr(mergeBB);
@@ -1703,11 +1760,17 @@ private:
     
     Variable LookupVariable(const std::string& name)
     {
-        auto it = m_locals.find(name);
-        if (it != m_locals.end())
-            return it->second;
+        int32_t scopeIdx = m_currentScopeId;
+        while (scopeIdx >= 0)
+        {
+            Scope& scope = m_scopes[scopeIdx];
+            std::string scopedName = name + '.' + std::to_string(scope.id);
+            if (m_locals.find(scopedName) != m_locals.end())
+                return m_locals[scopedName];
+            scopeIdx = scope.parent;
+        }
         
-        it = m_globals.find(name);
+        auto it = m_globals.find(name);
         if (it != m_globals.end())
             return it->second;
         
@@ -1796,14 +1859,18 @@ private:
             : m_builder.CreateICmp(signedPred, lhs, rhs);
     }
     
-    LLVMContext& m_context;
-    IRBuilder<> m_builder;
-    std::unique_ptr<Module> m_module;
-    
+    std::vector<Scope> m_scopes;
     std::unordered_map<std::string, FunctionInfo> m_functions;
     std::unordered_map<std::string, StructInfo> m_structs;
     std::unordered_map<std::string, Variable> m_locals;
     std::unordered_map<std::string, Variable> m_globals;
     
+    LLVMContext& m_context;
+    IRBuilder<> m_builder;
+    std::unique_ptr<Module> m_module;
+
+    uint32_t m_currentScopeId = 0;
+    uint32_t m_highestScopeId = 0;
+
     LoopContext m_loopContext;
 };

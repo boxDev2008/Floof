@@ -12,13 +12,13 @@ struct ASTNode {
 
 struct TypeNode : ASTNode {
     std::string name;
-    int pointer_depth = 0;
-    bool is_const = false;
     std::vector<int> array_dimensions;
-
-    bool is_function_type = false;
+    
     std::unique_ptr<TypeNode> return_type;
     std::vector<std::unique_ptr<TypeNode>> param_types;
+    int pointer_depth = 0;
+    bool is_const = false;
+    bool is_function_type = false;
 };
 
 struct ExprNode : ASTNode {
