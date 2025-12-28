@@ -121,7 +121,7 @@ private:
         {
             auto it = moduleTable.find(use->name);
             if (it == moduleTable.end())
-                throw std::runtime_error("Module not found: " + use->name);
+                Error("Module not found: " + use->name);
             
             ImportModuleStructs(*it->second);
             ImportModuleGlobals(*it->second);
@@ -179,7 +179,7 @@ private:
             {
                 auto it = m_functions.find(proc->name);
                 if (it == m_functions.end())
-                    throw std::runtime_error("Function not declared: " + proc->name);
+                    Error("Function not declared: " + proc->name);
                 
                 DefineFunctionBody(proc.get(), it->second);
             }
@@ -240,7 +240,7 @@ private:
                 initializer = cast<Constant>(initValue.value);
             }
             else
-                throw std::runtime_error("Global variable '" + decl->name + 
+                Error("Global variable '" + decl->name + 
                     "' must have either a type or an initializer");
             
             auto linkage = decl->is_pub ? GlobalValue::ExternalLinkage : GlobalValue::InternalLinkage;
@@ -288,7 +288,7 @@ private:
                     return TypedValue(globalVar, globalIt->second.type);
             }
             
-            throw std::runtime_error("Cannot use variable in constant expression: " + id->name);
+            Error("Cannot use variable in constant expression: " + id->name);
         }
     
         if (auto* num = dynamic_cast<NumberLiteral*>(node))
@@ -320,7 +320,7 @@ private:
         if (auto* ch = dynamic_cast<CharLiteral*>(node))
         {
             if (ch->value.empty())
-                throw std::runtime_error("Empty character literal");
+                Error("Empty character literal");
             
             uint8_t charValue = static_cast<uint8_t>(ch->value[0]);
             auto* val = m_builder.getInt8(charValue);
@@ -359,7 +359,7 @@ private:
                 
                 return negated;
             }
-            throw std::runtime_error("Unsupported unary operator in constant expression");
+            Error("Unsupported unary operator in constant expression");
         }
         
         if (auto* arrInit = dynamic_cast<ArrayInit*>(node))
@@ -376,7 +376,7 @@ private:
             else
             {
                 if (arrInit->elements.empty())
-                    throw std::runtime_error("Cannot infer array type from empty initializer");
+                    Error("Cannot infer array type from empty initializer");
                 
                 elemType = EvaluateConstantExpr(arrInit->elements[0].get()).type;
                 
@@ -409,7 +409,7 @@ private:
         {
             auto it = m_structs.find(structInit->type_name);
             if (it == m_structs.end())
-                throw std::runtime_error("Unknown struct: " + structInit->type_name);
+                Error("Unknown struct: " + structInit->type_name);
             
             const StructInfo& info = it->second;
             std::vector<Constant*> fieldValues;
@@ -439,7 +439,7 @@ private:
             return TypedValue(m_builder.getInt64(size), TypeInfo(m_builder.getInt64Ty(), true));
         }
         
-        throw std::runtime_error("Invalid constant expression for global variable");
+        Error("Invalid constant expression for global variable");
     }
 
     Constant* ConstantCast(Constant* value, const TypeInfo& fromType, const TypeInfo& toType)
@@ -451,7 +451,7 @@ private:
         Type* toLLVMType = toType.llvmType;
 
         if ((toType.functionInfo && !fromType.functionInfo))
-            throw std::runtime_error("Cannot assign non-function pointer to function pointer");
+            Error("Cannot assign non-function pointer to function pointer");
         
         // Pointer to Pointer
         if (fromLLVMType->isPointerTy() && toLLVMType->isPointerTy())
@@ -517,7 +517,7 @@ private:
         if (fromLLVMType->isPointerTy() && toLLVMType->isIntegerTy())
             return ConstantExpr::getPtrToInt(value, toLLVMType);
         
-        throw std::runtime_error("Cannot cast between incompatible types in constant expression");
+        Error("Cannot cast between incompatible types in constant expression");
     }
     
     void RegisterBuiltinFunctions()
@@ -602,7 +602,7 @@ private:
             if (funcInfo.returnType.llvmType->isVoidTy())
                 m_builder.CreateRetVoid();
             else
-                throw std::runtime_error("Non-void function '" + proc->name + "' must return a value");
+                Error("Non-void function '" + proc->name + "' must return a value");
         }
     }
 
@@ -622,7 +622,7 @@ private:
     void GenerateVarDeclHosingAlloc(VarDecl *decl)
     {
         if (IsVariableAccessibleInCurrentScope(decl->name))
-            throw std::runtime_error("Variable already declared in this scope: " + decl->name);
+            Error("Variable already declared in this scope: " + decl->name);
 
         TypeInfo type;
         
@@ -636,7 +636,7 @@ private:
             type = initValue.type;
         }
         else
-            throw std::runtime_error("Variable '" + decl->name + "' must have either a type or an initializer");
+            Error("Variable '" + decl->name + "' must have either a type or an initializer");
         
         std::string scopedName = decl->name + '.' + std::to_string(m_currentScopeId);
         auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, scopedName);
@@ -852,7 +852,7 @@ private:
     void GenerateBreak()
     {
         if (!m_loopContext.breakTarget)
-            throw std::runtime_error("'break' outside of loop");
+            Error("'break' outside of loop");
         
         m_builder.CreateBr(m_loopContext.breakTarget);
         CreateUnreachableBlock();
@@ -861,7 +861,7 @@ private:
     void GenerateContinue()
     {
         if (!m_loopContext.continueTarget)
-            throw std::runtime_error("'continue' outside of loop");
+            Error("'continue' outside of loop");
         
         m_builder.CreateBr(m_loopContext.continueTarget);
         CreateUnreachableBlock();
@@ -878,7 +878,7 @@ private:
             {
                 TypedValue ptr = EvaluateRValue(unary->operand.get());
                 if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
-                    throw std::runtime_error("Cannot dereference non-pointer");
+                    Error("Cannot dereference non-pointer");
                 return TypedValue(ptr.value, TypeInfo(ptr.type.pointeeType, ptr.type.isUnsigned));
             }
         }
@@ -899,7 +899,7 @@ private:
             return TypedValue(m_builder.CreateBitCast(operand.value, m_builder.getPtrTy()), targetType);
         }
         
-        throw std::runtime_error("Expression is not an lvalue");
+        Error("Expression is not an lvalue");
     }
 
     TypedValue EvaluateRValue(ExprNode* node, const TypeInfo* expectedType = nullptr)
@@ -940,7 +940,7 @@ private:
         if (auto* ch = dynamic_cast<CharLiteral*>(node))
         {
             if (ch->value.empty())
-                throw std::runtime_error("Empty character literal");
+                Error("Empty character literal");
             
             uint8_t charValue = static_cast<uint8_t>(ch->value[0]);
             auto* val = m_builder.getInt8(charValue);
@@ -991,7 +991,7 @@ private:
         if (auto* binary = dynamic_cast<BinaryExpr*>(node))
             return EvaluateBinaryExpr(binary);
         
-        throw std::runtime_error("Invalid rvalue expression");
+        Error("Invalid rvalue expression");
     }
 
     TypedValue EvaluateNumberLiteral(NumberLiteral* lit)
@@ -1080,12 +1080,12 @@ private:
             if (func.isVarArg)
             {
                 if (call->args.size() < func.paramTypes.size())
-                    throw std::runtime_error("Too few arguments for " + call->function);
+                    Error("Too few arguments for " + call->function);
             }
             else
             {
                 if (call->args.size() != func.paramTypes.size())
-                    throw std::runtime_error("Argument count mismatch for " + call->function);
+                    Error("Argument count mismatch for " + call->function);
             }
             
             std::vector<Value*> args;
@@ -1110,19 +1110,19 @@ private:
         Variable var = LookupVariable(call->function);
         
         if (!var.type.functionInfo)
-            throw std::runtime_error("Variable '" + call->function + "' is not callable");
+            Error("Variable '" + call->function + "' is not callable");
         
         const FunctionInfo& funcInfo = *var.type.functionInfo;
         
         if (funcInfo.isVarArg)
         {
             if (call->args.size() < funcInfo.paramTypes.size())
-                throw std::runtime_error("Too few arguments for " + call->function);
+                Error("Too few arguments for " + call->function);
         }
         else
         {
             if (call->args.size() != funcInfo.paramTypes.size())
-                throw std::runtime_error("Argument count mismatch for " + call->function);
+                Error("Argument count mismatch for " + call->function);
         }
         
         // Load the function pointer
@@ -1163,7 +1163,7 @@ private:
         if (baseType->isPointerTy())
         {
             if (!base.type.pointeeType)
-                throw std::runtime_error("Cannot index pointer without pointee type");
+                Error("Cannot index pointer without pointee type");
             
             Value* gep = m_builder.CreateInBoundsGEP(
                 base.type.pointeeType, base.value, index.value
@@ -1183,7 +1183,7 @@ private:
             return TypedValue(gep, TypeInfo(elementType, base.type.isUnsigned));
         }
         
-        throw std::runtime_error("Cannot index non-array/non-pointer type");
+        Error("Cannot index non-array/non-pointer type");
     }
 
     TypedValue EvaluateMemberAccess(MemberAccess* access)
@@ -1192,15 +1192,15 @@ private:
         
         Type* structType = structPtr.type.llvmType;
         if (!structType->isStructTy())
-            throw std::runtime_error("Member access on non-struct type");
+            Error("Member access on non-struct type");
         
         const StructInfo* structInfo = FindStructInfo(structType);
         if (!structInfo)
-            throw std::runtime_error("Unknown struct type");
+            Error("Unknown struct type");
         
         auto it = structInfo->fieldIndices.find(access->member);
         if (it == structInfo->fieldIndices.end())
-            throw std::runtime_error("Unknown member: " + access->member);
+            Error("Unknown member: " + access->member);
         
         unsigned fieldIndex = it->second;
         const TypeInfo& fieldType = structInfo->fieldTypes.at(access->member);
@@ -1214,19 +1214,19 @@ private:
         TypedValue ptr = EvaluateRValue(access->object.get());
         
         if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
-            throw std::runtime_error("Cannot use -> on non-pointer type");
+            Error("Cannot use -> on non-pointer type");
         
         Type* pointeeType = ptr.type.pointeeType;
         if (!pointeeType->isStructTy())
-            throw std::runtime_error("Cannot access member on non-struct pointer");
+            Error("Cannot access member on non-struct pointer");
         
         const StructInfo* structInfo = FindStructInfo(pointeeType);
         if (!structInfo)
-            throw std::runtime_error("Unknown struct type");
+            Error("Unknown struct type");
         
         auto it = structInfo->fieldIndices.find(access->member);
         if (it == structInfo->fieldIndices.end())
-            throw std::runtime_error("Unknown member: " + access->member);
+            Error("Unknown member: " + access->member);
         
         unsigned fieldIndex = it->second;
         const TypeInfo& fieldType = structInfo->fieldTypes.at(access->member);
@@ -1249,7 +1249,7 @@ private:
         else
         {
             if (init->elements.empty())
-                throw std::runtime_error("Cannot infer array type from empty initializer");
+                Error("Cannot infer array type from empty initializer");
             
             arraySize = init->elements.size();
             elementType = EvaluateRValue(init->elements[0].get()).type;
@@ -1282,12 +1282,12 @@ private:
     {
         auto it = m_structs.find(init->type_name);
         if (it == m_structs.end())
-            throw std::runtime_error("Unknown struct: " + init->type_name);
+            Error("Unknown struct: " + init->type_name);
         
         const StructInfo& info = it->second;
         
         if (init->fields.size() > info.fieldIndices.size())
-            throw std::runtime_error("Too many fields in struct initializer");
+            Error("Too many fields in struct initializer");
         
         auto* alloca = m_builder.CreateAlloca(info.type, nullptr, "struct_tmp");
         
@@ -1295,7 +1295,7 @@ private:
         {
             const TypeInfo* fieldType = FindFieldTypeAtIndex(info, i);
             if (!fieldType)
-                throw std::runtime_error("Field type not found at index " + std::to_string(i));
+                Error("Field type not found at index " + std::to_string(i));
             
             Value* fieldValue = (i < init->fields.size())
                 ? CastIfNeeded(EvaluateRValue(init->fields[i].get(), fieldType), *fieldType).value  // Pass fieldType here
@@ -1321,7 +1321,7 @@ private:
         {
             TypedValue ptr = EvaluateRValue(unary->operand.get());
             if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
-                throw std::runtime_error("Cannot dereference non-pointer");
+                Error("Cannot dereference non-pointer");
             auto* loaded = m_builder.CreateLoad(ptr.type.pointeeType, ptr.value);
             return TypedValue(loaded, TypeInfo(ptr.type.pointeeType, ptr.type.isUnsigned));
         }
@@ -1345,7 +1345,7 @@ private:
             return TypedValue(result, TypeInfo(m_builder.getInt1Ty(), false));
         }
         
-        throw std::runtime_error("Unknown unary operator");
+        Error("Unknown unary operator");
     }
 
     TypedValue EvaluateBinaryExpr(BinaryExpr* binary)
@@ -1393,23 +1393,23 @@ private:
             case '/': result = CreateDivision(lhs.value, rhs.value, isFloat, isUnsigned); break;
             case '%': result = CreateRemainder(lhs.value, rhs.value, isFloat, isUnsigned); break;
             case '&': 
-                if (isFloat) throw std::runtime_error("Bitwise AND not supported on floating-point types");
+                if (isFloat) Error("Bitwise AND not supported on floating-point types");
                 result = m_builder.CreateAnd(lhs.value, rhs.value); 
                 break;
             case '|': 
-                if (isFloat) throw std::runtime_error("Bitwise OR not supported on floating-point types");
+                if (isFloat) Error("Bitwise OR not supported on floating-point types");
                 result = m_builder.CreateOr(lhs.value, rhs.value); 
                 break;
             case '^': 
-                if (isFloat) throw std::runtime_error("Bitwise XOR not supported on floating-point types");
+                if (isFloat) Error("Bitwise XOR not supported on floating-point types");
                 result = m_builder.CreateXor(lhs.value, rhs.value); 
                 break;
             case 'l': // 
-                if (isFloat) throw std::runtime_error("Left shift not supported on floating-point types");
+                if (isFloat) Error("Left shift not supported on floating-point types");
                 result = m_builder.CreateShl(lhs.value, rhs.value); 
                 break;
             case 'r': // >>
-                if (isFloat) throw std::runtime_error("Right shift not supported on floating-point types");
+                if (isFloat) Error("Right shift not supported on floating-point types");
                 result = isUnsigned ? m_builder.CreateLShr(lhs.value, rhs.value) : m_builder.CreateAShr(lhs.value, rhs.value);
                 break;
             case 'E': result = CreateEquality(lhs.value, rhs.value, isFloat, true); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
@@ -1418,7 +1418,7 @@ private:
             case 'L': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SLE, CmpInst::ICMP_ULE, CmpInst::FCMP_OLE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case '>': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SGT, CmpInst::ICMP_UGT, CmpInst::FCMP_OGT); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case 'G': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SGE, CmpInst::ICMP_UGE, CmpInst::FCMP_OGE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
-            default: throw std::runtime_error("Unknown binary operator");
+            default: Error("Unknown binary operator");
         }
         
         return TypedValue(result, resultType);
@@ -1508,7 +1508,7 @@ private:
         {
             auto it = m_structs.find(structInit->type_name);
             if (it == m_structs.end())
-                throw std::runtime_error("Unknown struct: " + structInit->type_name);
+                Error("Unknown struct: " + structInit->type_name);
             
             const StructInfo& info = it->second;
             std::vector<Constant*> fieldValues;
@@ -1524,7 +1524,7 @@ private:
             return ConstantStruct::get(info.type, fieldValues);
         }
         
-        throw std::runtime_error("Invalid constant expression");
+        Error("Invalid constant expression");
     }
     
     TypeInfo ResolveType(TypeNode* node)
@@ -1586,7 +1586,7 @@ private:
         }
         
         if (!baseType)
-            throw std::runtime_error("Unknown type: " + node->name);
+            Error("Unknown type: " + node->name);
         
         // Apply pointer depth
         if (node->pointer_depth > 0)
@@ -1635,7 +1635,7 @@ private:
         Type* toType = targetType.llvmType;
 
         if ((targetType.functionInfo && !value.type.functionInfo))
-            throw std::runtime_error("Cannot assign non-function pointer to function pointer");
+            Error("Cannot assign non-function pointer to function pointer");
         
         // Pointer to Pointer
         if (fromType->isPointerTy() && toType->isPointerTy())
@@ -1706,7 +1706,7 @@ private:
         if (fromType->isPointerTy() && toType->isIntegerTy())
             return TypedValue(m_builder.CreatePtrToInt(value.value, toType), targetType);
         
-        throw std::runtime_error("Cannot cast between incompatible types");
+        Error("Cannot cast between incompatible types");
     }
     
     TypeInfo PromoteToCommonType(const TypeInfo& left, const TypeInfo& right)
@@ -1774,7 +1774,7 @@ private:
         if (it != m_globals.end())
             return it->second;
         
-        throw std::runtime_error("Unknown variable: " + name);
+        Error("Unknown variable: " + name);
     }
 
     const StructInfo* FindStructInfo(Type* structType) const
@@ -1857,6 +1857,11 @@ private:
         return isUnsigned 
             ? m_builder.CreateICmp(unsignedPred, lhs, rhs)
             : m_builder.CreateICmp(signedPred, lhs, rhs);
+    }
+
+    void Error(const std::string& msg)
+    {
+        throw std::runtime_error(msg + " in module \'" + m_module->getName().str() + '\'');
     }
     
     std::vector<Scope> m_scopes;
