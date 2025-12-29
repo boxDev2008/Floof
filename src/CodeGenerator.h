@@ -22,18 +22,20 @@ class CodeGenerator
         Type* llvmType;
         Type* pointeeType;  // For pointer types
         bool isUnsigned;
+        bool isConst;
 
         // For function pointers
         std::shared_ptr<FunctionInfo> functionInfo;
 
-        TypeInfo() : llvmType(nullptr), isUnsigned(false), pointeeType(nullptr) {}
-        TypeInfo(Type* t, bool u, Type* pt = nullptr, std::shared_ptr<FunctionInfo> fi = nullptr) 
-            : llvmType(t), isUnsigned(u), pointeeType(pt), functionInfo(fi) {}
+        TypeInfo() : llvmType(nullptr), isUnsigned(false), isConst(false), pointeeType(nullptr) {}
+        TypeInfo(Type* t, bool u, bool c = false, Type* pt = nullptr, std::shared_ptr<FunctionInfo> fi = nullptr) 
+        : llvmType(t), isUnsigned(u), isConst(c), pointeeType(pt), functionInfo(fi) {}
 
         
         bool operator==(const TypeInfo& other) const {
-            return llvmType == other.llvmType && 
-                   isUnsigned == other.isUnsigned && 
+            return llvmType == other.llvmType &&
+                   isUnsigned == other.isUnsigned &&
+                   isConst == other.isConst &&
                    pointeeType == other.pointeeType;
         }
         
@@ -46,7 +48,7 @@ class CodeGenerator
     {
         Value* value;
         TypeInfo type;
-        
+
         TypedValue() = default;
         TypedValue(Value* v, const TypeInfo& t) : value(v), type(t) {}
     };
@@ -55,9 +57,10 @@ class CodeGenerator
     {
         TypeInfo type;
         Value* storage;  // alloca or global
+        bool isConst;
 
         Variable() = default;
-        Variable(const TypeInfo& t, Value* s) : type(t), storage(s) {}
+        Variable(const TypeInfo& t, Value* s, bool c) : type(t), storage(s), isConst(c) {}
     };
 
     struct StructInfo
@@ -148,7 +151,7 @@ private:
                 *m_module, type.llvmType, decl->type->is_const,
                 GlobalValue::ExternalLinkage, nullptr, decl->name
             );
-            m_globals[decl->name] = {type, globalVar};
+            m_globals[decl->name] = {type, globalVar, decl->type->is_const};
         }
     }
 
@@ -250,7 +253,7 @@ private:
                 *m_module, type.llvmType, decl->type ? decl->type->is_const : false, 
                 linkage, initializer, decl->name
             );
-            m_globals[decl->name] = {type, globalVar};
+            m_globals[decl->name] = {type, globalVar, decl->type ? decl->type->is_const : false};
         }
     }
 
@@ -273,6 +276,7 @@ private:
                     func,
                     TypeInfo(
                         func->getType(),
+                        false,
                         false,
                         func->getFunctionType(),
                         std::make_shared<FunctionInfo>(funcIt->second)
@@ -585,11 +589,12 @@ private:
         unsigned idx = 0;
         for (auto& arg : funcInfo.function->args())
         {
+            const Parameter &param = proc->params[idx];
             TypeInfo paramType = funcInfo.paramTypes[idx++];
             std::string name = arg.getName().str() + ".0";
             auto* alloca = m_builder.CreateAlloca(paramType.llvmType, nullptr, name);
             m_builder.CreateStore(&arg, alloca);
-            m_locals[name] = Variable(paramType, alloca);
+            m_locals[name] = Variable(paramType, alloca, param.type->is_const);
         }
         
         GenerateHostingAllocs(proc->body.get());
@@ -642,7 +647,7 @@ private:
         
         std::string scopedName = decl->name + '.' + std::to_string(m_currentScopeId);
         auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, scopedName);
-        m_locals[scopedName] = Variable(type, alloca);
+        m_locals[scopedName] = Variable(type, alloca, decl->type ? decl->type->is_const : false);
     }
 
     void GenerateHostingAllocs(BlockStmt* block)
@@ -873,7 +878,12 @@ private:
     TypedValue EvaluateLValue(ExprNode* node)
     {
         if (auto* id = dynamic_cast<Identifier*>(node))
-            return TypedValue(LookupVariable(id->name).storage, LookupVariable(id->name).type);
+        {
+            Variable var = LookupVariable(id->name);
+            TypeInfo type = var.type;
+            type.isConst = var.isConst;
+            return TypedValue(var.storage, type);
+        }
         
         if (auto* unary = dynamic_cast<UnaryExpr*>(node))
         {
@@ -882,7 +892,7 @@ private:
                 TypedValue ptr = EvaluateRValue(unary->operand.get());
                 if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
                     Error("Cannot dereference non-pointer");
-                return TypedValue(ptr.value, TypeInfo(ptr.type.pointeeType, ptr.type.isUnsigned));
+                return TypedValue(ptr.value, TypeInfo(ptr.type.pointeeType, ptr.type.isUnsigned, ptr.type.isConst));
             }
         }
         
@@ -923,6 +933,7 @@ private:
                     func,
                     TypeInfo(
                         func->getType(),
+                        false,
                         false,
                         func->getFunctionType(),
                         std::make_shared<FunctionInfo>(funcIt->second)
@@ -1171,7 +1182,7 @@ private:
             Value* gep = m_builder.CreateInBoundsGEP(
                 base.type.pointeeType, base.value, index.value
             );
-            return TypedValue(gep, TypeInfo(base.type.pointeeType, base.type.isUnsigned));
+            return TypedValue(gep, TypeInfo(base.type.pointeeType, base.type.isUnsigned, base.type.isConst));
         }
         
         // Handle array indexing (requires lvalue)
@@ -1183,7 +1194,7 @@ private:
                 baseType, base.value,
                 {m_builder.getInt64(0), index.value}
             );
-            return TypedValue(gep, TypeInfo(elementType, base.type.isUnsigned));
+            return TypedValue(gep, TypeInfo(elementType, base.type.isUnsigned, base.type.isConst));
         }
         
         Error("Cannot index non-array/non-pointer type");
@@ -1206,8 +1217,9 @@ private:
             Error("Unknown member: " + access->member);
         
         unsigned fieldIndex = it->second;
-        const TypeInfo& fieldType = structInfo->fieldTypes.at(access->member);
-        
+        TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
+        fieldType.isConst = structPtr.type.isConst || fieldType.isConst;
+
         auto* fieldPtr = m_builder.CreateStructGEP(structType, structPtr.value, fieldIndex);
         return TypedValue(fieldPtr, fieldType);
     }
@@ -1232,8 +1244,10 @@ private:
             Error("Unknown member: " + access->member);
         
         unsigned fieldIndex = it->second;
-        const TypeInfo& fieldType = structInfo->fieldTypes.at(access->member);
-        
+    
+        TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
+        fieldType.isConst = ptr.type.isConst || fieldType.isConst;
+
         auto* fieldPtr = m_builder.CreateStructGEP(pointeeType, ptr.value, fieldIndex);
         return TypedValue(fieldPtr, fieldType);
     }
@@ -1317,7 +1331,14 @@ private:
         if (unary->op == '&')
         {
             TypedValue lval = EvaluateLValue(unary->operand.get());
-            return TypedValue(lval.value, TypeInfo(m_builder.getPtrTy(), false, lval.type.llvmType));
+            TypeInfo ptrType(
+                m_builder.getPtrTy(),
+                false,
+                false,
+                lval.type.llvmType,
+                nullptr
+            );
+            return TypedValue(lval.value, ptrType);
         }
         
         if (unary->op == '*')
@@ -1357,6 +1378,21 @@ private:
         if (binary->op == '=')
         {
             TypedValue lhs = EvaluateLValue(binary->left.get());
+
+            if (lhs.type.isConst)
+            {
+                if (auto* id = dynamic_cast<Identifier*>(binary->left.get()))
+                    throw std::runtime_error("Cannot assign to constant variable '" + id->name + "'");
+                else if (auto* member = dynamic_cast<MemberAccess*>(binary->left.get()))
+                    throw std::runtime_error("Cannot assign to constant member '" + member->member + "'");
+                else if (dynamic_cast<ArrayAccess*>(binary->left.get()))
+                    throw std::runtime_error("Cannot assign to constant array element");
+                else if (dynamic_cast<UnaryExpr*>(binary->left.get()))
+                    throw std::runtime_error("Cannot assign to constant through pointer dereference");
+                else
+                    throw std::runtime_error("Cannot assign to constant expression");
+            }
+
             TypedValue rhs = EvaluateRValue(binary->right.get());
             
             if (rhs.type != lhs.type)
@@ -1555,7 +1591,7 @@ private:
             auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, false);
             auto* funcPtrType = m_builder.getPtrTy();
 
-            return TypeInfo(funcPtrType, false, funcType, std::make_shared<FunctionInfo>(funcInfo));
+            return TypeInfo(funcPtrType, false, node->is_const, funcType, std::make_shared<FunctionInfo>(funcInfo));
         }
         
         if (!node->array_dimensions.empty())
@@ -1593,9 +1629,9 @@ private:
         
         // Apply pointer depth
         if (node->pointer_depth > 0)
-            return TypeInfo(m_builder.getPtrTy(), false, baseType);
+            return TypeInfo(m_builder.getPtrTy(), false, node->is_const, baseType);
         
-        return TypeInfo(baseType, isUnsigned);
+        return TypeInfo(baseType, isUnsigned, node->is_const, nullptr);
     }
 
     // Helper to get builtin type - returns nullptr if not found
