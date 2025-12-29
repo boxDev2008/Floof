@@ -645,7 +645,7 @@ private:
 
     void GenerateHostingAllocs(BlockStmt* block)
     {
-        uint32_t scopeId = m_scopes.size() - 1;
+        uint32_t scopeId = m_highestScopeId;
         m_currentScopeId = scopeId;
         for (const auto& stmt : block->statements)
         {
@@ -671,9 +671,10 @@ private:
             }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
             {
+                m_currentScopeId = ++m_highestScopeId;
                 if (s->init)
                     GenerateVarDeclHosingAlloc(s->init.get());
-                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
+                m_scopes.push_back(Scope{ (int32_t)scopeId, m_highestScopeId });
                 GenerateHostingAllocs(s->body.get());
                 m_currentScopeId = scopeId;
             }
@@ -811,7 +812,7 @@ private:
         // Initialize loop variable
         if (stmt->init)
         {
-            Variable variable = m_locals[stmt->init->name];
+            Variable variable = m_locals[stmt->init->name + '.' + std::to_string(m_currentScopeId)];
             if (stmt->init->init)
             {
                 TypedValue initValue = EvaluateRValue(stmt->init->init.get(), &variable.type);

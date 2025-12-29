@@ -7,6 +7,7 @@
 #include <sstream>
 #include <memory>
 #include <map>
+#include <future>
 
 #include <toml++/toml.hpp>
 
@@ -171,52 +172,88 @@ private:
             targetTriple, "generic", "", opt, llvm::Reloc::PIC_);
     }
 
-    std::string compileModulesToObjects(
-        std::map<std::string, std::unique_ptr<ModuleAST>> &moduleMap,
-        llvm::TargetMachine *targetMachine)
+    std::string compileSingleModule(
+        const std::string& moduleName,
+        const ModuleAST& moduleAST,
+        const std::map<std::string, std::unique_ptr<ModuleAST>>& moduleMap,
+        const fs::path& projectDir,
+        const llvm::TargetMachine& baseTM)
     {
+        llvm::LLVMContext localContext;
 
-        std::string objectFiles;
-        int moduleCount = 0;
+        std::unique_ptr<llvm::TargetMachine> targetMachine(
+            baseTM.getTarget().createTargetMachine(
+                baseTM.getTargetTriple().str(),
+                baseTM.getTargetCPU(),
+                baseTM.getTargetFeatureString(),
+                baseTM.Options,
+                baseTM.getRelocationModel(),
+                baseTM.getCodeModel(),
+                baseTM.getOptLevel()
+            )
+        );
 
-        for (const auto &[moduleName, moduleAST] : moduleMap)
+        CodeGenerator codeGen(
+            localContext,
+            const_cast<ModuleAST&>(moduleAST),
+            moduleName,
+            const_cast<std::map<std::string, std::unique_ptr<ModuleAST>>&>(moduleMap)
+        );
+        auto module = codeGen.GetModule();
+
+        module->setTargetTriple(targetMachine->getTargetTriple().str());
+        module->setDataLayout(targetMachine->createDataLayout());
+
+        fs::path objectPath = projectDir / "obj" / (moduleName + ".o");
+
+        std::error_code ec;
+        llvm::raw_fd_ostream dest(objectPath.string(), ec, llvm::sys::fs::OF_None);
+        if (ec)
+            throw std::runtime_error("Could not open file: " + ec.message());
+
+        llvm::legacy::PassManager pass;
+        if (targetMachine->addPassesToEmitFile(
+                pass, dest, nullptr, llvm::CGFT_ObjectFile))
         {
-            std::cout << Color::DIM << "  └─ " << Color::RESET
-                      << "Compiling " << Color::CYAN << moduleName << ".floof"
-                      << Color::RESET << "...\n";
-
-            CodeGenerator codeGen(context, *moduleAST, moduleName, moduleMap);
-            auto module = codeGen.GetModule();
-
-            module->setTargetTriple(targetMachine->getTargetTriple().str());
-            module->setDataLayout(targetMachine->createDataLayout());
-
-            fs::path objectPath = projectDir / "obj" / (moduleName + ".o");
-
-            std::error_code ec;
-            llvm::raw_fd_ostream dest(objectPath.string(), ec, llvm::sys::fs::OF_None);
-            if (ec)
-            {
-                throw std::runtime_error("Could not open file: " + ec.message());
-            }
-
-            llvm::legacy::PassManager pass;
-            if (targetMachine->addPassesToEmitFile(pass, dest, nullptr,
-                                                   llvm::CodeGenFileType::CGFT_ObjectFile))
-            {
-                throw std::runtime_error("TargetMachine can't emit object file");
-            }
-
-            pass.run(*module);
-            dest.flush();
-
-            objectFiles += "\"" + objectPath.string() + "\" ";
-            moduleCount++;
+            throw std::runtime_error("TargetMachine can't emit object file");
         }
 
+        pass.run(*module);
+        dest.flush();
+
+        return "\"" + objectPath.string() + "\" ";
+    }
+
+    std::string compileModulesToObjects(
+        std::map<std::string, std::unique_ptr<ModuleAST>>& moduleMap,
+        llvm::TargetMachine* baseTM)
+    {
+        std::vector<std::future<std::string>> jobs;
+
+        for (const auto& [moduleName, moduleAST] : moduleMap)
+        {
+            std::cout << Color::DIM << "  └─ " << Color::RESET
+                    << "Compiling " << Color::CYAN << moduleName << ".floof"
+                    << Color::RESET << "...\n";
+
+            jobs.emplace_back(std::async(std::launch::async, [&, moduleName]() {
+                return compileSingleModule(
+                    moduleName,
+                    *moduleAST,
+                    moduleMap,
+                    projectDir,
+                    *baseTM
+                );
+            }));
+        }
+
+        std::string objectFiles;
+        for (auto& job : jobs)
+            objectFiles += job.get();
+
         std::cout << Color::DIM << "  └─ " << Color::RESET
-                  << "Compiled " << Color::BRIGHT_GREEN << moduleCount
-                  << Color::RESET << " module(s)\n";
+                << "Compiled " << Color::BRIGHT_GREEN
+                << jobs.size() << Color::RESET << " module(s)\n";
 
         return objectFiles;
     }
