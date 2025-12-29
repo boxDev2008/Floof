@@ -96,6 +96,8 @@ public:
     {
         m_module = std::make_unique<Module>(moduleName, ctx);
 
+        m_scopes.reserve(64);
+
         ImportUsedModules(ast, moduleTable);
         RegisterStructs(ast);
         DeclareUserFunctions(ast);
