@@ -99,8 +99,6 @@ public:
     {
         m_module = std::make_unique<Module>(moduleName, ctx);
 
-        m_scopes.reserve(64);
-
         ImportUsedModules(ast, moduleTable);
         RegisterStructs(ast);
         DeclareUserFunctions(ast);
@@ -580,8 +578,8 @@ private:
         m_locals.clear();
 
         m_scopes.push_back(Scope{ -1, 0 });
-        m_currentScopeId = 0;
-        m_highestScopeId = 0;
+        m_currentScope = 0;
+        m_scopeCount = 0;
         auto* entry = BasicBlock::Create(m_context, "entry", funcInfo.function);
         m_builder.SetInsertPoint(entry);
         
@@ -599,8 +597,8 @@ private:
         
         GenerateHostingAllocs(proc->body.get());
 
-        m_currentScopeId = 0;
-        m_highestScopeId = 0;
+        m_currentScope = 0;
+        m_scopeCount = 0;
         GenerateBlock(proc->body.get(), funcInfo.returnType);
         
         // Add implicit return if needed
@@ -615,7 +613,7 @@ private:
 
     bool IsVariableAccessibleInCurrentScope(const std::string& name)
     {
-        int32_t scopeIdx = m_currentScopeId;
+        int32_t scopeIdx = m_currentScope;
         while (scopeIdx >= 0)
         {
             Scope& scope = m_scopes[scopeIdx];
@@ -645,52 +643,52 @@ private:
         else
             Error("Variable '" + decl->name + "' must have either a type or an initializer");
         
-        std::string scopedName = decl->name + '.' + std::to_string(m_currentScopeId);
+        std::string scopedName = decl->name + '.' + std::to_string(m_currentScope);
         auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, scopedName);
         m_locals[scopedName] = Variable(type, alloca, decl->type ? decl->type->is_const : false);
     }
 
     void GenerateHostingAllocs(BlockStmt* block)
     {
-        uint32_t scopeId = m_highestScopeId;
-        m_currentScopeId = scopeId;
+        uint32_t scopeId = m_scopeCount;
+        m_currentScope = scopeId;
         for (const auto& stmt : block->statements)
         {
             if (auto* decl = dynamic_cast<VarDecl*>(stmt.get()))
                 GenerateVarDeclHosingAlloc(decl);
             else if (auto* s = dynamic_cast<IfStmt*>(stmt.get()))
             {
-                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
+                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
                 GenerateHostingAllocs(s->then_branch.get());
-                m_currentScopeId = scopeId;
+                m_currentScope = scopeId;
                 if (s->else_branch)
                 {
-                    m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
+                    m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
                     GenerateHostingAllocs(s->else_branch.get());
-                    m_currentScopeId = scopeId;
+                    m_currentScope = scopeId;
                 }
             }
             else if (auto* s = dynamic_cast<WhileStmt*>(stmt.get()))
             {
-                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_highestScopeId });
+                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
                 GenerateHostingAllocs(s->then_branch.get());
-                m_currentScopeId = scopeId;
+                m_currentScope = scopeId;
             }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
             {
-                m_currentScopeId = ++m_highestScopeId;
+                m_currentScope = ++m_scopeCount;
                 if (s->init)
                     GenerateVarDeclHosingAlloc(s->init.get());
-                m_scopes.push_back(Scope{ (int32_t)scopeId, m_highestScopeId });
+                m_scopes.push_back(Scope{ (int32_t)scopeId, m_scopeCount });
                 GenerateHostingAllocs(s->body.get());
-                m_currentScopeId = scopeId;
+                m_currentScope = scopeId;
             }
         }
     }
     
     void GenerateBlock(BlockStmt* block, const TypeInfo& returnType)
     {
-        uint32_t scopeId = m_currentScopeId;
+        uint32_t scopeId = m_currentScope;
         for (const auto& stmt : block->statements)
         {
             if (auto* s = dynamic_cast<VarDecl*>(stmt.get()))
@@ -701,21 +699,21 @@ private:
                 GenerateReturn(s, returnType);
             else if (auto* s = dynamic_cast<IfStmt*>(stmt.get()))
             {
-                m_currentScopeId = ++m_highestScopeId;
+                m_currentScope = ++m_scopeCount;
                 GenerateIf(s, returnType);
-                m_currentScopeId = scopeId;
+                m_currentScope = scopeId;
             }
             else if (auto* s = dynamic_cast<WhileStmt*>(stmt.get()))
             {
-                m_currentScopeId = ++m_highestScopeId;
+                m_currentScope = ++m_scopeCount;
                 GenerateWhile(s, returnType);
-                m_currentScopeId = scopeId;
+                m_currentScope = scopeId;
             }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
             {
-                m_currentScopeId = ++m_highestScopeId;
+                m_currentScope = ++m_scopeCount;
                 GenerateFor(s, returnType);
-                m_currentScopeId = scopeId;
+                m_currentScope = scopeId;
             }
             else if (auto* s = dynamic_cast<BreakStmt*>(stmt.get()))
                 GenerateBreak();
@@ -726,7 +724,7 @@ private:
 
     void GenerateVarDecl(VarDecl* decl)
     {
-        std::string scopedName = decl->name + '.' + std::to_string(m_currentScopeId);
+        std::string scopedName = decl->name + '.' + std::to_string(m_currentScope);
         Variable& variable = m_locals[scopedName];
         
         if (decl->init)
@@ -778,7 +776,7 @@ private:
         if (elseBB)
         {
             m_builder.SetInsertPoint(elseBB);
-            m_currentScopeId++;
+            m_currentScope++;
             GenerateBlock(stmt->else_branch.get(), returnType);
             if (!m_builder.GetInsertBlock()->getTerminator())
                 m_builder.CreateBr(mergeBB);
@@ -819,7 +817,7 @@ private:
         // Initialize loop variable
         if (stmt->init)
         {
-            Variable variable = m_locals[stmt->init->name + '.' + std::to_string(m_currentScopeId)];
+            Variable variable = m_locals[stmt->init->name + '.' + std::to_string(m_currentScope)];
             if (stmt->init->init)
             {
                 TypedValue initValue = EvaluateRValue(stmt->init->init.get(), &variable.type);
@@ -1401,19 +1399,16 @@ private:
             return rhs;
         }
 
+        TypedValue lhs = EvaluateRValue(binary->left.get());
+        TypedValue rhs = EvaluateRValue(binary->right.get());
+
         // Handle pointer arithmetic
         if (binary->op == '+' || binary->op == '-')
         {
-            TypedValue lhs = EvaluateRValue(binary->left.get());
-            TypedValue rhs = EvaluateRValue(binary->right.get());
-            
             if (auto result = TryPointerArithmetic(binary->op, lhs, rhs))
                 return *result;
         }
-        
-        TypedValue lhs = EvaluateRValue(binary->left.get());
-        TypedValue rhs = EvaluateRValue(binary->right.get());
-        
+
         TypeInfo commonType = PromoteToCommonType(lhs.type, rhs.type);
         lhs = CastIfNeeded(lhs, commonType);
         rhs = CastIfNeeded(rhs, commonType);
@@ -1799,7 +1794,7 @@ private:
     
     Variable LookupVariable(const std::string& name)
     {
-        int32_t scopeIdx = m_currentScopeId;
+        int32_t scopeIdx = m_currentScope;
         while (scopeIdx >= 0)
         {
             Scope& scope = m_scopes[scopeIdx];
@@ -1913,8 +1908,8 @@ private:
     IRBuilder<> m_builder;
     std::unique_ptr<Module> m_module;
 
-    uint32_t m_currentScopeId = 0;
-    uint32_t m_highestScopeId = 0;
+    uint32_t m_currentScope = 0;
+    uint32_t m_scopeCount = 0;
 
     LoopContext m_loopContext;
 };
