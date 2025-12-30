@@ -85,12 +85,6 @@ struct SizeofExpr : ExprNode {
     std::unique_ptr<TypeNode> type;
 };
 
-struct EnumConstruct : ExprNode {
-    std::string enum_name;
-    std::string variant_name;
-    std::unique_ptr<ExprNode> payload;
-};
-
 struct StmtNode : ASTNode {
     virtual ~StmtNode() = default;
 };
@@ -151,20 +145,6 @@ struct ForStmt : StmtNode {
     std::unique_ptr<BlockStmt> body;
 };
 
-struct MatchArm {
-    std::string enum_name;
-    std::string variant_name;
-    std::string binding_name;
-    std::unique_ptr<BlockStmt> body;
-    int literal_value = 0;
-    bool is_literal = false;
-};
-
-struct MatchStmt : StmtNode {
-    std::unique_ptr<ExprNode> expr;
-    std::vector<std::unique_ptr<MatchArm>> arms;
-};
-
 struct StructField {
     std::string name;
     std::unique_ptr<TypeNode> type;
@@ -174,17 +154,6 @@ struct StructDecl : ASTNode {
     std::string name;
     bool is_packed;
     std::vector<std::unique_ptr<StructField>> fields;
-};
-
-struct EnumVariant {
-    std::string name;
-    std::unique_ptr<TypeNode> payload_type;
-    int explicit_value = -1;
-};
-
-struct EnumDecl : ASTNode {
-    std::string name;
-    std::vector<std::unique_ptr<EnumVariant>> variants;
 };
 
 struct Parameter {
@@ -209,7 +178,6 @@ struct UsingDecl : ASTNode {
 struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<UsingDecl>> usings;
     std::vector<std::unique_ptr<StructDecl>> structs;
-    std::vector<std::unique_ptr<EnumDecl>> enums;
     std::vector<std::unique_ptr<GlobalVarDecl>> globals;
     std::vector<std::unique_ptr<ProcDecl>> procs;
 };
@@ -225,8 +193,10 @@ public:
     {
         std::unique_ptr<ModuleAST> module = std::make_unique<ModuleAST>();
         
+        // Parse all top-level declarations until EOF
         while (m_current.type != TokenType_EOF)
         {
+            // Using declarations
             if (Match("using"))
             {
                 auto using_decl = std::make_unique<UsingDecl>();
@@ -240,14 +210,12 @@ public:
                 Expect(';', "Expected ';' after using declaration");
                 module->usings.push_back(std::move(using_decl));
             }
+            // Struct declarations
             else if (Match("struct"))
             {
                 module->structs.push_back(ParseStructDecl());
             }
-            else if (Match("enum"))
-            {
-                module->enums.push_back(ParseEnumDecl());
-            }
+            // Global declarations
             else if (Check(TokenType_Identifier))
             {
                 const bool is_pub = Match("pub");
@@ -267,6 +235,7 @@ public:
                     
                     if (Check(':'))
                     {
+                        // It's a global variable
                         auto var = std::make_unique<GlobalVarDecl>();
                         var->name = name;
                         
@@ -293,6 +262,7 @@ public:
             }
             else
             {
+                // If we get here, we have an unexpected token
                 std::string msg = "Unexpected token at module level: ";
                 if (m_current.type == TokenType_Identifier)
                     msg += m_current.value;
@@ -305,43 +275,6 @@ public:
         }
         
         return module;
-    }
-
-    std::unique_ptr<EnumDecl> ParseEnumDecl(void)
-    {
-        auto enum_decl = std::make_unique<EnumDecl>();
-        
-        Expect(TokenType_Identifier, "Expected enum name");
-        enum_decl->name = m_last.value;
-        
-        Expect('{', "Expected '{' after enum name");
-        
-        while (!Match('}'))
-        {
-            auto variant = std::make_unique<EnumVariant>();
-            
-            Expect(TokenType_Identifier, "Expected variant name");
-            variant->name = m_last.value;
-            
-            if (Match('='))
-            {
-                Expect(TokenType_Number, "Expected number after '='");
-                variant->explicit_value = std::stoi(m_last.value);
-            }
-            
-            if (Match('('))
-            {
-                variant->payload_type = ParseType();
-                Expect(')', "Expected ')' after payload type");
-            }
-            
-            enum_decl->variants.push_back(std::move(variant));
-            
-            if (!Check('}'))
-                Expect(',', "Expected ',' or '}' after variant");
-        }
-        
-        return enum_decl;
     }
 
     std::unique_ptr<TypeNode> ParseType(void)
@@ -387,6 +320,7 @@ public:
             return type;
         }
         
+        // Regular type parsing
         if (Check(TokenType_Identifier))
         {
             type->name = m_current.value;
@@ -398,9 +332,11 @@ public:
             type->name = m_last.value;
         }
         
+        // Parse pointer depth
         while (Match('*'))
             type->pointer_depth++;
         
+        // Parse array dimensions
         while (Match('['))
         {
             Expect(TokenType_Number, "Expected array size");
@@ -416,22 +352,24 @@ public:
         return ParseAssignment();
     }
 
+    // Assignment: = += -= *= /=
     std::unique_ptr<ExprNode> ParseAssignment(void)
     {
-        auto expr = ParseBitwiseOr();
+        auto expr = ParseBitwiseOr();  // Start with lowest precedence binary operator
         
         if (Match('='))
         {
             auto binary = std::make_unique<BinaryExpr>();
             binary->left = std::move(expr);
             binary->op = '=';
-            binary->right = ParseAssignment();
+            binary->right = ParseAssignment(); // right-associative
             return binary;
         }
         
         return expr;
     }
 
+    // Bitwise OR: |
     std::unique_ptr<ExprNode> ParseBitwiseOr(void)
     {
         auto expr = ParseBitwiseXor();
@@ -448,6 +386,7 @@ public:
         return expr;
     }
 
+    // Bitwise XOR: ^
     std::unique_ptr<ExprNode> ParseBitwiseXor(void)
     {
         auto expr = ParseBitwiseAnd();
@@ -464,6 +403,7 @@ public:
         return expr;
     }
 
+    // Bitwise AND: &
     std::unique_ptr<ExprNode> ParseBitwiseAnd(void)
     {
         auto expr = ParseComparison();
@@ -480,9 +420,10 @@ public:
         return expr;
     }
 
+    // Comparison: == != < <= > >=
     std::unique_ptr<ExprNode> ParseComparison(void)
     {
-        auto expr = ParseShift();
+        auto expr = ParseShift();  // Changed from ParseAdditive
         
         while (Match(TokenType_EqualEqual) || Match(TokenType_NotEqual) || 
             Match('<') || Match(TokenType_LessEqual) || 
@@ -502,16 +443,17 @@ public:
             else
                 binary->op = m_last.value[0];
             
-            binary->right = ParseShift();
+            binary->right = ParseShift();  // Changed from ParseAdditive
             expr = std::move(binary);
         }
         
         return expr;
     }
 
+    // Shift operators: << >>
     std::unique_ptr<ExprNode> ParseShift(void)
     {
-        auto expr = ParseAdditive();
+        auto expr = ParseAdditive();  // Call next level down
         
         while (Match(TokenType_LeftShift) || Match(TokenType_RightShift))
         {
@@ -523,16 +465,17 @@ public:
             else
                 binary->op = 'r';
             
-            binary->right = ParseAdditive();
+            binary->right = ParseAdditive();  // Call next level down
             expr = std::move(binary);
         }
         
         return expr;
     }
 
+    // Additive: + -
     std::unique_ptr<ExprNode> ParseAdditive(void)
     {
-        auto expr = ParseMultiplicative();
+        auto expr = ParseMultiplicative();  // Back to calling ParseMultiplicative
         
         while (Match('+') || Match('-'))
         {
@@ -546,6 +489,7 @@ public:
         return expr;
     }
 
+    // Multiplicative: * / %
     std::unique_ptr<ExprNode> ParseMultiplicative(void)
     {
         auto expr = ParseUnary();
@@ -562,6 +506,7 @@ public:
         return expr;
     }
 
+    // Unary: - ! & * ~
     std::unique_ptr<ExprNode> ParseUnary(void)
     {
         if (Match('-') || Match('!') || Match('&') || Match('*') || Match('~'))
@@ -576,6 +521,7 @@ public:
         return ParsePostfix();
     }
 
+    // Postfix: [] . ()
     std::unique_ptr<ExprNode> ParsePostfix(void)
     {
         auto expr = ParsePrimary();
@@ -592,37 +538,11 @@ public:
             }
             else if (Match('.'))
             {
-                Expect(TokenType_Identifier, "Expected member or variant name");
-                std::string member_name = m_last.value;
-                if (auto* id = dynamic_cast<Identifier*>(expr.get()))
-                {
-                    if (Match('('))
-                    {
-                        auto enumConstruct = std::make_unique<EnumConstruct>();
-                        enumConstruct->enum_name = id->name;
-                        enumConstruct->variant_name = member_name;
-                        
-                        if (!Check(')'))
-                            enumConstruct->payload = ParseExpr();
-                        
-                        Expect(')', "Expected ')'");
-                        expr = std::move(enumConstruct);
-                    }
-                    else
-                    {
-                        auto member = std::make_unique<MemberAccess>();
-                        member->object = std::move(expr);
-                        member->member = member_name;
-                        expr = std::move(member);
-                    }
-                }
-                else
-                {
-                    auto member = std::make_unique<MemberAccess>();
-                    member->object = std::move(expr);
-                    member->member = member_name;
-                    expr = std::move(member);
-                }
+                auto member = std::make_unique<MemberAccess>();
+                member->object = std::move(expr);
+                Expect(TokenType_Identifier, "Expected member name");
+                member->member = m_last.value;
+                expr = std::move(member);
             }
             else if (Match(TokenType_Arrow))
             {
@@ -634,10 +554,10 @@ public:
             }
             else if (Match('('))
             {
-                if (auto* id = dynamic_cast<Identifier*>(expr.get()))
+                if (auto* ident = dynamic_cast<Identifier*>(expr.get()))
                 {
                     auto call = std::make_unique<CallExpr>();
-                    call->function = id->name;
+                    call->function = ident->name;
                     
                     if (!Check(')'))
                     {
@@ -656,6 +576,7 @@ public:
         return expr;
     }
 
+    // Primary: literals, identifiers, parenthesized expressions
     std::unique_ptr<ExprNode> ParsePrimary(void)
     {
         if (Match(TokenType_Number))
@@ -756,30 +677,39 @@ public:
         throw std::runtime_error("Expected expression");
     }
 
+    // Parse variable declaration
+    // Syntax: name: [const] type [= initializer];
     std::unique_ptr<VarDecl> ParseVarDecl(void)
     {
         auto var = std::make_unique<VarDecl>();
         
+        // Variable name
         Expect(TokenType_Identifier, "Expected variable name");
         var->name = m_last.value;
         
+        // Colon
         Expect(':', "Expected ':' after variable name");
         
-        if (Check(TokenType_Identifier) || Check('('))
+        // Type
+        if (Check(TokenType_Identifier) || Check('('))  // Added Check('(')
             var->type = ParseType();
         
+        // Optional initializer
         if (Match('='))
         {
             var->init = ParseExpr();
         }
         
+        // Semicolon
         Expect(';', "Expected ';' after variable declaration");
         
         return var;
     }
 
+    // Parse statement
     std::unique_ptr<StmtNode> ParseStmt(void)
     {
+        // Return statement
         if (Match("return"))
         {
             auto ret = std::make_unique<ReturnStmt>();
@@ -791,6 +721,8 @@ public:
             return ret;
         }
 
+
+        // Break statement
         if (Match("break"))
         {
             auto breakStmt = std::make_unique<BreakStmt>();
@@ -798,6 +730,7 @@ public:
             return breakStmt;
         }
 
+        // Continue statement
         if (Match("continue"))
         {
             auto continueStmt = std::make_unique<ContinueStmt>();
@@ -805,6 +738,7 @@ public:
             return continueStmt;
         }
 
+        // If statement
         if (Match("if"))
         {
             auto statement = std::make_unique<IfStmt>();
@@ -817,6 +751,7 @@ public:
             return statement;
         }
         
+        // While loop
         if (Match("while"))
         {
             auto statement = std::make_unique<WhileStmt>();
@@ -827,6 +762,7 @@ public:
             return statement;
         }
         
+        // For loop
         if (Match("for"))
         {
             auto statement = std::make_unique<ForStmt>();
@@ -839,22 +775,29 @@ public:
             statement->body = ParseBlock();
             return statement;
         }
-
-        if (Match("match"))
-            return ParseMatchStmt();
         
+        // Block statement
         if (Check('{'))
         {
             return ParseBlock();
         }
         
+        // Try to distinguish variable declaration from expression
+        // Variable declarations have pattern: identifier ':'
+        // Expressions can start with identifiers too: identifier '=' or identifier '('
+        
         if (Check(TokenType_Identifier))
         {
+            // Peek by actually advancing and then deciding what to do
             std::string ident_name = m_current.value;
-            Advance();
+            Advance(); // consume the identifier
             
             if (Check(':'))
             {
+                // It's a variable declaration!
+                // We already consumed the identifier, so we need to handle it here
+                // or rewind somehow. Let's just parse it inline:
+                
                 auto var = std::make_unique<VarDecl>();
                 var->name = ident_name;
                 
@@ -874,11 +817,18 @@ public:
             }
             else
             {
+                // It's an expression statement
+                // We already consumed the identifier, so we need to build the expression
+                // starting from this identifier
+                
                 auto ident = std::make_unique<Identifier>();
                 ident->name = ident_name;
                 
+                // Now continue parsing the rest of the expression
+                // Handle postfix operations
                 std::unique_ptr<ExprNode> expr = std::move(ident);
                 
+                // Check for postfix operators like [], ., ()
                 while (true)
                 {
                     if (Match('['))
@@ -929,6 +879,7 @@ public:
                     }
                 }
                 
+                // Now check for assignment
                 if (Match('='))
                 {
                     auto binary = std::make_unique<BinaryExpr>();
@@ -945,72 +896,14 @@ public:
             }
         }
         
+        // Other expression statements
         auto stmt = std::make_unique<ExprStmt>();
         stmt->expr = ParseExpr();
         Expect(';', "Expected ';' after expression");
         return stmt;
     }
 
-    std::unique_ptr<MatchStmt> ParseMatchStmt(void)
-    {
-        auto match = std::make_unique<MatchStmt>();
-        
-        m_parsingStatement = true;
-        match->expr = ParseExpr();
-        m_parsingStatement = false;
-
-        Expect('{', "Expected '{' after match expression");
-        
-        while (!Check('}'))
-        {
-            auto arm = std::make_unique<MatchArm>();
-            
-            if (Check(TokenType_Number))
-            {
-                Expect(TokenType_Number, "Expected number");
-                arm->literal_value = std::stoi(m_last.value);
-                arm->is_literal = true;
-            }
-            else if (Check(TokenType_Char))
-            {
-                Expect(TokenType_Char, "Expected char");
-                if (m_last.value.empty())
-                    throw std::runtime_error("Empty character literal in match pattern");
-                arm->literal_value = static_cast<uint8_t>(m_last.value[0]);
-                arm->is_literal = true;
-            }
-            else
-            {
-                Expect(TokenType_Identifier, "Expected enum name in match pattern");
-                arm->enum_name = m_last.value;
-                
-                Expect('.', "Expected '.' after enum name");
-                
-                Expect(TokenType_Identifier, "Expected variant name");
-                arm->variant_name = m_last.value;
-                
-                if (Match('('))
-                {
-                    Expect(TokenType_Identifier, "Expected binding name");
-                    arm->binding_name = m_last.value;
-                    Expect(')', "Expected ')' after binding");
-                }
-                
-                arm->is_literal = false;
-            }
-            
-            arm->body = ParseBlock();
-            
-            match->arms.push_back(std::move(arm));
-            
-            Match(',');
-        }
-        
-        Expect('}', "Expected '}' after match arms");
-        
-        return match;
-    }
-
+    // Update ParseBlock to use ParseStmt
     std::unique_ptr<BlockStmt> ParseBlock(void)
     {
         Expect('{', "Expected '{'");
