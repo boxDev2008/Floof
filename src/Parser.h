@@ -592,16 +592,15 @@ public:
             }
             else if (Match('.'))
             {
+                Expect(TokenType_Identifier, "Expected member or variant name");
+                std::string member_name = m_last.value;
                 if (auto* id = dynamic_cast<Identifier*>(expr.get()))
                 {
-                    Expect(TokenType_Identifier, "Expected member or variant name");
-                    std::string member_or_variant = m_last.value;
-                    
                     if (Match('('))
                     {
                         auto enumConstruct = std::make_unique<EnumConstruct>();
                         enumConstruct->enum_name = id->name;
-                        enumConstruct->variant_name = member_or_variant;
+                        enumConstruct->variant_name = member_name;
                         
                         if (!Check(')'))
                             enumConstruct->payload = ParseExpr();
@@ -611,19 +610,17 @@ public:
                     }
                     else
                     {
-                        auto enumConstruct = std::make_unique<EnumConstruct>();
-                        enumConstruct->enum_name = id->name;
-                        enumConstruct->variant_name = member_or_variant;
-                        enumConstruct->payload = nullptr;
-                        expr = std::move(enumConstruct);
+                        auto member = std::make_unique<MemberAccess>();
+                        member->object = std::move(expr);
+                        member->member = member_name;
+                        expr = std::move(member);
                     }
                 }
                 else
                 {
                     auto member = std::make_unique<MemberAccess>();
                     member->object = std::move(expr);
-                    Expect(TokenType_Identifier, "Expected member name");
-                    member->member = m_last.value;
+                    member->member = member_name;
                     expr = std::move(member);
                 }
             }

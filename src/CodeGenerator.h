@@ -1132,7 +1132,6 @@ private:
             
             int caseValue;
             const EnumVariantInfo* variant = nullptr;
-            Value* enumAllocaForArm = nullptr;
             
             if (arm->is_literal)
             {
