@@ -11,6 +11,7 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <unordered_set>
 
 using namespace llvm;
 
@@ -70,6 +71,26 @@ class CodeGenerator
         std::unordered_map<std::string, TypeInfo> fieldTypes;
     };
 
+    struct EnumVariantInfo
+    {
+        std::string name;
+        int discriminant;
+        TypeInfo payloadType;
+        bool hasPayload;
+        
+        EnumVariantInfo() : discriminant(0), hasPayload(false) {}
+    };
+
+    struct EnumInfo
+    {
+        std::string name;
+        StructType* unionType;
+        std::vector<EnumVariantInfo> variants;
+        std::map<std::string, size_t> variantIndexMap;
+        Type* discriminantType;
+        size_t maxPayloadSize;
+    };
+
     struct FunctionInfo
     {
         Function* function;
@@ -101,6 +122,7 @@ public:
 
         ImportUsedModules(ast, moduleTable);
         RegisterStructs(ast);
+        RegisterEnums(ast);
         DeclareUserFunctions(ast);
         DeclareGlobalVariables(ast);
         RegisterBuiltinFunctions();
@@ -127,6 +149,7 @@ private:
                 Error("Module not found: " + use->name);
             
             ImportModuleStructs(*it->second);
+            ImportModuleEnums(*it->second);
             ImportModuleGlobals(*it->second);
             ImportModuleFunctions(*it->second);
         }
@@ -187,6 +210,64 @@ private:
                 DefineFunctionBody(proc.get(), it->second);
             }
         }
+    }
+
+    void RegisterEnums(const ModuleAST& ast)
+    {
+        for (const auto& decl : ast.enums)
+            RegisterEnum(decl.get());
+    }
+
+    void RegisterEnum(const EnumDecl* decl)
+    {
+        EnumInfo info;
+        info.name = decl->name;
+        info.discriminantType = m_builder.getInt32Ty();
+        info.maxPayloadSize = 0;
+        
+        int currentDiscriminant = 0;
+        
+        for (const auto& variant : decl->variants)
+        {
+            EnumVariantInfo varInfo;
+            varInfo.name = variant->name;
+            
+            if (variant->explicit_value >= 0)
+                currentDiscriminant = variant->explicit_value;
+            
+            varInfo.discriminant = currentDiscriminant++;
+            
+            if (variant->payload_type)
+            {
+                varInfo.hasPayload = true;
+                varInfo.payloadType = ResolveType(variant->payload_type.get());
+                
+                uint64_t payloadSize = m_module->getDataLayout().getTypeAllocSize(
+                    varInfo.payloadType.llvmType);
+                if (payloadSize > info.maxPayloadSize)
+                    info.maxPayloadSize = payloadSize;
+            }
+            else
+                varInfo.hasPayload = false;
+            
+            info.variantIndexMap[variant->name] = info.variants.size();
+            info.variants.push_back(varInfo);
+        }
+        
+        std::vector<Type*> enumFields;
+        enumFields.push_back(info.discriminantType);
+        
+        if (info.maxPayloadSize > 0)
+            enumFields.push_back(ArrayType::get(m_builder.getInt8Ty(), info.maxPayloadSize));
+        
+        info.unionType = StructType::create(m_context, enumFields, decl->name);
+        m_enums[decl->name] = info;
+    }
+
+    void ImportModuleEnums(const ModuleAST& module)
+    {
+        for (const auto& decl : module.enums)
+            RegisterEnum(decl.get());
     }
     
     void RegisterStructs(const ModuleAST& ast)
@@ -441,6 +522,57 @@ private:
             TypeInfo type = ResolveType(sizeofExpr->type.get());
             uint64_t size = m_module->getDataLayout().getTypeAllocSize(type.llvmType);
             return TypedValue(m_builder.getInt64(size), TypeInfo(m_builder.getInt64Ty(), true));
+        }
+
+        if (auto* enumConstruct = dynamic_cast<EnumConstruct*>(node))
+        {
+            auto enumIt = m_enums.find(enumConstruct->enum_name);
+            if (enumIt == m_enums.end())
+                Error("Unknown enum: " + enumConstruct->enum_name);
+            
+            const EnumInfo& enumInfo = enumIt->second;
+            
+            auto variantIt = enumInfo.variantIndexMap.find(enumConstruct->variant_name);
+            if (variantIt == enumInfo.variantIndexMap.end())
+                Error("Unknown variant: " + enumConstruct->variant_name);
+            
+            const EnumVariantInfo& variant = enumInfo.variants[variantIt->second];
+            
+            std::vector<Constant*> fields;
+            fields.push_back(m_builder.getInt32(variant.discriminant));
+            
+            if (enumInfo.maxPayloadSize > 0)
+            {
+                if (variant.hasPayload && enumConstruct->payload)
+                {
+                    TypedValue payloadVal = EvaluateConstantExpr(
+                        enumConstruct->payload.get(), &variant.payloadType);
+                    Constant* payloadConst = cast<Constant>(payloadVal.value);
+                    
+                    auto* payloadArrayType = ArrayType::get(
+                        m_builder.getInt8Ty(), enumInfo.maxPayloadSize);
+                    
+                    auto* tempGlobal = new GlobalVariable(
+                        *m_module, variant.payloadType.llvmType, true,
+                        GlobalValue::PrivateLinkage, payloadConst, ".enum_payload_tmp");
+                    
+                    auto* payloadBytes = ConstantExpr::getBitCast(
+                        tempGlobal, 
+                        PointerType::get(payloadArrayType, 0));
+                    
+                    fields.push_back(Constant::getNullValue(payloadArrayType));
+                }
+                else
+                {
+                    auto* payloadArrayType = ArrayType::get(
+                        m_builder.getInt8Ty(), enumInfo.maxPayloadSize);
+                    fields.push_back(Constant::getNullValue(payloadArrayType));
+                }
+            }
+            
+            return TypedValue(
+                ConstantStruct::get(enumInfo.unionType, fields),
+                TypeInfo(enumInfo.unionType, false));
         }
         
         Error("Invalid constant expression for global variable");
@@ -714,6 +846,19 @@ private:
                 GenerateHostingAllocs(s->body.get());
                 m_currentScope = scopeId;
             }
+            else if (auto* s = dynamic_cast<MatchStmt*>(stmt.get()))
+            {
+                for (const auto& arm : s->arms)
+                {
+                    m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                    uint32_t armScope = m_scopeCount;
+                    m_currentScope = armScope;
+                    
+                    GenerateHostingAllocs(arm->body.get());
+                    
+                    m_currentScope = scopeId;
+                }
+            }
         }
     }
     
@@ -728,6 +873,12 @@ private:
                 GenerateExprStmt(s);
             else if (auto* s = dynamic_cast<ReturnStmt*>(stmt.get()))
                 GenerateReturn(s, returnType);
+            else if (auto* s = dynamic_cast<MatchStmt*>(stmt.get()))  // Add this
+            {
+                m_currentScope = ++m_scopeCount;
+                GenerateMatch(s, returnType);
+                m_currentScope = scopeId;
+            }
             else if (auto* s = dynamic_cast<IfStmt*>(stmt.get()))
             {
                 m_currentScope = ++m_scopeCount;
@@ -886,6 +1037,166 @@ private:
         m_builder.SetInsertPoint(endBB);
     }
 
+    void GenerateMatch(MatchStmt* stmt, const TypeInfo& returnType)
+    {
+        TypedValue matchValue = EvaluateRValue(stmt->expr.get());
+        
+        Value* discriminant = nullptr;
+        const EnumInfo* enumInfo = nullptr;
+        bool isEnumMatch = false;
+        
+        if (matchValue.type.llvmType->isStructTy())
+        {
+            for (const auto& [name, info] : m_enums)
+            {
+                if (info.unionType == matchValue.type.llvmType)
+                {
+                    enumInfo = &info;
+                    isEnumMatch = true;
+                    break;
+                }
+            }
+            
+            if (isEnumMatch)
+            {
+                auto* enumAlloca = m_builder.CreateAlloca(enumInfo->unionType, nullptr, "match_val");
+                m_builder.CreateStore(matchValue.value, enumAlloca);
+                
+                auto* discriminantPtr = m_builder.CreateStructGEP(
+                    enumInfo->unionType, enumAlloca, 0, "discriminant_ptr");
+                discriminant = m_builder.CreateLoad(
+                    enumInfo->discriminantType, discriminantPtr, "discriminant");
+            }
+            else
+            {
+                Error("Match expression struct type is not a valid enum");
+            }
+        }
+        else if (matchValue.type.llvmType->isIntegerTy())
+        {
+            discriminant = matchValue.value;
+            isEnumMatch = false;
+        }
+        else
+        {
+            Error("Match expression must be an enum or integer type");
+        }
+        
+        auto* function = m_builder.GetInsertBlock()->getParent();
+        auto* afterMatchBB = BasicBlock::Create(m_context, "match.end", function);
+        
+        std::unordered_set<int> handledDiscriminants;
+        for (const auto& arm : stmt->arms)
+        {
+            if (arm->is_literal)
+            {
+                handledDiscriminants.insert(arm->literal_value);
+            }
+            else if (isEnumMatch)
+            {
+                auto variantIt = enumInfo->variantIndexMap.find(arm->variant_name);
+                if (variantIt != enumInfo->variantIndexMap.end())
+                {
+                    const EnumVariantInfo& variant = enumInfo->variants[variantIt->second];
+                    handledDiscriminants.insert(variant.discriminant);
+                }
+            }
+        }
+        
+        std::vector<BasicBlock*> armBlocks;
+        for (size_t i = 0; i < stmt->arms.size(); i++)
+        {
+            armBlocks.push_back(BasicBlock::Create(
+                m_context, "match.arm." + std::to_string(i), function));
+        }
+        
+        auto* defaultBB = BasicBlock::Create(m_context, "match.default", function);
+        
+        size_t numCases = isEnumMatch ? enumInfo->variants.size() : handledDiscriminants.size();
+        auto* switchInst = m_builder.CreateSwitch(discriminant, defaultBB, numCases);
+        
+        if (isEnumMatch)
+        {
+            for (const auto& variant : enumInfo->variants)
+            {
+                if (handledDiscriminants.count(variant.discriminant) == 0)
+                {
+                    switchInst->addCase(m_builder.getInt32(variant.discriminant), defaultBB);
+                }
+            }
+        }
+        
+        for (size_t i = 0; i < stmt->arms.size(); i++)
+        {
+            const auto& arm = stmt->arms[i];
+            
+            int caseValue;
+            const EnumVariantInfo* variant = nullptr;
+            Value* enumAllocaForArm = nullptr;
+            
+            if (arm->is_literal)
+            {
+                caseValue = arm->literal_value;
+            }
+            else
+            {
+                if (!isEnumMatch)
+                    Error("Cannot match enum variant on non-enum type");
+                
+                auto variantIt = enumInfo->variantIndexMap.find(arm->variant_name);
+                if (variantIt == enumInfo->variantIndexMap.end())
+                    Error("Unknown variant in match: " + arm->variant_name);
+                
+                variant = &enumInfo->variants[variantIt->second];
+                caseValue = variant->discriminant;
+            }
+            
+            switchInst->addCase(m_builder.getInt32(caseValue), armBlocks[i]);
+            
+            m_builder.SetInsertPoint(armBlocks[i]);
+
+            uint32_t savedScope = m_currentScope;
+            m_currentScope = ++m_scopeCount;
+            m_scopes.push_back(Scope{(int32_t)savedScope, m_currentScope});
+            
+            if (!arm->binding_name.empty() && variant && variant->hasPayload)
+            {
+                auto* enumAlloca = m_builder.CreateAlloca(enumInfo->unionType, nullptr, "match_val_reload");
+                m_builder.CreateStore(matchValue.value, enumAlloca);
+                
+                auto* payloadArrayPtr = m_builder.CreateStructGEP(
+                    enumInfo->unionType, enumAlloca, 1, "payload_array_ptr");
+                
+                auto* payloadPtr = m_builder.CreateBitCast(
+                    payloadArrayPtr,
+                    m_builder.getPtrTy(),
+                    "payload_ptr");
+                
+                auto* payloadValue = m_builder.CreateLoad(
+                    variant->payloadType.llvmType, payloadPtr, arm->binding_name);
+                
+                std::string scopedName = arm->binding_name + '.' + std::to_string(m_currentScope);
+                auto* bindingAlloca = m_builder.CreateAlloca(
+                    variant->payloadType.llvmType, nullptr, scopedName);
+                m_builder.CreateStore(payloadValue, bindingAlloca);
+                
+                m_locals[scopedName] = Variable(variant->payloadType, bindingAlloca, false);
+            }
+            
+            GenerateBlock(arm->body.get(), returnType);
+            
+            m_currentScope = savedScope;
+            
+            if (!m_builder.GetInsertBlock()->getTerminator())
+                m_builder.CreateBr(afterMatchBB);
+        }
+        
+        m_builder.SetInsertPoint(defaultBB);
+        m_builder.CreateBr(afterMatchBB);
+        
+        m_builder.SetInsertPoint(afterMatchBB);
+    }
+
     void GenerateBreak()
     {
         if (!m_loopContext.breakTarget)
@@ -902,6 +1213,56 @@ private:
         
         m_builder.CreateBr(m_loopContext.continueTarget);
         CreateUnreachableBlock();
+    }
+
+    TypedValue EvaluateEnumConstruct(EnumConstruct* construct)
+    {
+        auto enumIt = m_enums.find(construct->enum_name);
+        if (enumIt == m_enums.end())
+            Error("Unknown enum: " + construct->enum_name);
+        
+        const EnumInfo& enumInfo = enumIt->second;
+        
+        auto variantIt = enumInfo.variantIndexMap.find(construct->variant_name);
+        if (variantIt == enumInfo.variantIndexMap.end())
+            Error("Unknown variant: " + construct->variant_name);
+        
+        const EnumVariantInfo& variant = enumInfo.variants[variantIt->second];
+        
+        // Allocate space for the enum value
+        auto* enumAlloca = m_builder.CreateAlloca(enumInfo.unionType, nullptr, "enum_tmp");
+        
+        // Set the discriminant
+        auto* discriminantPtr = m_builder.CreateStructGEP(
+            enumInfo.unionType, enumAlloca, 0, "discriminant_ptr");
+        m_builder.CreateStore(
+            m_builder.getInt32(variant.discriminant), 
+            discriminantPtr);
+        
+        // Set the payload if present
+        if (variant.hasPayload && construct->payload)
+        {
+            TypedValue payload = EvaluateRValue(construct->payload.get(), &variant.payloadType);
+            
+            if (payload.type != variant.payloadType)
+                payload = CastValue(payload, variant.payloadType);
+            
+            // Get pointer to payload field
+            auto* payloadArrayPtr = m_builder.CreateStructGEP(
+                enumInfo.unionType, enumAlloca, 1, "payload_array_ptr");
+            
+            // Cast to the actual payload type pointer
+            auto* payloadPtr = m_builder.CreateBitCast(
+                payloadArrayPtr,
+                m_builder.getPtrTy(),
+                "payload_ptr");
+            
+            m_builder.CreateStore(payload.value, payloadPtr);
+        }
+        
+        // Load and return the complete enum value
+        auto* enumValue = m_builder.CreateLoad(enumInfo.unionType, enumAlloca);
+        return TypedValue(enumValue, TypeInfo(enumInfo.unionType, false));
     }
     
     TypedValue EvaluateLValue(ExprNode* node)
@@ -1007,6 +1368,9 @@ private:
             TypedValue ptr = EvaluateLValue(member);
             return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
         }
+
+        if (auto* enumConstruct = dynamic_cast<EnumConstruct*>(node))
+            return EvaluateEnumConstruct(enumConstruct);
 
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
         {
@@ -1288,6 +1652,44 @@ private:
         TypedValue structPtr = EvaluateLValue(access->object.get());
         
         Type* structType = structPtr.type.llvmType;
+        
+        // Check if this is an enum type
+        const EnumInfo* enumInfo = GetEnumInfo(structType);
+        if (enumInfo)
+        {
+            // Find which variant has this field
+            const EnumVariantInfo* variant = FindVariantWithField(*enumInfo, access->member);
+            if (!variant)
+                Error("No variant of enum '" + enumInfo->name + "' has field '" + access->member + "'");
+            
+            // Extract the payload
+            auto* payloadArrayPtr = m_builder.CreateStructGEP(
+                enumInfo->unionType, structPtr.value, 1, "payload_array_ptr");
+            
+            auto* payloadPtr = m_builder.CreateBitCast(
+                payloadArrayPtr,
+                m_builder.getPtrTy(),
+                "payload_ptr");
+            
+            // Now access the field within the payload
+            Type* payloadStructType = variant->payloadType.llvmType;
+            const StructInfo* structInfo = FindStructInfo(payloadStructType);
+            if (!structInfo)
+                Error("Payload type is not a struct");
+            
+            auto it = structInfo->fieldIndices.find(access->member);
+            if (it == structInfo->fieldIndices.end())
+                Error("Unknown member: " + access->member);
+            
+            unsigned fieldIndex = it->second;
+            TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
+            fieldType.isConst = structPtr.type.isConst || fieldType.isConst;
+            
+            auto* fieldPtr = m_builder.CreateStructGEP(payloadStructType, payloadPtr, fieldIndex);
+            return TypedValue(fieldPtr, fieldType);
+        }
+        
+        // Regular struct member access
         if (!structType->isStructTy())
             Error("Member access on non-struct type");
         
@@ -1315,6 +1717,44 @@ private:
             Error("Cannot use -> on non-pointer type");
         
         Type* pointeeType = ptr.type.pointeeType;
+        
+        // Check if this is an enum type
+        const EnumInfo* enumInfo = GetEnumInfo(pointeeType);
+        if (enumInfo)
+        {
+            // Find which variant has this field
+            const EnumVariantInfo* variant = FindVariantWithField(*enumInfo, access->member);
+            if (!variant)
+                Error("No variant of enum '" + enumInfo->name + "' has field '" + access->member + "'");
+            
+            // Extract the payload
+            auto* payloadArrayPtr = m_builder.CreateStructGEP(
+                enumInfo->unionType, ptr.value, 1, "payload_array_ptr");
+            
+            auto* payloadPtr = m_builder.CreateBitCast(
+                payloadArrayPtr,
+                m_builder.getPtrTy(),
+                "payload_ptr");
+            
+            // Now access the field within the payload
+            Type* payloadStructType = variant->payloadType.llvmType;
+            const StructInfo* structInfo = FindStructInfo(payloadStructType);
+            if (!structInfo)
+                Error("Payload type is not a struct");
+            
+            auto it = structInfo->fieldIndices.find(access->member);
+            if (it == structInfo->fieldIndices.end())
+                Error("Unknown member: " + access->member);
+            
+            unsigned fieldIndex = it->second;
+            TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
+            fieldType.isConst = ptr.type.isConst || fieldType.isConst;
+            
+            auto* fieldPtr = m_builder.CreateStructGEP(payloadStructType, payloadPtr, fieldIndex);
+            return TypedValue(fieldPtr, fieldType);
+        }
+        
+        // Regular struct pointer member access
         if (!pointeeType->isStructTy())
             Error("Cannot access member on non-struct pointer");
         
@@ -1327,12 +1767,41 @@ private:
             Error("Unknown member: " + access->member);
         
         unsigned fieldIndex = it->second;
-    
+        
         TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
         fieldType.isConst = ptr.type.isConst || fieldType.isConst;
 
         auto* fieldPtr = m_builder.CreateStructGEP(pointeeType, ptr.value, fieldIndex);
         return TypedValue(fieldPtr, fieldType);
+    }
+
+    const EnumInfo* GetEnumInfo(Type* type) const
+    {
+        for (const auto& [name, info] : m_enums)
+        {
+            if (info.unionType == type)
+                return &info;
+        }
+        return nullptr;
+    }
+
+    const EnumVariantInfo* FindVariantWithField(const EnumInfo& enumInfo, const std::string& fieldName) const
+    {
+        for (const auto& variant : enumInfo.variants)
+        {
+            if (!variant.hasPayload)
+                continue;
+            
+            // Check if the payload type has this field
+            Type* payloadType = variant.payloadType.llvmType;
+            if (payloadType->isStructTy())
+            {
+                const StructInfo* structInfo = FindStructInfo(payloadType);
+                if (structInfo && structInfo->fieldIndices.count(fieldName) > 0)
+                    return &variant;
+            }
+        }
+        return nullptr;
     }
 
     TypedValue EvaluateArrayInit(ArrayInit* init, const TypeInfo* expectedType)
@@ -1703,6 +2172,13 @@ private:
             if (structIt != m_structs.end())
                 baseType = structIt->second.type;
         }
+
+        if (!baseType)
+        {
+            auto enumIt = m_enums.find(node->name);
+            if (enumIt != m_enums.end())
+                baseType = enumIt->second.unionType;
+        }
         
         if (!baseType)
             Error("Unknown type: " + node->name);
@@ -1989,6 +2465,7 @@ private:
     std::vector<Scope> m_scopes;
     std::unordered_map<std::string, FunctionInfo> m_functions;
     std::unordered_map<std::string, StructInfo> m_structs;
+    std::unordered_map<std::string, EnumInfo> m_enums;
     std::unordered_map<std::string, Variable> m_locals;
     std::unordered_map<std::string, Variable> m_globals;
     

@@ -46,11 +46,11 @@
       "patterns": [
         {
           "name": "keyword.control.flooflang",
-          "match": "\\b(if|else|while|for|break|continue|return)\\b"
+          "match": "\\b(if|else|while|for|match|break|continue|return)\\b"
         },
         {
           "name": "keyword.other.flooflang",
-          "match": "\\b(using|pub|proc|struct|const|extern)\\b"
+          "match": "\\b(using|pub|proc|struct|enum|const|extern)\\b"
         }
       ]
     },
