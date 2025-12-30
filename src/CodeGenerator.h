@@ -526,6 +526,21 @@ private:
     
     void RegisterBuiltinFunctions(void)
     {
+        auto* printfFunc = Function::Create(
+            FunctionType::get(
+                m_builder.getInt32Ty(),
+                {m_builder.getInt8PtrTy()},
+                true
+            ),
+            Function::ExternalLinkage, "printf", m_module.get()
+        );
+        m_functions["printf"] = FunctionInfo(
+            printfFunc,
+            {TypeInfo(m_builder.getInt8PtrTy(), false)},
+            TypeInfo(m_builder.getInt32Ty(), false),
+            true
+        );
+
         // va_start - void @llvm.va_start(ptr)
         auto* vaStartFunc = Function::Create(
             FunctionType::get(
