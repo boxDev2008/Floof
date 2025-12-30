@@ -115,6 +115,11 @@ struct ReturnStmt : StmtNode {
     std::unique_ptr<ExprNode> value;
 };
 
+struct VaArgExpr : ExprNode {
+    std::unique_ptr<ExprNode> va_list;
+    std::unique_ptr<TypeNode> type;
+};
+
 struct BreakStmt : StmtNode { };
 
 struct ContinueStmt : StmtNode { };
@@ -163,6 +168,7 @@ struct ProcDecl : ASTNode {
     std::unique_ptr<BlockStmt> body;
     bool is_pub = false;
     bool is_extern = false;
+    bool is_vararg = false;
 };
 
 struct UsingDecl : ASTNode {
@@ -637,6 +643,16 @@ public:
                 return cast;
             }
 
+            if (name == "va_arg" && Match('('))
+            {
+                auto vaArg = std::make_unique<VaArgExpr>();
+                vaArg->va_list = ParseExpr();
+                Expect(',', "Expected ',' after va_list");
+                vaArg->type = ParseType();
+                Expect(')', "Expected ')' after va_arg type");
+                return vaArg;
+            }
+
             if (!m_parsingStatement && Match('{'))
             {
                 auto init = std::make_unique<StructInit>();
@@ -949,6 +965,13 @@ public:
         {
             while (!Match(')'))
             {
+                if ((Match('.') && Match('.') && Match('.')))
+                {
+                    proc->is_vararg = true;
+                    Expect(')', "Expected ')' after '...'");
+                    break;
+                }
+
                 if (Match(TokenType_Identifier))
                 {
                     Parameter param;

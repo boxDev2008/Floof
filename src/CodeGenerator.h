@@ -524,22 +524,38 @@ private:
         Error("Cannot cast between incompatible types in constant expression");
     }
     
-    void RegisterBuiltinFunctions()
+    void RegisterBuiltinFunctions(void)
     {
-        // printf(i8*, ...) -> i32
-        auto* printfFunc = Function::Create(
-                FunctionType::get(
-                m_builder.getInt32Ty(),
-                {m_builder.getInt8PtrTy()},
-                true  // varargs
+        // va_start - void @llvm.va_start(ptr)
+        auto* vaStartFunc = Function::Create(
+            FunctionType::get(
+                m_builder.getVoidTy(),
+                {m_builder.getPtrTy()},
+                false
             ),
-            Function::ExternalLinkage, "printf", m_module.get()
+            Function::ExternalLinkage, "llvm.va_start", m_module.get()
         );
-        m_functions["printf"] = FunctionInfo(
-            printfFunc,
-            {TypeInfo(m_builder.getInt8PtrTy(), false)},
-            TypeInfo(m_builder.getInt32Ty(), false),
-            true  // isVarArg
+        m_functions["llvm.va_start"] = FunctionInfo(
+            vaStartFunc,
+            {TypeInfo(m_builder.getPtrTy(), false)},
+            TypeInfo(m_builder.getVoidTy(), false),
+            false
+        );
+
+        // va_end - void @llvm.va_end(ptr)
+        auto* vaEndFunc = Function::Create(
+            FunctionType::get(
+                m_builder.getVoidTy(),
+                {m_builder.getPtrTy()},
+                false
+            ),
+            Function::ExternalLinkage, "llvm.va_end", m_module.get()
+        );
+        m_functions["llvm.va_end"] = FunctionInfo(
+            vaEndFunc,
+            {TypeInfo(m_builder.getPtrTy(), false)},
+            TypeInfo(m_builder.getVoidTy(), false),
+            false
         );
     }
 
@@ -559,7 +575,7 @@ private:
             ? ResolveType(proc->return_type.get())
             : TypeInfo(Type::getVoidTy(m_context), false);
         
-        auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, false);
+        auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, proc->is_vararg);
         auto* func = Function::Create(funcType, linkage, proc->name, m_module.get());
         
         // Set parameter names
@@ -567,7 +583,7 @@ private:
         for (auto& arg : func->args())
             arg.setName(proc->params[idx++].name);
         
-        FunctionInfo info(func, paramTypes, returnType);
+        FunctionInfo info(func, paramTypes, returnType, proc->is_vararg);
         m_functions[proc->name] = info;
         return info;
     }
@@ -1003,6 +1019,26 @@ private:
         if (auto* binary = dynamic_cast<BinaryExpr*>(node))
             return EvaluateBinaryExpr(binary);
         
+        if (auto* vaArg = dynamic_cast<VaArgExpr*>(node))
+        {
+            TypedValue vaList = EvaluateLValue(vaArg->va_list.get());
+            TypeInfo targetType = ResolveType(vaArg->type.get());
+            
+            Value* vaListPtr = vaList.value;
+            
+            if (vaList.type.llvmType->isArrayTy())
+            {
+                vaListPtr = m_builder.CreateInBoundsGEP(
+                    vaList.type.llvmType,
+                    vaList.value,
+                    {m_builder.getInt64(0), m_builder.getInt64(0)}
+                );
+            }
+            
+            auto* result = m_builder.CreateVAArg(vaListPtr, targetType.llvmType);
+            return TypedValue(result, targetType);
+        }
+
         Error("Invalid rvalue expression");
     }
 
@@ -1082,6 +1118,40 @@ private:
 
     TypedValue EvaluateFunctionCall(CallExpr *call)
     {
+        if (call->function == "va_start")
+        {
+            if (call->args.size() != 2)
+                Error("va_start requires exactly 2 arguments: va_list and last named parameter");
+            
+            TypedValue vaListArg = EvaluateLValue(call->args[0].get());
+            
+            auto funcIt = m_functions.find("llvm.va_start");
+            if (funcIt == m_functions.end())
+                Error("llvm.va_start intrinsic not found");
+            
+            Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
+            
+            m_builder.CreateCall(funcIt->second.function, {vaListPtr});
+            return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
+        }
+
+        if (call->function == "va_end")
+        {
+            if (call->args.size() != 1)
+                Error("va_end requires exactly 1 argument: va_list");
+
+            TypedValue vaListArg = EvaluateLValue(call->args[0].get());
+
+            auto funcIt = m_functions.find("llvm.va_end");
+            if (funcIt == m_functions.end())
+                Error("llvm.va_end intrinsic not found");
+
+            Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
+
+            m_builder.CreateCall(funcIt->second.function, {vaListPtr});
+            return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
+        }
+
         // First, try to find it as a direct function name
         auto funcIt = m_functions.find(call->function);
         if (funcIt != m_functions.end())
@@ -1646,7 +1716,10 @@ private:
             {"u64", [](auto& b) { return b.getInt64Ty(); }},
             {"usize", [](auto& b) { return b.getInt64Ty(); }},
             {"f32", [](auto& b) { return b.getFloatTy(); }},
-            {"f64", [](auto& b) { return b.getDoubleTy(); }}
+            {"f64", [](auto& b) { return b.getDoubleTy(); }},
+            {"va_list", [](auto& b) { 
+                return ArrayType::get(b.getInt8Ty(), 32);
+            }}
         };
         
         auto it = typeMap.find(name);
