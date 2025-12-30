@@ -1442,20 +1442,10 @@ private:
         if (!index.type.llvmType->isIntegerTy(64))
             index = CastValue(index, TypeInfo(m_builder.getInt64Ty(), false));
         
-        TypedValue base;
-        bool baseIsLValue = false;
-        
-        try {
-            base = EvaluateLValue(access->array.get());
-            baseIsLValue = true;
-        } catch (...) {
-            base = EvaluateRValue(access->array.get());
-            baseIsLValue = false;
-        }
-        
+        TypedValue base = EvaluateLValue(access->array.get());
         Type* baseType = base.type.llvmType;
         
-        if (baseIsLValue && baseType->isArrayTy())
+        if (baseType->isArrayTy())
         {
             Type* elementType = baseType->getArrayElementType();
             Value* gep = m_builder.CreateInBoundsGEP(
@@ -1467,31 +1457,14 @@ private:
         
         if (baseType->isPointerTy())
         {
-            if (baseIsLValue && base.type.pointeeType)
-            {
-                base.value = m_builder.CreateLoad(baseType, base.value);
-            }
-            
             if (!base.type.pointeeType)
                 Error("Cannot index pointer without pointee type");
             
+            Value* ptr = m_builder.CreateLoad(baseType, base.value);
             Value* gep = m_builder.CreateInBoundsGEP(
-                base.type.pointeeType, base.value, index.value
+                base.type.pointeeType, ptr, index.value
             );
             return TypedValue(gep, TypeInfo(base.type.pointeeType, base.type.isUnsigned, base.type.isConst));
-        }
-        
-        if (!baseIsLValue && baseType->isArrayTy())
-        {
-            auto* alloca = m_builder.CreateAlloca(baseType, nullptr, "arr_tmp");
-            m_builder.CreateStore(base.value, alloca);
-            
-            Type* elementType = baseType->getArrayElementType();
-            Value* gep = m_builder.CreateInBoundsGEP(
-                baseType, alloca,
-                {m_builder.getInt64(0), index.value}
-            );
-            return TypedValue(gep, TypeInfo(elementType, base.type.isUnsigned, base.type.isConst));
         }
         
         Error("Cannot index non-array/non-pointer type");
