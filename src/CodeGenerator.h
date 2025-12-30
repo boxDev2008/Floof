@@ -70,6 +70,12 @@ class CodeGenerator
         std::unordered_map<std::string, TypeInfo> fieldTypes;
     };
 
+    struct EnumInfo
+    {
+        std::string name;
+        std::unordered_map<std::string, int> values;
+    };
+
     struct FunctionInfo
     {
         Function* function;
@@ -101,6 +107,7 @@ public:
 
         ImportUsedModules(ast, moduleTable);
         RegisterStructs(ast);
+        RegisterEnums(ast);
         DeclareUserFunctions(ast);
         DeclareGlobalVariables(ast);
         RegisterBuiltinFunctions();
@@ -193,6 +200,18 @@ private:
     {
         for (const auto& decl : ast.structs)
             RegisterStruct(decl.get());
+    }
+
+    void RegisterEnums(const ModuleAST& ast)
+    {
+        for (const auto& decl : ast.enums)
+        {
+            EnumInfo info;
+            info.name = decl->name;
+            for (const auto& val : decl->values)
+                info.values[val.name] = val.value;
+            m_enums[decl->name] = info;
+        }
     }
 
     void RegisterStruct(const StructDecl* decl)
@@ -750,6 +769,11 @@ private:
                 GenerateBreak();
             else if (auto* s = dynamic_cast<ContinueStmt*>(stmt.get()))
                 GenerateContinue();
+            else if (auto* s = dynamic_cast<MatchStmt*>(stmt.get()))
+            {
+                GenerateMatch(s, returnType);
+                m_currentScope = scopeId;
+            }
         }
     }
 
@@ -758,12 +782,105 @@ private:
         std::string scopedName = decl->name + '.' + std::to_string(m_currentScope);
         Variable& variable = m_locals[scopedName];
         
-        if (decl->init)
+        if (!decl->init)
+            return;
+        
+        if (auto* arrInit = dynamic_cast<ArrayInit*>(decl->init.get()))
+            if (variable.type.llvmType->isArrayTy())
+            {
+                InitializeArrayInPlace(variable.storage, variable.type, arrInit);
+                return;
+            }
+        
+        if (auto* structInit = dynamic_cast<StructInit*>(decl->init.get()))
+            if (variable.type.llvmType->isStructTy())
+            {
+                InitializeStructInPlace(variable.storage, variable.type, structInit);
+                return;
+            }
+        
+        TypedValue initValue = EvaluateRValue(decl->init.get(), &variable.type);
+        if (initValue.type != variable.type)
+            initValue = CastValue(initValue, variable.type);
+        m_builder.CreateStore(initValue.value, variable.storage);
+    }
+
+    void InitializeArrayInPlace(Value* arrayPtr, const TypeInfo& arrayTypeInfo, ArrayInit* init)
+    {
+        auto* arrayType = cast<ArrayType>(arrayTypeInfo.llvmType);
+        size_t arraySize = arrayType->getNumElements();
+        TypeInfo elementType(arrayType->getElementType(), arrayTypeInfo.isUnsigned);
+        
+        if (init->elements.size() < arraySize) {
+            uint64_t arrayBytes = m_module->getDataLayout().getTypeAllocSize(arrayType);
+            m_builder.CreateMemSet(
+                arrayPtr,
+                m_builder.getInt8(0),
+                arrayBytes,
+                MaybeAlign()
+            );
+            
+            for (size_t i = 0; i < init->elements.size(); i++)
+            {
+                TypedValue elemValue = EvaluateRValue(init->elements[i].get());
+                if (elemValue.type != elementType)
+                    elemValue = CastValue(elemValue, elementType);
+                
+                auto* elemPtr = m_builder.CreateInBoundsGEP(
+                    arrayType, arrayPtr,
+                    {m_builder.getInt64(0), m_builder.getInt64(i)}
+                );
+                m_builder.CreateStore(elemValue.value, elemPtr);
+            }
+        } else {
+            for (size_t i = 0; i < arraySize; i++)
+            {
+                Value* elemValue = (i < init->elements.size())
+                    ? CastIfNeeded(EvaluateRValue(init->elements[i].get()), elementType).value
+                    : CreateZeroValue(elementType.llvmType);
+                
+                auto* elemPtr = m_builder.CreateInBoundsGEP(
+                    arrayType, arrayPtr,
+                    {m_builder.getInt64(0), m_builder.getInt64(i)}
+                );
+                m_builder.CreateStore(elemValue, elemPtr);
+            }
+        }
+    }
+
+    void InitializeStructInPlace(Value* structPtr, const TypeInfo& structTypeInfo, StructInit* init)
+    {
+        auto it = m_structs.find(init->type_name);
+        if (it == m_structs.end())
+            Error("Unknown struct: " + init->type_name);
+        
+        const StructInfo& info = it->second;
+        
+        if (init->fields.size() > info.fieldIndices.size())
+            Error("Too many fields in struct initializer");
+        
+        if (init->fields.size() < info.fieldIndices.size()) {
+            uint64_t structBytes = m_module->getDataLayout().getTypeAllocSize(info.type);
+            m_builder.CreateMemSet(
+                structPtr,
+                m_builder.getInt8(0),
+                structBytes,
+                MaybeAlign()
+            );
+        }
+        
+        for (unsigned i = 0; i < init->fields.size(); i++)
         {
-            TypedValue initValue = EvaluateRValue(decl->init.get(), &variable.type);
-            if (initValue.type != variable.type)
-                initValue = CastValue(initValue, variable.type);
-            m_builder.CreateStore(initValue.value, variable.storage);
+            const TypeInfo* fieldType = FindFieldTypeAtIndex(info, i);
+            if (!fieldType)
+                Error("Field type not found at index " + std::to_string(i));
+            
+            TypedValue fieldValue = EvaluateRValue(init->fields[i].get(), fieldType);
+            if (fieldValue.type != *fieldType)
+                fieldValue = CastValue(fieldValue, *fieldType);
+            
+            auto* fieldPtr = m_builder.CreateStructGEP(info.type, structPtr, i);
+            m_builder.CreateStore(fieldValue.value, fieldPtr);
         }
     }
 
@@ -903,6 +1020,64 @@ private:
         m_builder.CreateBr(m_loopContext.continueTarget);
         CreateUnreachableBlock();
     }
+
+    void GenerateMatch(MatchStmt* stmt, const TypeInfo& returnType)
+    {
+        TypedValue matchValue = EvaluateRValue(stmt->value.get());
+        
+        auto* function = m_builder.GetInsertBlock()->getParent();
+        auto* endBB = BasicBlock::Create(m_context, "match.end", function);
+        
+        BasicBlock* nextCaseBB = nullptr;
+        BasicBlock* elseBB = nullptr;
+        
+        for (const auto& case_stmt : stmt->cases)
+        {
+            if (case_stmt->is_else)
+            {
+                elseBB = BasicBlock::Create(m_context, "match.else", function);
+                break;
+            }
+        }
+        
+        for (size_t i = 0; i < stmt->cases.size(); i++)
+        {
+            const auto& case_stmt = stmt->cases[i];
+            
+            m_currentScope = ++m_scopeCount;
+
+            if (case_stmt->is_else)
+            {
+                m_builder.SetInsertPoint(elseBB);
+                GenerateBlock(case_stmt->body.get(), returnType);
+                if (!m_builder.GetInsertBlock()->getTerminator())
+                    m_builder.CreateBr(endBB);
+                continue;
+            }
+            
+            auto* caseBB = BasicBlock::Create(m_context, "match.case", function);
+            nextCaseBB = (i + 1 < stmt->cases.size() && !stmt->cases[i+1]->is_else)
+                ? BasicBlock::Create(m_context, "match.next", function)
+                : (elseBB ? elseBB : endBB);
+            
+            TypedValue caseValue = EvaluateRValue(case_stmt->value.get());
+            if (caseValue.type != matchValue.type)
+                caseValue = CastValue(caseValue, matchValue.type);
+            
+            auto* cond = m_builder.CreateICmpEQ(matchValue.value, caseValue.value);
+            m_builder.CreateCondBr(cond, caseBB, nextCaseBB);
+            
+            m_builder.SetInsertPoint(caseBB);
+            GenerateBlock(case_stmt->body.get(), returnType);
+            if (!m_builder.GetInsertBlock()->getTerminator())
+                m_builder.CreateBr(endBB);
+            
+            if (nextCaseBB != elseBB && nextCaseBB != endBB)
+                m_builder.SetInsertPoint(nextCaseBB);
+        }
+        
+        m_builder.SetInsertPoint(endBB);
+    }
     
     TypedValue EvaluateLValue(ExprNode* node)
     {
@@ -1006,6 +1181,20 @@ private:
         {
             TypedValue ptr = EvaluateLValue(member);
             return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
+        }
+
+        if (auto* enumAccess = dynamic_cast<EnumAccess*>(node))
+        {
+            auto it = m_enums.find(enumAccess->enum_name);
+            if (it == m_enums.end())
+                Error("Unknown enum: " + enumAccess->enum_name);
+            
+            auto valueIt = it->second.values.find(enumAccess->value_name);
+            if (valueIt == it->second.values.end())
+                Error("Unknown enum value: " + enumAccess->value_name);
+            
+            auto* val = m_builder.getInt32(valueIt->second);
+            return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
         }
 
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
@@ -1248,17 +1437,41 @@ private:
 
     TypedValue EvaluateArrayAccess(ArrayAccess* access)
     {
-        TypedValue base = EvaluateRValue(access->array.get());  // Changed from EvaluateLValue
         TypedValue index = EvaluateRValue(access->index.get());
         
         if (!index.type.llvmType->isIntegerTy(64))
             index = CastValue(index, TypeInfo(m_builder.getInt64Ty(), false));
         
+        TypedValue base;
+        bool baseIsLValue = false;
+        
+        try {
+            base = EvaluateLValue(access->array.get());
+            baseIsLValue = true;
+        } catch (...) {
+            base = EvaluateRValue(access->array.get());
+            baseIsLValue = false;
+        }
+        
         Type* baseType = base.type.llvmType;
         
-        // Handle pointer indexing: ptr[i] -> *(ptr + i)
+        if (baseIsLValue && baseType->isArrayTy())
+        {
+            Type* elementType = baseType->getArrayElementType();
+            Value* gep = m_builder.CreateInBoundsGEP(
+                baseType, base.value,
+                {m_builder.getInt64(0), index.value}
+            );
+            return TypedValue(gep, TypeInfo(elementType, base.type.isUnsigned, base.type.isConst));
+        }
+        
         if (baseType->isPointerTy())
         {
+            if (baseIsLValue && base.type.pointeeType)
+            {
+                base.value = m_builder.CreateLoad(baseType, base.value);
+            }
+            
             if (!base.type.pointeeType)
                 Error("Cannot index pointer without pointee type");
             
@@ -1268,13 +1481,14 @@ private:
             return TypedValue(gep, TypeInfo(base.type.pointeeType, base.type.isUnsigned, base.type.isConst));
         }
         
-        // Handle array indexing (requires lvalue)
-        if (baseType->isArrayTy())
+        if (!baseIsLValue && baseType->isArrayTy())
         {
-            base = EvaluateLValue(access->array.get());  // Get the array's address
+            auto* alloca = m_builder.CreateAlloca(baseType, nullptr, "arr_tmp");
+            m_builder.CreateStore(base.value, alloca);
+            
             Type* elementType = baseType->getArrayElementType();
             Value* gep = m_builder.CreateInBoundsGEP(
-                baseType, base.value,
+                baseType, alloca,
                 {m_builder.getInt64(0), index.value}
             );
             return TypedValue(gep, TypeInfo(elementType, base.type.isUnsigned, base.type.isConst));
@@ -1361,18 +1575,7 @@ private:
         auto* arrayType = ArrayType::get(elementType.llvmType, arraySize);
         auto* alloca = m_builder.CreateAlloca(arrayType, nullptr, "array_tmp");
         
-        for (size_t i = 0; i < arraySize; i++)
-        {
-            Value* elemValue = (i < init->elements.size())
-                ? CastIfNeeded(EvaluateRValue(init->elements[i].get()), elementType).value
-                : CreateZeroValue(elementType.llvmType);
-            
-            auto* elemPtr = m_builder.CreateInBoundsGEP(
-                arrayType, alloca,
-                {m_builder.getInt64(0), m_builder.getInt64(i)}
-            );
-            m_builder.CreateStore(elemValue, elemPtr);
-        }
+        InitializeArrayInPlace(alloca, TypeInfo(arrayType, elementType.isUnsigned), init);
         
         auto* arrayValue = m_builder.CreateLoad(arrayType, alloca);
         return TypedValue(arrayValue, TypeInfo(arrayType, elementType.isUnsigned));
@@ -1385,25 +1588,9 @@ private:
             Error("Unknown struct: " + init->type_name);
         
         const StructInfo& info = it->second;
-        
-        if (init->fields.size() > info.fieldIndices.size())
-            Error("Too many fields in struct initializer");
-        
         auto* alloca = m_builder.CreateAlloca(info.type, nullptr, "struct_tmp");
         
-        for (unsigned i = 0; i < info.fieldIndices.size(); i++)
-        {
-            const TypeInfo* fieldType = FindFieldTypeAtIndex(info, i);
-            if (!fieldType)
-                Error("Field type not found at index " + std::to_string(i));
-            
-            Value* fieldValue = (i < init->fields.size())
-                ? CastIfNeeded(EvaluateRValue(init->fields[i].get(), fieldType), *fieldType).value  // Pass fieldType here
-                : CreateZeroValue(fieldType->llvmType);
-            
-            auto* fieldPtr = m_builder.CreateStructGEP(info.type, alloca, i);
-            m_builder.CreateStore(fieldValue, fieldPtr);
-        }
+        InitializeStructInPlace(alloca, TypeInfo(info.type, false), init);
         
         auto* structValue = m_builder.CreateLoad(info.type, alloca);
         return TypedValue(structValue, TypeInfo(info.type, false));
@@ -1474,6 +1661,25 @@ private:
                     throw std::runtime_error("Cannot assign to constant through pointer dereference");
                 else
                     throw std::runtime_error("Cannot assign to constant expression");
+            }
+
+            if (lhs.type.llvmType->isArrayTy() || lhs.type.llvmType->isStructTy())
+            {
+                TypedValue rhs = EvaluateLValue(binary->right.get());
+                
+                if (rhs.type != lhs.type)
+                    Error("Type mismatch in aggregate assignment");
+                
+                uint64_t size = m_module->getDataLayout().getTypeAllocSize(lhs.type.llvmType);
+                m_builder.CreateMemCpy(
+                    lhs.value,
+                    MaybeAlign(),
+                    rhs.value,
+                    MaybeAlign(),
+                    size
+                );
+                
+                return rhs;
             }
 
             TypedValue rhs = EvaluateRValue(binary->right.get());
@@ -1704,6 +1910,17 @@ private:
                 baseType = structIt->second.type;
         }
         
+        // Try enum types
+        if (!baseType)
+        {
+            auto enumIt = m_enums.find(node->name);
+            if (enumIt != m_enums.end())
+            {
+                baseType = m_builder.getInt32Ty();  // Enums are i32
+                isUnsigned = false;
+            }
+        }
+
         if (!baseType)
             Error("Unknown type: " + node->name);
         
@@ -1989,6 +2206,7 @@ private:
     std::vector<Scope> m_scopes;
     std::unordered_map<std::string, FunctionInfo> m_functions;
     std::unordered_map<std::string, StructInfo> m_structs;
+    std::unordered_map<std::string, EnumInfo> m_enums;
     std::unordered_map<std::string, Variable> m_locals;
     std::unordered_map<std::string, Variable> m_globals;
     

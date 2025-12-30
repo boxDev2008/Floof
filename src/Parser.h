@@ -156,6 +156,45 @@ struct StructDecl : ASTNode {
     std::vector<std::unique_ptr<StructField>> fields;
 };
 
+struct EnumValue
+{
+    std::string name;
+    int value;
+    std::unique_ptr<TypeNode> payload_type;
+};
+
+struct EnumDecl : ASTNode
+{
+    std::string name;
+    std::vector<EnumValue> values;
+    bool is_union = false;
+};
+
+struct EnumConstruct : ExprNode
+{
+    std::string enum_name;
+    std::string variant_name;
+    std::unique_ptr<ExprNode> payload;
+};
+
+struct MatchCase
+{
+    std::unique_ptr<ExprNode> value;
+    std::unique_ptr<BlockStmt> body;
+    bool is_else = false;
+    std::string binding_name;
+};
+
+struct MatchStmt : StmtNode {
+    std::unique_ptr<ExprNode> value;
+    std::vector<std::unique_ptr<MatchCase>> cases;
+};
+
+struct EnumAccess : ExprNode {
+    std::string enum_name;
+    std::string value_name;
+};
+
 struct Parameter {
     std::string name;
     std::unique_ptr<TypeNode> type;
@@ -178,6 +217,7 @@ struct UsingDecl : ASTNode {
 struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<UsingDecl>> usings;
     std::vector<std::unique_ptr<StructDecl>> structs;
+    std::vector<std::unique_ptr<EnumDecl>> enums;
     std::vector<std::unique_ptr<GlobalVarDecl>> globals;
     std::vector<std::unique_ptr<ProcDecl>> procs;
 };
@@ -214,6 +254,11 @@ public:
             else if (Match("struct"))
             {
                 module->structs.push_back(ParseStructDecl());
+            }
+            // Enum declarations
+            else if (Match("enum"))
+            {
+                module->enums.push_back(ParseEnumDecl());
             }
             // Global declarations
             else if (Check(TokenType_Identifier))
@@ -653,6 +698,27 @@ public:
                 return vaArg;
             }
 
+            if (Match(':'))
+            {
+                Expect(TokenType_Identifier, "Expected enum value name after ':'");
+                std::string valueName = m_last.value;
+                
+                if (Match('('))
+                {
+                    auto enumConstruct = std::make_unique<EnumConstruct>();
+                    enumConstruct->enum_name = name;
+                    enumConstruct->variant_name = valueName;
+                    enumConstruct->payload = ParseExpr();
+                    Expect(')', "Expected ')' after enum payload");
+                    return enumConstruct;
+                }
+                
+                auto enumAccess = std::make_unique<EnumAccess>();
+                enumAccess->enum_name = name;
+                enumAccess->value_name = valueName;
+                return enumAccess;
+            }
+
             if (!m_parsingStatement && Match('{'))
             {
                 auto init = std::make_unique<StructInit>();
@@ -775,6 +841,9 @@ public:
             statement->body = ParseBlock();
             return statement;
         }
+
+        if (Match("match"))
+            return ParseMatchStmt();
         
         // Block statement
         if (Check('{'))
@@ -917,6 +986,91 @@ public:
         
         Expect('}', "Expected '}'");
         return block;
+    }
+
+    std::unique_ptr<EnumDecl> ParseEnumDecl(void)
+    {
+        auto enum_decl = std::make_unique<EnumDecl>();
+        
+        Expect(TokenType_Identifier, "Expected enum name");
+        enum_decl->name = m_last.value;
+        
+        Expect('{', "Expected '{'");
+        
+        int next_value = 0;
+        while (!Check('}'))
+        {
+            Expect(TokenType_Identifier, "Expected enum value name");
+            EnumValue val;
+            val.name = m_last.value;
+            
+            if (Match('('))
+            {
+                val.payload_type = ParseType();
+                Expect(')', "Expected ')' after payload type");
+                enum_decl->is_union = true;
+            }
+            
+            if (Match('='))
+            {
+                Expect(TokenType_Number, "Expected number after '='");
+                val.value = std::stoi(m_last.value);
+                next_value = val.value + 1;
+            }
+            else
+            {
+                val.value = next_value++;
+            }
+            
+            enum_decl->values.push_back(std::move(val));
+            
+            if (!Check('}'))
+                Match(',');
+        }
+        
+        Expect('}', "Expected '}'");
+        return enum_decl;
+    }
+
+    std::unique_ptr<MatchStmt> ParseMatchStmt(void)
+    {
+        auto match = std::make_unique<MatchStmt>();
+        
+        m_parsingStatement = true;
+        match->value = ParseExpr();
+        m_parsingStatement = false;
+        
+        Expect('{', "Expected '{'");
+        
+        while (!Check('}'))
+        {
+            auto case_stmt = std::make_unique<MatchCase>();
+            
+            if (Match("else"))
+            {
+                case_stmt->is_else = true;
+            }
+            else
+            {
+                case_stmt->value = ParseExpr();
+                
+                if (Match('('))
+                {
+                    Expect(TokenType_Identifier, "Expected binding name");
+                    case_stmt->binding_name = m_last.value;
+                    Expect(')', "Expected ')' after binding name");
+                }
+            }
+            
+            case_stmt->body = ParseBlock();
+            match->cases.push_back(std::move(case_stmt));
+            
+            if (!Check('}'))
+                Match(',');
+        }
+        
+        Expect('}', "Expected '}'");
+        return match;
     }
 
     std::unique_ptr<StructDecl> ParseStructDecl(void)
