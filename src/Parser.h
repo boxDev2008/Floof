@@ -160,7 +160,6 @@ struct EnumValue
 {
     std::string name;
     int value;
-    std::unique_ptr<TypeNode> payload_type;
 };
 
 struct EnumDecl : ASTNode
@@ -168,13 +167,6 @@ struct EnumDecl : ASTNode
     std::string name;
     std::vector<EnumValue> values;
     bool is_union = false;
-};
-
-struct EnumConstruct : ExprNode
-{
-    std::string enum_name;
-    std::string variant_name;
-    std::unique_ptr<ExprNode> payload;
 };
 
 struct MatchCase
@@ -702,17 +694,6 @@ public:
             {
                 Expect(TokenType_Identifier, "Expected enum value name after ':'");
                 std::string valueName = m_last.value;
-                
-                if (Match('('))
-                {
-                    auto enumConstruct = std::make_unique<EnumConstruct>();
-                    enumConstruct->enum_name = name;
-                    enumConstruct->variant_name = valueName;
-                    enumConstruct->payload = ParseExpr();
-                    Expect(')', "Expected ')' after enum payload");
-                    return enumConstruct;
-                }
-                
                 auto enumAccess = std::make_unique<EnumAccess>();
                 enumAccess->enum_name = name;
                 enumAccess->value_name = valueName;
@@ -1003,13 +984,6 @@ public:
             Expect(TokenType_Identifier, "Expected enum value name");
             EnumValue val;
             val.name = m_last.value;
-            
-            if (Match('('))
-            {
-                val.payload_type = ParseType();
-                Expect(')', "Expected ')' after payload type");
-                enum_decl->is_union = true;
-            }
             
             if (Match('='))
             {
