@@ -174,7 +174,6 @@ struct MatchCase
     std::unique_ptr<ExprNode> value;
     std::unique_ptr<BlockStmt> body;
     bool is_else = false;
-    std::string binding_name;
 };
 
 struct MatchStmt : StmtNode {
@@ -1027,13 +1026,6 @@ public:
             else
             {
                 case_stmt->value = ParseExpr();
-                
-                if (Match('('))
-                {
-                    Expect(TokenType_Identifier, "Expected binding name");
-                    case_stmt->binding_name = m_last.value;
-                    Expect(')', "Expected ')' after binding name");
-                }
             }
             
             case_stmt->body = ParseBlock();
