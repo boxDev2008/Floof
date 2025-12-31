@@ -1014,7 +1014,7 @@ public:
         m_parsingStatement = false;
         
         Expect('{', "Expected '{'");
-        
+
         while (!Check('}'))
         {
             auto case_stmt = std::make_unique<MatchCase>();

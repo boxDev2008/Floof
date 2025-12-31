@@ -1028,7 +1028,13 @@ private:
         auto* function = m_builder.GetInsertBlock()->getParent();
         auto* endBB = BasicBlock::Create(m_context, "match.end", function);
         
-        BasicBlock* nextCaseBB = nullptr;
+        if (stmt->cases.empty())
+        {
+            m_builder.CreateBr(endBB);
+            m_builder.SetInsertPoint(endBB);
+            return;
+        }
+        
         BasicBlock* elseBB = nullptr;
         
         for (const auto& case_stmt : stmt->cases)
@@ -1040,12 +1046,17 @@ private:
             }
         }
         
+        if (stmt->cases[0]->is_else)
+            m_builder.CreateBr(elseBB);
+        
+        BasicBlock* nextCaseBB = nullptr;
+        
         for (size_t i = 0; i < stmt->cases.size(); i++)
         {
             const auto& case_stmt = stmt->cases[i];
             
             m_currentScope = ++m_scopeCount;
-
+            
             if (case_stmt->is_else)
             {
                 m_builder.SetInsertPoint(elseBB);
@@ -1054,6 +1065,9 @@ private:
                     m_builder.CreateBr(endBB);
                 continue;
             }
+            
+            if (i > 0 && nextCaseBB && nextCaseBB != elseBB && nextCaseBB != endBB)
+                m_builder.SetInsertPoint(nextCaseBB);
             
             auto* caseBB = BasicBlock::Create(m_context, "match.case", function);
             nextCaseBB = (i + 1 < stmt->cases.size() && !stmt->cases[i+1]->is_else)
@@ -1071,9 +1085,6 @@ private:
             GenerateBlock(case_stmt->body.get(), returnType);
             if (!m_builder.GetInsertBlock()->getTerminator())
                 m_builder.CreateBr(endBB);
-            
-            if (nextCaseBB != elseBB && nextCaseBB != endBB)
-                m_builder.SetInsertPoint(nextCaseBB);
         }
         
         m_builder.SetInsertPoint(endBB);
