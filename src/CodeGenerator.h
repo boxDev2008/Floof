@@ -1649,10 +1649,21 @@ private:
 
             if (lhs.type.llvmType->isArrayTy() || lhs.type.llvmType->isStructTy())
             {
-                TypedValue rhs = EvaluateLValue(binary->right.get());
+                bool isInitializer = dynamic_cast<StructInit*>(binary->right.get()) != nullptr ||
+                                    dynamic_cast<ArrayInit*>(binary->right.get()) != nullptr;
+                
+                TypedValue rhs = isInitializer 
+                    ? EvaluateRValue(binary->right.get())
+                    : EvaluateLValue(binary->right.get());
                 
                 if (rhs.type != lhs.type)
                     Error("Type mismatch in aggregate assignment");
+                
+                if (isInitializer) {
+                    auto* tempAlloca = m_builder.CreateAlloca(rhs.type.llvmType, nullptr, "temp_aggregate");
+                    m_builder.CreateStore(rhs.value, tempAlloca);
+                    rhs.value = tempAlloca;
+                }
                 
                 uint64_t size = m_module->getDataLayout().getTypeAllocSize(lhs.type.llvmType);
                 m_builder.CreateMemCpy(
