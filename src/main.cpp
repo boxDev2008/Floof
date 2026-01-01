@@ -139,16 +139,16 @@ private:
             std::ifstream file(path);
             std::stringstream buffer;
             buffer << file.rdbuf();
-            
-            Lexer lexer(buffer.str());
-            Parser parser(lexer);
-            auto module = parser.ParseModule();
-            
+
             fs::path relativePath = fs::relative(path, projectDir / "src");
             std::string moduleName = relativePath.replace_extension("").string();
             
             std::replace(moduleName.begin(), moduleName.end(), '/', '.');
             std::replace(moduleName.begin(), moduleName.end(), '\\', '.');
+            
+            Lexer lexer(buffer.str());
+            Parser parser(lexer, moduleName);
+            auto module = parser.ParseModule();
             
             moduleMap.insert({moduleName, std::move(module)});
         }

@@ -215,7 +215,7 @@ struct ModuleAST : ASTNode {
 
 class Parser {
 public:
-    Parser(Lexer& lex) : m_lexer(lex)
+    Parser(Lexer& lex, const std::string &moduleName) : m_lexer(lex), m_moduleName(moduleName)
     {
         Advance();
     }
@@ -1049,7 +1049,7 @@ public:
             if (m_last.value == "packed")
                 struct_decl->is_packed = true;
             else
-                throw std::runtime_error("Invalid attribute name " + m_last.value + " on line " + std::to_string(m_lexer.GetCurrentLine()));
+                throw std::runtime_error("Invalid attribute name " + m_last.value + " on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
             Expect(')', "Expected ')'");
         }
 
@@ -1152,10 +1152,11 @@ private:
     void Expect(int type, const std::string& msg)
     {
         if (!Match(type))
-            throw std::runtime_error(msg + " on line " + std::to_string(m_lexer.GetCurrentLine()));
+            throw std::runtime_error(msg + " on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
     }
 
-    Lexer& m_lexer;
+    const std::string &m_moduleName;
+    Lexer &m_lexer;
     Token m_current;
     Token m_last;
     bool m_parsingStatement = false;

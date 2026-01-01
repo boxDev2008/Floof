@@ -733,6 +733,15 @@ private:
                 GenerateHostingAllocs(s->body.get());
                 m_currentScope = scopeId;
             }
+            else if (auto* s = dynamic_cast<MatchStmt*>(stmt.get()))
+            {
+                for (auto &c : s->cases)
+                {
+                    m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                    GenerateHostingAllocs(c->body.get());
+                }
+                m_currentScope = scopeId;
+            }
         }
     }
     
