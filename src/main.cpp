@@ -169,7 +169,8 @@ private:
 
         llvm::TargetOptions opt;
         return target->createTargetMachine(
-            targetTriple, "generic", "", opt, llvm::Reloc::PIC_);
+            targetTriple, "generic", "", opt, llvm::Reloc::PIC_,
+            llvm::CodeModel::Small, llvm::CodeGenOpt::Aggressive);
     }
 
     std::string compileSingleModule(
