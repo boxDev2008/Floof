@@ -1754,15 +1754,15 @@ private:
             if (lhs.type.isConst)
             {
                 if (auto* id = dynamic_cast<Identifier*>(binary->left.get()))
-                    throw std::runtime_error("Cannot assign to constant variable '" + id->name + "'");
+                    Error("Cannot assign to constant variable '" + id->name + "'");
                 else if (auto* member = dynamic_cast<MemberAccess*>(binary->left.get()))
-                    throw std::runtime_error("Cannot assign to constant member '" + member->member + "'");
+                    Error("Cannot assign to constant member '" + member->member + "'");
                 else if (dynamic_cast<ArrayAccess*>(binary->left.get()))
-                    throw std::runtime_error("Cannot assign to constant array element");
+                    Error("Cannot assign to constant array element");
                 else if (dynamic_cast<UnaryExpr*>(binary->left.get()))
-                    throw std::runtime_error("Cannot assign to constant through pointer dereference");
+                    Error("Cannot assign to constant through pointer dereference");
                 else
-                    throw std::runtime_error("Cannot assign to constant expression");
+                    Error("Cannot assign to constant expression");
             }
 
             if (lhs.type.llvmType->isArrayTy() || lhs.type.llvmType->isStructTy())
@@ -1810,7 +1810,18 @@ private:
             TypedValue lhs = EvaluateLValue(binary->left.get());
             
             if (lhs.type.isConst)
-                Error("Cannot assign to constant variable");
+            {
+                if (auto* id = dynamic_cast<Identifier*>(binary->left.get()))
+                    Error("Cannot assign to constant variable '" + id->name + "'");
+                else if (auto* member = dynamic_cast<MemberAccess*>(binary->left.get()))
+                    Error("Cannot assign to constant member '" + member->member + "'");
+                else if (dynamic_cast<ArrayAccess*>(binary->left.get()))
+                    Error("Cannot assign to constant array element");
+                else if (dynamic_cast<UnaryExpr*>(binary->left.get()))
+                    Error("Cannot assign to constant through pointer dereference");
+                else
+                    Error("Cannot assign to constant expression");
+            }
             
             TypedValue currentValue(m_builder.CreateLoad(lhs.type.llvmType, lhs.value), lhs.type);
             
