@@ -27,7 +27,7 @@ struct ExprNode : ASTNode {
 
 struct BinaryExpr : ExprNode {
     std::unique_ptr<ExprNode> left, right;
-    char op;
+    uint16_t op;
 };
 
 struct UnaryExpr : ExprNode {
@@ -407,6 +407,17 @@ public:
             binary->right = ParseAssignment(); // right-associative
             return binary;
         }
+
+        if (Match(TokenType_PlusEqual) || Match(TokenType_MinusEqual) || 
+            Match(TokenType_StarEqual) || Match(TokenType_SlashEqual) || 
+            Match(TokenType_PercentEqual))
+        {
+            auto binary = std::make_unique<BinaryExpr>();
+            binary->left = std::move(expr);
+            binary->op = m_last.type;
+            binary->right = ParseAssignment();
+            return binary;
+        }
         
         return expr;
     }
@@ -475,13 +486,13 @@ public:
             binary->left = std::move(expr);
             
             if (m_last.type == TokenType_EqualEqual)
-                binary->op = 'E';
+                binary->op = TokenType_EqualEqual;
             else if (m_last.type == TokenType_NotEqual)
-                binary->op = 'N';
+                binary->op = TokenType_NotEqual;
             else if (m_last.type == TokenType_LessEqual)
-                binary->op = 'L';
+                binary->op = TokenType_LessEqual;
             else if (m_last.type == TokenType_GreaterEqual)
-                binary->op = 'G';
+                binary->op = TokenType_GreaterEqual;
             else
                 binary->op = m_last.value[0];
             
@@ -503,9 +514,9 @@ public:
             binary->left = std::move(expr);
             
             if (m_last.type == TokenType_LeftShift)
-                binary->op = 'l';
+                binary->op = TokenType_LeftShift;
             else
-                binary->op = 'r';
+                binary->op = TokenType_RightShift;
             
             binary->right = ParseAdditive();  // Call next level down
             expr = std::move(binary);
@@ -929,11 +940,12 @@ public:
                 }
                 
                 // Now check for assignment
-                if (Match('='))
+                if (Match('=') || Match(TokenType_PlusEqual) || Match(TokenType_MinusEqual) ||
+                    Match(TokenType_StarEqual) || Match(TokenType_SlashEqual) || Match(TokenType_PercentEqual))
                 {
                     auto binary = std::make_unique<BinaryExpr>();
                     binary->left = std::move(expr);
-                    binary->op = '=';
+                    binary->op = m_last.type;
                     binary->right = ParseAssignment();
                     expr = std::move(binary);
                 }

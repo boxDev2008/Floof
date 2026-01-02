@@ -17,6 +17,11 @@ enum TokenType
     TokenType_GreaterEqual,  // >=
     TokenType_LeftShift,     // <<
     TokenType_RightShift,    // >>
+    TokenType_PlusEqual,     // +=
+    TokenType_MinusEqual,    // -=
+    TokenType_StarEqual,     // *=
+    TokenType_SlashEqual,    // /=
+    TokenType_PercentEqual,  // %=
     TokenType_EOF
 };
 
@@ -339,5 +344,10 @@ const std::unordered_map<std::string, TokenType> Lexer::two_char_ops = {
     {"<=", TokenType_LessEqual},
     {">=", TokenType_GreaterEqual},
     {"<<", TokenType_LeftShift},
-    {">>", TokenType_RightShift}
+    {">>", TokenType_RightShift},
+    {"+=", TokenType_PlusEqual},
+    {"-=", TokenType_MinusEqual},
+    {"*=", TokenType_StarEqual},
+    {"/=", TokenType_SlashEqual},
+    {"%=", TokenType_PercentEqual}
 };

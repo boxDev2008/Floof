@@ -1803,10 +1803,70 @@ private:
             return rhs;
         }
 
+        if (binary->op == TokenType_PlusEqual || binary->op == TokenType_MinusEqual ||
+            binary->op == TokenType_StarEqual || binary->op == TokenType_SlashEqual ||
+            binary->op == TokenType_PercentEqual)
+        {
+            TypedValue lhs = EvaluateLValue(binary->left.get());
+            
+            if (lhs.type.isConst)
+                Error("Cannot assign to constant variable");
+            
+            TypedValue currentValue(m_builder.CreateLoad(lhs.type.llvmType, lhs.value), lhs.type);
+            
+            TypedValue rhs = EvaluateRValue(binary->right.get());
+            
+            char opChar;
+            switch (binary->op)
+            {
+                case TokenType_PlusEqual:    opChar = '+'; break;
+                case TokenType_MinusEqual:   opChar = '-'; break;
+                case TokenType_StarEqual:    opChar = '*'; break;
+                case TokenType_SlashEqual:   opChar = '/'; break;
+                case TokenType_PercentEqual: opChar = '%'; break;
+                default: Error("Unknown compound assignment operator");
+            }
+            
+            if ((binary->op == TokenType_PlusEqual || binary->op == TokenType_MinusEqual) &&
+                currentValue.type.llvmType->isPointerTy())
+            {
+                if (auto result = TryPointerArithmetic(opChar, currentValue, rhs))
+                {
+                    m_builder.CreateStore(result->value, lhs.value);
+                    return *result;
+                }
+            }
+            
+            TypeInfo commonType = PromoteToCommonType(currentValue.type, rhs.type);
+            currentValue = CastIfNeeded(currentValue, commonType);
+            rhs = CastIfNeeded(rhs, commonType);
+            
+            const bool isFloat = commonType.llvmType->isFloatingPointTy();
+            const bool isUnsigned = commonType.isUnsigned;
+            
+            Value* result = nullptr;
+            switch (opChar)
+            {
+                case '+': result = isFloat ? m_builder.CreateFAdd(currentValue.value, rhs.value) : m_builder.CreateAdd(currentValue.value, rhs.value); break;
+                case '-': result = isFloat ? m_builder.CreateFSub(currentValue.value, rhs.value) : m_builder.CreateSub(currentValue.value, rhs.value); break;
+                case '*': result = isFloat ? m_builder.CreateFMul(currentValue.value, rhs.value) : m_builder.CreateMul(currentValue.value, rhs.value); break;
+                case '/': result = CreateDivision(currentValue.value, rhs.value, isFloat, isUnsigned); break;
+                case '%': result = CreateRemainder(currentValue.value, rhs.value, isFloat, isUnsigned); break;
+                default: Error("Unknown binary operator in compound assignment");
+            }
+            
+            TypedValue resultValue(result, commonType);
+            
+            if (resultValue.type != lhs.type)
+                resultValue = CastValue(resultValue, lhs.type);
+            
+            m_builder.CreateStore(resultValue.value, lhs.value);
+            return resultValue;
+        }
+
         TypedValue lhs = EvaluateRValue(binary->left.get());
         TypedValue rhs = EvaluateRValue(binary->right.get());
 
-        // Handle pointer arithmetic
         if (binary->op == '+' || binary->op == '-')
         {
             if (auto result = TryPointerArithmetic(binary->op, lhs, rhs))
@@ -1850,12 +1910,12 @@ private:
                 if (isFloat) Error("Right shift not supported on floating-point types");
                 result = isUnsigned ? m_builder.CreateLShr(lhs.value, rhs.value) : m_builder.CreateAShr(lhs.value, rhs.value);
                 break;
-            case 'E': result = CreateEquality(lhs.value, rhs.value, isFloat, true); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
-            case 'N': result = CreateEquality(lhs.value, rhs.value, isFloat, false); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
+            case TokenType_EqualEqual: result = CreateEquality(lhs.value, rhs.value, isFloat, true); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
+            case TokenType_NotEqual: result = CreateEquality(lhs.value, rhs.value, isFloat, false); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case '<': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SLT, CmpInst::ICMP_ULT, CmpInst::FCMP_OLT); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
-            case 'L': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SLE, CmpInst::ICMP_ULE, CmpInst::FCMP_OLE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
+            case TokenType_LessEqual: result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SLE, CmpInst::ICMP_ULE, CmpInst::FCMP_OLE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case '>': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SGT, CmpInst::ICMP_UGT, CmpInst::FCMP_OGT); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
-            case 'G': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SGE, CmpInst::ICMP_UGE, CmpInst::FCMP_OGE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
+            case TokenType_GreaterEqual: result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SGE, CmpInst::ICMP_UGE, CmpInst::FCMP_OGE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             default: Error("Unknown binary operator");
         }
         
