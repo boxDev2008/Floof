@@ -1975,7 +1975,10 @@ private:
         
         // Apply pointer depth
         if (node->pointer_depth > 0)
-            return TypeInfo(m_builder.getPtrTy(), false, node->is_const, baseType);
+        {
+            Type* pointeeType = baseType->isVoidTy() ? m_builder.getInt8Ty() : baseType;
+            return TypeInfo(m_builder.getPtrTy(), false, node->is_const, pointeeType);
+        }
         
         return TypeInfo(baseType, isUnsigned, node->is_const, nullptr);
     }
