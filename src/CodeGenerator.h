@@ -1342,100 +1342,143 @@ private:
 
     TypedValue EvaluateFunctionCall(CallExpr *call)
     {
-        if (call->function == "va_start")
+        if (auto* ident = dynamic_cast<Identifier*>(call->callee.get()))
         {
-            if (call->args.size() != 2)
-                Error("va_start requires exactly 2 arguments: va_list and last named parameter");
-            
-            TypedValue vaListArg = EvaluateLValue(call->args[0].get());
-            
-            auto funcIt = m_functions.find("llvm.va_start");
-            if (funcIt == m_functions.end())
-                Error("llvm.va_start intrinsic not found");
-            
-            Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-            
-            m_builder.CreateCall(funcIt->second.function, {vaListPtr});
-            return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
-        }
-
-        if (call->function == "va_end")
-        {
-            if (call->args.size() != 1)
-                Error("va_end requires exactly 1 argument: va_list");
-
-            TypedValue vaListArg = EvaluateLValue(call->args[0].get());
-
-            auto funcIt = m_functions.find("llvm.va_end");
-            if (funcIt == m_functions.end())
-                Error("llvm.va_end intrinsic not found");
-
-            Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-
-            m_builder.CreateCall(funcIt->second.function, {vaListPtr});
-            return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
-        }
-
-        // First, try to find it as a direct function name
-        auto funcIt = m_functions.find(call->function);
-        if (funcIt != m_functions.end())
-        {
-            // Direct function call
-            const FunctionInfo& func = funcIt->second;
-            
-            if (func.isVarArg)
+            if (ident->name == "va_start")
             {
-                if (call->args.size() < func.paramTypes.size())
-                    Error("Too few arguments for " + call->function);
+                if (call->args.size() != 2)
+                    Error("va_start requires exactly 2 arguments: va_list and last named parameter");
+                
+                TypedValue vaListArg = EvaluateLValue(call->args[0].get());
+                
+                auto funcIt = m_functions.find("llvm.va_start");
+                if (funcIt == m_functions.end())
+                    Error("llvm.va_start intrinsic not found");
+                
+                Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
+                
+                m_builder.CreateCall(funcIt->second.function, {vaListPtr});
+                return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
+            }
+
+            if (ident->name == "va_end")
+            {
+                if (call->args.size() != 1)
+                    Error("va_end requires exactly 1 argument: va_list");
+
+                TypedValue vaListArg = EvaluateLValue(call->args[0].get());
+
+                auto funcIt = m_functions.find("llvm.va_end");
+                if (funcIt == m_functions.end())
+                    Error("llvm.va_end intrinsic not found");
+
+                Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
+
+                m_builder.CreateCall(funcIt->second.function, {vaListPtr});
+                return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
+            }
+
+            // Check if it's a direct function name
+            auto funcIt = m_functions.find(ident->name);
+            if (funcIt != m_functions.end())
+            {
+                // Direct function call
+                const FunctionInfo& func = funcIt->second;
+                
+                if (func.isVarArg)
+                {
+                    if (call->args.size() < func.paramTypes.size())
+                        Error("Too few arguments for " + ident->name);
+                }
+                else
+                {
+                    if (call->args.size() != func.paramTypes.size())
+                        Error("Argument count mismatch for " + ident->name);
+                }
+                
+                std::vector<Value*> args;
+                for (size_t i = 0; i < call->args.size(); i++)
+                {
+                    TypedValue arg = EvaluateRValue(call->args[i].get());
+                    
+                    if (i < func.paramTypes.size())
+                    {
+                        if (arg.type != func.paramTypes[i])
+                            arg = CastValue(arg, func.paramTypes[i]);
+                    }
+                    
+                    args.push_back(arg.value);
+                }
+                
+                auto* result = m_builder.CreateCall(func.function, args);
+                return TypedValue(result, func.returnType);
+            }
+            
+            // Not a direct function - check if it's a function pointer variable
+            Variable var = LookupVariable(ident->name);
+            
+            if (!var.type.functionInfo)
+                Error("Variable '" + ident->name + "' is not callable");
+            
+            const FunctionInfo& funcInfo = *var.type.functionInfo;
+            
+            if (funcInfo.isVarArg)
+            {
+                if (call->args.size() < funcInfo.paramTypes.size())
+                    Error("Too few arguments");
             }
             else
             {
-                if (call->args.size() != func.paramTypes.size())
-                    Error("Argument count mismatch for " + call->function);
+                if (call->args.size() != funcInfo.paramTypes.size())
+                    Error("Argument count mismatch");
             }
+            
+            // Load the function pointer
+            Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
+            
+            // Get the function type from the pointer type
+            FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
             
             std::vector<Value*> args;
             for (size_t i = 0; i < call->args.size(); i++)
             {
                 TypedValue arg = EvaluateRValue(call->args[i].get());
                 
-                if (i < func.paramTypes.size())
+                if (i < funcInfo.paramTypes.size())
                 {
-                    if (arg.type != func.paramTypes[i])
-                        arg = CastValue(arg, func.paramTypes[i]);
+                    if (arg.type != funcInfo.paramTypes[i])
+                        arg = CastValue(arg, funcInfo.paramTypes[i]);
                 }
                 
                 args.push_back(arg.value);
             }
             
-            auto* result = m_builder.CreateCall(func.function, args);
-            return TypedValue(result, func.returnType);
+            auto* result = m_builder.CreateCall(funcType, funcPtr, args);
+            return TypedValue(result, funcInfo.returnType);
         }
         
-        // Not a direct function - must be a function pointer variable
-        Variable var = LookupVariable(call->function);
+        // For any other callable expression (array access, member access, etc.)
+        TypedValue calleeValue = EvaluateRValue(call->callee.get());
         
-        if (!var.type.functionInfo)
-            Error("Variable '" + call->function + "' is not callable");
+        if (!calleeValue.type.functionInfo)
+            Error("Expression is not callable");
         
-        const FunctionInfo& funcInfo = *var.type.functionInfo;
+        const FunctionInfo& funcInfo = *calleeValue.type.functionInfo;
         
+        // Validation
         if (funcInfo.isVarArg)
         {
             if (call->args.size() < funcInfo.paramTypes.size())
-                Error("Too few arguments for " + call->function);
+                Error("Too few arguments for function call");
         }
         else
         {
             if (call->args.size() != funcInfo.paramTypes.size())
-                Error("Argument count mismatch for " + call->function);
+                Error("Argument count mismatch for function call");
         }
         
-        // Load the function pointer
-        Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
-        
-        // Get the function type from the pointer type
-        FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
+        // Get the function type
+        FunctionType* funcType = cast<FunctionType>(calleeValue.type.pointeeType);
         
         std::vector<Value*> args;
         for (size_t i = 0; i < call->args.size(); i++)
@@ -1451,7 +1494,7 @@ private:
             args.push_back(arg.value);
         }
         
-        auto* result = m_builder.CreateCall(funcType, funcPtr, args);
+        auto* result = m_builder.CreateCall(funcType, calleeValue.value, args);
         return TypedValue(result, funcInfo.returnType);
     }
 
@@ -1472,7 +1515,15 @@ private:
                 baseType, base.value,
                 {m_builder.getInt64(0), index.value}
             );
-            return TypedValue(gep, TypeInfo(elementType, base.type.isUnsigned, base.type.isConst));
+            
+            TypeInfo elemTypeInfo(elementType, base.type.isUnsigned, base.type.isConst);
+            
+            if (elementType->isPointerTy() && base.type.functionInfo) {
+                elemTypeInfo.pointeeType = base.type.pointeeType;
+                elemTypeInfo.functionInfo = base.type.functionInfo;
+            }
+            
+            return TypedValue(gep, elemTypeInfo);
         }
         
         if (baseType->isPointerTy())
@@ -1484,7 +1535,15 @@ private:
             Value* gep = m_builder.CreateInBoundsGEP(
                 base.type.pointeeType, ptr, index.value
             );
-            return TypedValue(gep, TypeInfo(base.type.pointeeType, base.type.isUnsigned, base.type.isConst));
+            
+            TypeInfo elemTypeInfo(base.type.pointeeType, base.type.isUnsigned, base.type.isConst);
+            
+            if (base.type.pointeeType->isPointerTy() && base.type.functionInfo) {
+                elemTypeInfo.pointeeType = base.type.functionInfo->function->getFunctionType();
+                elemTypeInfo.functionInfo = base.type.functionInfo;
+            }
+            
+            return TypedValue(gep, elemTypeInfo);
         }
         
         Error("Cannot index non-array/non-pointer type");
@@ -1552,6 +1611,12 @@ private:
             auto* arrayType = cast<ArrayType>(expectedType->llvmType);
             arraySize = arrayType->getNumElements();
             elementType = TypeInfo(arrayType->getElementType(), expectedType->isUnsigned);
+            
+            if (expectedType->functionInfo)
+            {
+                elementType.pointeeType = expectedType->pointeeType;
+                elementType.functionInfo = expectedType->functionInfo;
+            }
         }
         else
         {
@@ -1559,19 +1624,63 @@ private:
                 Error("Cannot infer array type from empty initializer");
             
             arraySize = init->elements.size();
+            
             elementType = EvaluateRValue(init->elements[0].get()).type;
             
+            if (auto* firstIdent = dynamic_cast<Identifier*>(init->elements[0].get()))
+            {
+                auto funcIt = m_functions.find(firstIdent->name);
+                if (funcIt != m_functions.end())
+                {
+                    Function* func = funcIt->second.function;
+                    elementType = TypeInfo(
+                        func->getType(),
+                        false,
+                        false,
+                        func->getFunctionType(),
+                        std::make_shared<FunctionInfo>(funcIt->second)
+                    );
+                }
+            }
+            
             for (size_t i = 1; i < init->elements.size(); i++)
-                elementType = PromoteToCommonType(elementType, EvaluateRValue(init->elements[i].get()).type);
+            {
+                TypeInfo elemType = EvaluateRValue(init->elements[i].get()).type;
+                
+                if (auto* ident = dynamic_cast<Identifier*>(init->elements[i].get()))
+                {
+                    auto funcIt = m_functions.find(ident->name);
+                    if (funcIt != m_functions.end())
+                    {
+                        Function* func = funcIt->second.function;
+                        elemType = TypeInfo(
+                            func->getType(),
+                            false,
+                            false,
+                            func->getFunctionType(),
+                            std::make_shared<FunctionInfo>(funcIt->second)
+                        );
+                    }
+                }
+                
+                elementType = PromoteToCommonType(elementType, elemType);
+            }
         }
         
         auto* arrayType = ArrayType::get(elementType.llvmType, arraySize);
         auto* alloca = m_builder.CreateAlloca(arrayType, nullptr, "array_tmp");
         
-        InitializeArrayInPlace(alloca, TypeInfo(arrayType, elementType.isUnsigned), init);
+        TypeInfo arrayTypeInfo(arrayType, elementType.isUnsigned);
+        if (elementType.functionInfo)
+        {
+            arrayTypeInfo.pointeeType = elementType.pointeeType;
+            arrayTypeInfo.functionInfo = elementType.functionInfo;
+        }
+        
+        InitializeArrayInPlace(alloca, arrayTypeInfo, init);
         
         auto* arrayValue = m_builder.CreateLoad(arrayType, alloca);
-        return TypedValue(arrayValue, TypeInfo(arrayType, elementType.isUnsigned));
+        return TypedValue(arrayValue, arrayTypeInfo);
     }
 
     TypedValue EvaluateStructInit(StructInit* init)
@@ -1808,6 +1917,14 @@ private:
             
             auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, false);
             auto* funcPtrType = m_builder.getPtrTy();
+
+            if (!node->array_dimensions.empty())
+            {
+                Type* arrayType = funcPtrType;
+                for (size_t dim : node->array_dimensions)
+                    arrayType = ArrayType::get(arrayType, dim);
+                return TypeInfo(arrayType, false, node->is_const, funcType, std::make_shared<FunctionInfo>(funcInfo));
+            }
 
             return TypeInfo(funcPtrType, false, node->is_const, funcType, std::make_shared<FunctionInfo>(funcInfo));
         }

@@ -53,7 +53,7 @@ struct Identifier : ExprNode {
 };
 
 struct CallExpr : ExprNode {
-    std::string function;
+    std::unique_ptr<ExprNode> callee;
     std::vector<std::unique_ptr<ExprNode>> args;
 };
 
@@ -320,11 +320,9 @@ public:
         if (Match("const"))
             type->is_const = true;
         
-        if (Check('('))
+        if (Match('('))
         {
             type->is_function_type = true;
-            
-            Expect('(', "Expected '('");
             
             if (!Check(')'))
             {
@@ -347,8 +345,16 @@ public:
                     }
                 } while (Match(','));
             }
+
             
             Expect(')', "Expected ')'");
+            
+            while (Match('['))
+            {
+                Expect(TokenType_Number, "Expected array size");
+                type->array_dimensions.push_back(std::stoi(m_last.value));
+                Expect(']', "Expected ']'");
+            }
 
             if (Match(TokenType_Arrow))
                 type->return_type = ParseType();
@@ -590,21 +596,18 @@ public:
             }
             else if (Match('('))
             {
-                if (auto* ident = dynamic_cast<Identifier*>(expr.get()))
+                auto call = std::make_unique<CallExpr>();
+                call->callee = std::move(expr);
+                
+                if (!Check(')'))
                 {
-                    auto call = std::make_unique<CallExpr>();
-                    call->function = ident->name;
-                    
-                    if (!Check(')'))
-                    {
-                        do {
-                            call->args.push_back(ParseExpr());
-                        } while (Match(','));
-                    }
-                    
-                    Expect(')', "Expected ')'");
-                    expr = std::move(call);
+                    do {
+                        call->args.push_back(ParseExpr());
+                    } while (Match(','));
                 }
+                
+                Expect(')', "Expected ')'");
+                expr = std::move(call);
             }
             else break;
         }
@@ -906,21 +909,18 @@ public:
                     }
                     else if (Match('('))
                     {
-                        if (auto* id = dynamic_cast<Identifier*>(expr.get()))
+                        auto call = std::make_unique<CallExpr>();
+                        call->callee = std::move(expr);
+                        
+                        if (!Check(')'))
                         {
-                            auto call = std::make_unique<CallExpr>();
-                            call->function = id->name;
-                            
-                            if (!Check(')'))
-                            {
-                                do {
-                                    call->args.push_back(ParseExpr());
-                                } while (Match(','));
-                            }
-                            
-                            Expect(')', "Expected ')'");
-                            expr = std::move(call);
+                            do {
+                                call->args.push_back(ParseExpr());
+                            } while (Match(','));
                         }
+                        
+                        Expect(')', "Expected ')'");
+                        expr = std::move(call);
                     }
                     else
                     {
