@@ -456,6 +456,20 @@ private:
                             TypeInfo(info.type, false));
         }
 
+        if (auto* enumAccess = dynamic_cast<EnumAccess*>(node))
+        {
+            auto it = m_enums.find(enumAccess->enum_name);
+            if (it == m_enums.end())
+                Error("Unknown enum: " + enumAccess->enum_name);
+            
+            auto valueIt = it->second.values.find(enumAccess->value_name);
+            if (valueIt == it->second.values.end())
+                Error("Unknown enum value: " + enumAccess->value_name);
+            
+            auto* val = m_builder.getInt32(valueIt->second);
+            return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
+        }
+
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
         {
             TypeInfo type = ResolveType(sizeofExpr->type.get());
