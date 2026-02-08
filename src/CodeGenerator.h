@@ -20,23 +20,24 @@ class CodeGenerator
     struct TypeInfo
     {
         Type* llvmType;
-        Type* pointeeType;  // For pointer types
+        Type* pointeeType;
         bool isUnsigned;
-        bool isConst;
-
-        // For function pointers
+        bool isConst;  // const for the current level
+        std::vector<bool> pointerConst;  // const qualifiers for pointer chain
+        
         std::shared_ptr<FunctionInfo> functionInfo;
 
         TypeInfo() : llvmType(nullptr), isUnsigned(false), isConst(false), pointeeType(nullptr) {}
-        TypeInfo(Type* t, bool u, bool c = false, Type* pt = nullptr, std::shared_ptr<FunctionInfo> fi = nullptr) 
-        : llvmType(t), isUnsigned(u), isConst(c), pointeeType(pt), functionInfo(fi) {}
+        TypeInfo(Type* t, bool u, bool c = false, Type* pt = nullptr, std::shared_ptr<FunctionInfo> fi = nullptr,
+                std::vector<bool> ptrConst = {}) 
+        : llvmType(t), isUnsigned(u), isConst(c), pointeeType(pt), functionInfo(fi), pointerConst(ptrConst) {}
 
-        
         bool operator==(const TypeInfo& other) const {
             return llvmType == other.llvmType &&
-                   isUnsigned == other.isUnsigned &&
-                   isConst == other.isConst &&
-                   pointeeType == other.pointeeType;
+                isUnsigned == other.isUnsigned &&
+                isConst == other.isConst &&
+                pointeeType == other.pointeeType &&
+                pointerConst == other.pointerConst;
         }
         
         bool operator!=(const TypeInfo& other) const {
@@ -818,7 +819,20 @@ private:
     {
         auto* arrayType = cast<ArrayType>(arrayTypeInfo.llvmType);
         size_t arraySize = arrayType->getNumElements();
-        TypeInfo elementType(arrayType->getElementType(), arrayTypeInfo.isUnsigned);
+        Type* elemLLVMType = arrayType->getElementType();
+        
+        TypeInfo elementType(elemLLVMType, arrayTypeInfo.isUnsigned);
+        
+        if (elemLLVMType->isArrayTy())
+        {
+            elementType.pointeeType = arrayTypeInfo.pointeeType;
+            elementType.functionInfo = arrayTypeInfo.functionInfo;
+        }
+        else if (arrayTypeInfo.functionInfo)
+        {
+            elementType.pointeeType = arrayTypeInfo.pointeeType;
+            elementType.functionInfo = arrayTypeInfo.functionInfo;
+        }
         
         if (init->elements.size() < arraySize) {
             uint64_t arrayBytes = m_module->getDataLayout().getTypeAllocSize(arrayType);
@@ -831,7 +845,7 @@ private:
             
             for (size_t i = 0; i < init->elements.size(); i++)
             {
-                TypedValue elemValue = EvaluateRValue(init->elements[i].get());
+                TypedValue elemValue = EvaluateRValue(init->elements[i].get(), &elementType);
                 if (elemValue.type != elementType)
                     elemValue = CastValue(elemValue, elementType);
                 
@@ -845,7 +859,7 @@ private:
             for (size_t i = 0; i < arraySize; i++)
             {
                 Value* elemValue = (i < init->elements.size())
-                    ? CastIfNeeded(EvaluateRValue(init->elements[i].get()), elementType).value
+                    ? CastIfNeeded(EvaluateRValue(init->elements[i].get(), &elementType), elementType).value
                     : CreateZeroValue(elementType.llvmType);
                 
                 auto* elemPtr = m_builder.CreateInBoundsGEP(
@@ -1116,7 +1130,32 @@ private:
                 TypedValue ptr = EvaluateRValue(unary->operand.get());
                 if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
                     Error("Cannot dereference non-pointer");
-                return TypedValue(ptr.value, TypeInfo(ptr.type.pointeeType, ptr.type.isUnsigned, ptr.type.isConst));
+
+                bool pointeeIsConst = false;
+                std::vector<bool> newPointerConst;
+                
+                if (ptr.type.pointerConst.size() > 1)
+                {
+                    pointeeIsConst = ptr.type.pointerConst[0];
+                    
+                    newPointerConst = std::vector<bool>(
+                        ptr.type.pointerConst.begin() + 1, 
+                        ptr.type.pointerConst.end()
+                    );
+                }
+                else if (ptr.type.pointerConst.size() == 1)
+                    pointeeIsConst = ptr.type.isConst;
+                
+                TypeInfo derefType(
+                    ptr.type.pointeeType, 
+                    ptr.type.isUnsigned, 
+                    pointeeIsConst,
+                    nullptr,
+                    nullptr,
+                    newPointerConst
+                );
+                
+                return TypedValue(ptr.value, derefType);
             }
         }
         
@@ -1518,7 +1557,13 @@ private:
             
             TypeInfo elemTypeInfo(elementType, base.type.isUnsigned, base.type.isConst);
             
-            if (elementType->isPointerTy() && base.type.functionInfo) {
+            if (elementType->isArrayTy() && base.type.functionInfo)
+            {
+                elemTypeInfo.pointeeType = base.type.pointeeType;
+                elemTypeInfo.functionInfo = base.type.functionInfo;
+            }
+            else if (elementType->isPointerTy() && base.type.functionInfo)
+            {
                 elemTypeInfo.pointeeType = base.type.pointeeType;
                 elemTypeInfo.functionInfo = base.type.functionInfo;
             }
@@ -1538,7 +1583,13 @@ private:
             
             TypeInfo elemTypeInfo(base.type.pointeeType, base.type.isUnsigned, base.type.isConst);
             
-            if (base.type.pointeeType->isPointerTy() && base.type.functionInfo) {
+            if (base.type.pointeeType->isArrayTy() && base.type.functionInfo)
+            {
+                elemTypeInfo.pointeeType = base.type.pointeeType;
+                elemTypeInfo.functionInfo = base.type.functionInfo;
+            }
+            else if (base.type.pointeeType->isPointerTy() && base.type.functionInfo)
+            {
                 elemTypeInfo.pointeeType = base.type.functionInfo->function->getFunctionType();
                 elemTypeInfo.functionInfo = base.type.functionInfo;
             }
@@ -1610,7 +1661,9 @@ private:
         {
             auto* arrayType = cast<ArrayType>(expectedType->llvmType);
             arraySize = arrayType->getNumElements();
-            elementType = TypeInfo(arrayType->getElementType(), expectedType->isUnsigned);
+            
+            Type* elemLLVMType = arrayType->getElementType();
+            elementType = TypeInfo(elemLLVMType, expectedType->isUnsigned);
             
             if (expectedType->functionInfo)
             {
@@ -1671,11 +1724,8 @@ private:
         auto* alloca = m_builder.CreateAlloca(arrayType, nullptr, "array_tmp");
         
         TypeInfo arrayTypeInfo(arrayType, elementType.isUnsigned);
-        if (elementType.functionInfo)
-        {
-            arrayTypeInfo.pointeeType = elementType.pointeeType;
-            arrayTypeInfo.functionInfo = elementType.functionInfo;
-        }
+        arrayTypeInfo.pointeeType = elementType.pointeeType;
+        arrayTypeInfo.functionInfo = elementType.functionInfo;
         
         InitializeArrayInPlace(alloca, arrayTypeInfo, init);
         
@@ -1703,13 +1753,19 @@ private:
         if (unary->op == '&')
         {
             TypedValue lval = EvaluateLValue(unary->operand.get());
+            
+            std::vector<bool> ptrConst;
+            ptrConst.push_back(false);
+            
             TypeInfo ptrType(
                 m_builder.getPtrTy(),
                 false,
                 false,
                 lval.type.llvmType,
-                nullptr
+                nullptr,
+                ptrConst
             );
+
             return TypedValue(lval.value, ptrType);
         }
         
@@ -1718,8 +1774,13 @@ private:
             TypedValue ptr = EvaluateRValue(unary->operand.get());
             if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
                 Error("Cannot dereference non-pointer");
+
+            bool pointeeIsConst = false;
+            if (!ptr.type.pointerConst.empty())
+                pointeeIsConst = ptr.type.isConst;
+            
             auto* loaded = m_builder.CreateLoad(ptr.type.pointeeType, ptr.value);
-            return TypedValue(loaded, TypeInfo(ptr.type.pointeeType, ptr.type.isUnsigned));
+            return TypedValue(loaded, TypeInfo(ptr.type.pointeeType, ptr.type.isUnsigned, pointeeIsConst));
         }
         
         if (unary->op == '-')
@@ -1755,6 +1816,11 @@ private:
             {
                 if (auto* id = dynamic_cast<Identifier*>(binary->left.get()))
                     Error("Cannot assign to constant variable '" + id->name + "'");
+                else if (auto* unary = dynamic_cast<UnaryExpr*>(binary->left.get()))
+                {
+                    if (unary->op == '*')
+                        Error("Cannot assign to const-qualified pointee");
+                }
                 else if (auto* member = dynamic_cast<MemberAccess*>(binary->left.get()))
                     Error("Cannot assign to constant member '" + member->member + "'");
                 else if (dynamic_cast<ArrayAccess*>(binary->left.get()))
@@ -2006,7 +2072,7 @@ private:
             Type* type = baseType.llvmType;
             for (size_t dim : node->array_dimensions)
                 type = ArrayType::get(type, dim);
-            return TypeInfo(type, baseType.isUnsigned);
+            return TypeInfo(type, baseType.isUnsigned, false, nullptr, nullptr, baseType.pointerConst);
         }
         
         return ResolveSimpleType(node);
@@ -2015,14 +2081,11 @@ private:
     // Resolves a type including pointer depth
     TypeInfo ResolveSimpleType(TypeNode* node)
     {
-        // Get the base type (without pointers)
         Type* baseType = nullptr;
         bool isUnsigned = false;
         
-        // Try builtin types first
         baseType = GetBuiltinType(node->name, isUnsigned);
         
-        // Try struct types
         if (!baseType)
         {
             auto structIt = m_structs.find(node->name);
@@ -2030,13 +2093,12 @@ private:
                 baseType = structIt->second.type;
         }
         
-        // Try enum types
         if (!baseType)
         {
             auto enumIt = m_enums.find(node->name);
             if (enumIt != m_enums.end())
             {
-                baseType = m_builder.getInt32Ty();  // Enums are i32
+                baseType = m_builder.getInt32Ty();
                 isUnsigned = false;
             }
         }
@@ -2044,14 +2106,19 @@ private:
         if (!baseType)
             Error("Unknown type: " + node->name);
         
-        // Apply pointer depth
+        // Apply pointer depth with const qualifiers
         if (node->pointer_depth > 0)
         {
             Type* pointeeType = baseType->isVoidTy() ? m_builder.getInt8Ty() : baseType;
-            return TypeInfo(m_builder.getPtrTy(), false, node->is_const, pointeeType);
+            bool pointeeConst = node->is_const;
+            
+            std::vector<bool> ptrConst = node->pointer_const;
+            bool topLevelConst = !ptrConst.empty() ? ptrConst.back() : false;
+            
+            return TypeInfo(m_builder.getPtrTy(), false, topLevelConst, pointeeType, nullptr, ptrConst);
         }
         
-        return TypeInfo(baseType, isUnsigned, node->is_const, nullptr);
+        return TypeInfo(baseType, isUnsigned, node->is_const, nullptr, nullptr, {});
     }
 
     // Helper to get builtin type - returns nullptr if not found

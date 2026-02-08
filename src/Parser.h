@@ -16,6 +16,7 @@ struct TypeNode : ASTNode {
     
     std::unique_ptr<TypeNode> return_type;
     std::vector<std::unique_ptr<TypeNode>> param_types;
+    std::vector<bool> pointer_const;
     int pointer_depth = 0;
     bool is_const = false;
     bool is_function_type = false;
@@ -374,11 +375,15 @@ public:
             type->name = m_last.value;
         }
         
-        // Parse pointer depth
         while (Match('*'))
+        {
             type->pointer_depth++;
+            if (Match("const"))
+                type->pointer_const.push_back(true);
+            else
+                type->pointer_const.push_back(false);
+        }
         
-        // Parse array dimensions
         while (Match('['))
         {
             Expect(TokenType_Number, "Expected array size");
