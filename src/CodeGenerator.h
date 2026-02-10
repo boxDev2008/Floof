@@ -11,6 +11,7 @@
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <unordered_set>
 
 using namespace llvm;
 
@@ -107,8 +108,8 @@ public:
         m_module = std::make_unique<Module>(moduleName, ctx);
 
         ImportUsedModules(ast, moduleTable);
-        RegisterStructs(ast);
         RegisterEnums(ast);
+        RegisterStructs(ast);
         DeclareUserFunctions(ast);
         DeclareGlobalVariables(ast);
         RegisterBuiltinFunctions();
@@ -129,21 +130,30 @@ private:
     void ImportUsedModules(const ModuleAST& ast, std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable)
     {
         for (const auto& use : ast.usings)
-        {
-            auto it = moduleTable.find(use->name);
-            if (it == moduleTable.end())
-                Error("Module not found: " + use->name);
-            
-            ImportModuleStructs(*it->second);
-            ImportModuleGlobals(*it->second);
-            ImportModuleFunctions(*it->second);
-        }
+            ImportModuleRecursively(use->name, moduleTable);
     }
 
-    void ImportModuleStructs(const ModuleAST& module)
+    std::unordered_set<std::string> m_importedModules;
+    void ImportModuleRecursively(const std::string& moduleName, std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable)
     {
-        for (const auto& decl : module.structs)
-            RegisterStruct(decl.get());
+        if (m_importedModules.count(moduleName) > 0)
+            return;
+        
+        auto it = moduleTable.find(moduleName);
+        if (it == moduleTable.end())
+            Error("Module not found: " + moduleName);
+        
+        m_importedModules.insert(moduleName);
+        
+        const ModuleAST& module = *it->second;
+        
+        for (const auto& use : module.usings)
+            ImportModuleRecursively(use->name, moduleTable);
+        
+        RegisterEnums(module);
+        RegisterStructs(module);
+        ImportModuleGlobals(module);
+        ImportModuleFunctions(module);
     }
 
     void ImportModuleGlobals(const ModuleAST& module)
@@ -209,8 +219,28 @@ private:
         {
             EnumInfo info;
             info.name = decl->name;
+
+            int next_value = 0;
             for (const auto& val : decl->values)
-                info.values[val.name] = val.value;
+            {
+                int resolved;
+                if (val.expr)
+                {
+                    TypedValue result = EvaluateConstantExpr(val.expr.get());
+                    
+                    auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(result.value);
+                    if (!constInt)
+                        Error("Enum value '" + val.name + "' must be a constant integer expression");
+                    
+                    resolved = (int)constInt->getSExtValue();
+                    next_value = resolved + 1;
+                }
+                else
+                    resolved = next_value++;
+
+                info.values[val.name] = resolved;
+            }
+
             m_enums[decl->name] = info;
         }
     }
@@ -475,6 +505,34 @@ private:
             TypeInfo type = ResolveType(sizeofExpr->type.get());
             uint64_t size = m_module->getDataLayout().getTypeAllocSize(type.llvmType);
             return TypedValue(m_builder.getInt64(size), TypeInfo(m_builder.getInt64Ty(), true));
+        }
+
+        if (auto* binary = dynamic_cast<BinaryExpr*>(node))
+        {
+            TypedValue lhs = EvaluateConstantExpr(binary->left.get());
+            TypedValue rhs = EvaluateConstantExpr(binary->right.get());
+            
+            auto* lhsConst = llvm::cast<Constant>(lhs.value);
+            auto* rhsConst = llvm::cast<Constant>(rhs.value);
+            
+            TypeInfo commonType = PromoteToCommonType(lhs.type, rhs.type);
+            lhsConst = ConstantCast(lhsConst, lhs.type, commonType);
+            rhsConst = ConstantCast(rhsConst, rhs.type, commonType);
+            
+            Constant* result = nullptr;
+            switch (binary->op)
+            {
+                case '+': result = ConstantExpr::getAdd(lhsConst, rhsConst); break;
+                case '-': result = ConstantExpr::getSub(lhsConst, rhsConst); break;
+                case '*': result = ConstantExpr::getMul(lhsConst, rhsConst); break;
+                case '|': result = ConstantExpr::getOr(lhsConst, rhsConst); break;
+                case '&': result = ConstantExpr::getAnd(lhsConst, rhsConst); break;
+                case '^': result = ConstantExpr::getXor(lhsConst, rhsConst); break;
+                case TokenType_LeftShift:  result = ConstantExpr::getShl(lhsConst, rhsConst); break;
+                case TokenType_RightShift: result = ConstantExpr::getLShr(lhsConst, rhsConst); break;
+                default: Error("Unsupported binary operator in constant expression");
+            }
+            return TypedValue(result, commonType);
         }
         
         Error("Invalid constant expression for global variable");
@@ -1323,9 +1381,16 @@ private:
     {
         const std::string &value = lit->value;
 
-        if (value.find('.') == std::string::npos &&
-            value.find('e') == std::string::npos &&
-            value.find('E') == std::string::npos)
+        bool isHex = value.size() >= 2 && value[0] == '0' && 
+                    (value[1] == 'x' || value[1] == 'X');
+
+        bool isFloatingPoint = !isHex && (
+            value.find('.') != std::string::npos ||
+            value.find('e') != std::string::npos ||
+            value.find('E') != std::string::npos
+        );
+
+        if (!isFloatingPoint)
         {
             bool isUnsigned = false;
             bool isLong = false;

@@ -160,7 +160,7 @@ struct StructDecl : ASTNode {
 struct EnumValue
 {
     std::string name;
-    int value;
+    std::unique_ptr<ExprNode> expr;
 };
 
 struct EnumDecl : ASTNode
@@ -1002,15 +1002,7 @@ public:
             val.name = m_last.value;
             
             if (Match('='))
-            {
-                Expect(TokenType_Number, "Expected number after '='");
-                val.value = std::stoi(m_last.value);
-                next_value = val.value + 1;
-            }
-            else
-            {
-                val.value = next_value++;
-            }
+                val.expr = ParseExpr();
             
             enum_decl->values.push_back(std::move(val));
             
