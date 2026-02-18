@@ -7,11 +7,14 @@
 #include <sstream>
 #include <memory>
 #include <map>
-#include <future>
+#include <thread>
+#include <mutex>
+#include <atomic>
 
 #include <toml++/toml.hpp>
 
 #ifdef _WIN32
+#define NOMINMAX
 #include <windows.h>
 #else
 #include <sys/wait.h>
@@ -229,32 +232,76 @@ private:
         std::map<std::string, std::unique_ptr<ModuleAST>>& moduleMap,
         llvm::TargetMachine* baseTM)
     {
-        std::vector<std::future<std::string>> jobs;
+        const size_t hardwareMax = std::thread::hardware_concurrency();
+        const int requestedThreads = (int)hardwareMax;
 
-        for (const auto& [moduleName, moduleAST] : moduleMap)
+        const size_t threadCount = (size_t)requestedThreads < hardwareMax
+            ? (size_t)requestedThreads
+            : hardwareMax;
+        const size_t finalThreadCount = threadCount < moduleMap.size()
+            ? threadCount
+            : moduleMap.size();
+
+        std::vector<std::pair<const std::string*, const ModuleAST*>> tasks;
+        tasks.reserve(moduleMap.size());
+        for (const auto& [name, ast] : moduleMap)
         {
             std::cout << Color::DIM << "  └─ " << Color::RESET
-                    << "Compiling " << Color::CYAN << moduleName << ".floof"
+                    << "Compiling " << Color::CYAN << name << ".floof"
                     << Color::RESET << "...\n";
-
-            jobs.emplace_back(std::async(std::launch::async, [&, moduleName]() {
-                return compileSingleModule(
-                    moduleName,
-                    *moduleAST,
-                    moduleMap,
-                    projectDir,
-                    *baseTM
-                );
-            }));
+            tasks.emplace_back(&name, ast.get());
         }
 
+        std::vector<std::string> results(tasks.size());
+        std::atomic<size_t> nextTask{0};
+        std::mutex errorMutex;
+        std::exception_ptr firstError = nullptr;
+        
+        auto worker = [&]()
+        {
+            while (true)
+            {
+                size_t i = nextTask.fetch_add(1, std::memory_order_relaxed);
+                if (i >= tasks.size()) break;
+
+                try
+                {
+                    results[i] = compileSingleModule(
+                        *tasks[i].first,
+                        *tasks[i].second,
+                        moduleMap,
+                        projectDir,
+                        *baseTM
+                    );
+                }
+                catch (...)
+                {
+                    std::lock_guard<std::mutex> lock(errorMutex);
+                    if (!firstError)
+                        firstError = std::current_exception();
+                }
+            }
+        };
+
+        std::vector<std::thread> threads;
+        threads.reserve(finalThreadCount);
+        for (size_t i = 0; i < finalThreadCount; ++i)
+            threads.emplace_back(worker);
+
+        for (auto& t : threads)
+            t.join();
+
+        if (firstError)
+            std::rethrow_exception(firstError);
+
         std::string objectFiles;
-        for (auto& job : jobs)
-            objectFiles += job.get();
+        for (const auto& r : results)
+            objectFiles += r;
 
         std::cout << Color::DIM << "  └─ " << Color::RESET
                 << "Compiled " << Color::BRIGHT_GREEN
-                << jobs.size() << Color::RESET << " module(s)\n";
+                << tasks.size() << Color::RESET << " module(s) across "
+                << Color::BRIGHT_YELLOW << finalThreadCount << Color::RESET << " thread(s)\n";
 
         return objectFiles;
     }
@@ -262,27 +309,12 @@ private:
     void linkObjects(const std::string &objectFiles, const BuildConfig &config)
     {
         std::cout << Color::DIM << "  └─ " << Color::RESET << "Linking...\n";
-
+        std::string executableName = config.projectName;
 #ifdef _WIN32
-        std::string outputPath = (projectDir / "build" / (config.projectName + ".exe")).string();
+        executableName += ".exe";
+#endif
 
-        std::string linkerFlags;
-        for (const auto& path : config.libraryPaths)
-            linkerFlags += " /LIBPATH:\"" + path + "\"";
-
-        for (const auto& lib : config.libraries)
-            linkerFlags += " " + lib + ".lib";
-
-        std::string command =
-            "clang-cl /nologo /MD /Fe:\"" + outputPath + "\" " +
-            objectFiles +
-            " /link" +
-            linkerFlags;
-
-        if (config.isDebug)
-            command += " /Zi /Od";
-#else
-        std::string outputPath = (projectDir / "build" / config.projectName).string();
+        std::string outputPath = (projectDir / "build" / executableName).string();
         std::string command = "clang -o " + outputPath + " " + objectFiles;
 
         if (config.isDebug)
@@ -293,7 +325,6 @@ private:
 
         for (const auto &path : config.libraryPaths)
             command += " -L" + path;
-#endif
 
         int result = system(command.c_str());
         if (result != 0)

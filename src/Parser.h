@@ -153,8 +153,9 @@ struct StructField {
 
 struct StructDecl : ASTNode {
     std::string name;
-    bool is_packed;
     std::vector<std::unique_ptr<StructField>> fields;
+    bool is_packed = false;
+    bool is_pub = false;
 };
 
 struct EnumValue
@@ -167,7 +168,7 @@ struct EnumDecl : ASTNode
 {
     std::string name;
     std::vector<EnumValue> values;
-    bool is_union = false;
+    bool is_pub = false;
 };
 
 struct MatchCase
@@ -204,6 +205,7 @@ struct ProcDecl : ASTNode {
 
 struct UsingDecl : ASTNode {
     std::string name;
+    bool is_pub = false;
 };
 
 struct ModuleAST : ASTNode {
@@ -228,32 +230,7 @@ public:
         // Parse all top-level declarations until EOF
         while (m_current.type != TokenType_EOF)
         {
-            // Using declarations
-            if (Match("using"))
-            {
-                auto using_decl = std::make_unique<UsingDecl>();
-                Expect(TokenType_Identifier, "Expected module name after 'using'");
-                using_decl->name = m_last.value;
-                while (Match('.'))
-                {
-                    Expect(TokenType_Identifier, "Expected identifier after '.'");
-                    using_decl->name += '.' + m_last.value;
-                }
-                Expect(';', "Expected ';' after using declaration");
-                module->usings.push_back(std::move(using_decl));
-            }
-            // Struct declarations
-            else if (Match("struct"))
-            {
-                module->structs.push_back(ParseStructDecl());
-            }
-            // Enum declarations
-            else if (Match("enum"))
-            {
-                module->enums.push_back(ParseEnumDecl());
-            }
-            // Global declarations
-            else if (Check(TokenType_Identifier))
+            if (Check(TokenType_Identifier))
             {
                 const bool is_pub = Match("pub");
                 const bool is_extern = Match("extern");
@@ -264,6 +241,32 @@ public:
                     proc->is_extern = is_extern;
                     proc->is_pub = is_pub;
                     module->procs.push_back(std::move(proc));
+                }
+                else if (Match("struct"))
+                {
+                    std::unique_ptr<StructDecl> decl = ParseStructDecl();
+                    decl->is_pub = is_pub;
+                    module->structs.push_back(std::move(decl));
+                }
+                else if (Match("enum"))
+                {
+                    std::unique_ptr<EnumDecl> decl = ParseEnumDecl();
+                    decl->is_pub = is_pub;
+                    module->enums.push_back(std::move(decl));
+                }
+                else if (Match("using"))
+                {
+                    auto using_decl = std::make_unique<UsingDecl>();
+                    Expect(TokenType_Identifier, "Expected module name after 'using'");
+                    using_decl->name = m_last.value;
+                    using_decl->is_pub = is_pub;
+                    while (Match('.'))
+                    {
+                        Expect(TokenType_Identifier, "Expected identifier after '.'");
+                        using_decl->name += '.' + m_last.value;
+                    }
+                    Expect(';', "Expected ';' after using declaration");
+                    module->usings.push_back(std::move(using_decl));
                 }
                 else
                 {

@@ -148,10 +148,13 @@ private:
         const ModuleAST& module = *it->second;
         
         for (const auto& use : module.usings)
-            ImportModuleRecursively(use->name, moduleTable);
+        {
+            if (use->is_pub)
+                ImportModuleRecursively(use->name, moduleTable);
+        }
         
-        RegisterEnums(module);
-        RegisterStructs(module);
+        ImportModuleEnums(module);
+        ImportModuleStructs(module);
         ImportModuleGlobals(module);
         ImportModuleFunctions(module);
     }
@@ -206,6 +209,19 @@ private:
             }
         }
     }
+
+    void RegisterEnums(const ModuleAST& ast)
+    {
+        for (const auto& decl : ast.enums)
+            RegisterEnum(decl.get());
+    }
+
+    void ImportModuleEnums(const ModuleAST& ast)
+    {
+        for (const auto& decl : ast.enums)
+            if (decl->is_pub)
+                RegisterEnum(decl.get());
+    }
     
     void RegisterStructs(const ModuleAST& ast)
     {
@@ -213,36 +229,40 @@ private:
             RegisterStruct(decl.get());
     }
 
-    void RegisterEnums(const ModuleAST& ast)
+    void ImportModuleStructs(const ModuleAST& ast)
     {
-        for (const auto& decl : ast.enums)
+        for (const auto& decl : ast.structs)
+            if (decl->is_pub)
+                RegisterStruct(decl.get());
+    }
+
+    void RegisterEnum(const EnumDecl* decl)
+    {
+        EnumInfo info;
+        info.name = decl->name;
+
+        int next_value = 0;
+        for (const auto& val : decl->values)
         {
-            EnumInfo info;
-            info.name = decl->name;
-
-            int next_value = 0;
-            for (const auto& val : decl->values)
+            int resolved;
+            if (val.expr)
             {
-                int resolved;
-                if (val.expr)
-                {
-                    TypedValue result = EvaluateConstantExpr(val.expr.get());
-                    
-                    auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(result.value);
-                    if (!constInt)
-                        Error("Enum value '" + val.name + "' must be a constant integer expression");
-                    
-                    resolved = (int)constInt->getSExtValue();
-                    next_value = resolved + 1;
-                }
-                else
-                    resolved = next_value++;
-
-                info.values[val.name] = resolved;
+                TypedValue result = EvaluateConstantExpr(val.expr.get());
+                
+                auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(result.value);
+                if (!constInt)
+                    Error("Enum value '" + val.name + "' must be a constant integer expression");
+                
+                resolved = (int)constInt->getSExtValue();
+                next_value = resolved + 1;
             }
+            else
+                resolved = next_value++;
 
-            m_enums[decl->name] = info;
+            info.values[val.name] = resolved;
         }
+
+        m_enums[decl->name] = info;
     }
 
     void RegisterStruct(const StructDecl* decl)
