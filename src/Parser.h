@@ -1094,30 +1094,45 @@ public:
             if (m_last.value == "packed")
                 struct_decl->is_packed = true;
             else
-                throw std::runtime_error("Invalid attribute name " + m_last.value + " on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
+                throw std::runtime_error(
+                    "Invalid attribute name " + m_last.value +
+                    " on line " + std::to_string(m_lexer.GetCurrentLine()) +
+                    " in module " + m_moduleName);
+
             Expect(')', "Expected ')'");
         }
 
         Expect(TokenType_Identifier, "Expected struct name");
         struct_decl->name = m_last.value;
         struct_decl->line = m_lexer.GetCurrentLine();
-        
-        if (Match('{'))
+            
+        Expect('{', "Expected '{'");
+
+        while (!Check('}'))
         {
-            while (!Match('}'))
+            Expect(TokenType_Identifier, "Expected field name");
+
+            std::unique_ptr<StructField> field = std::make_unique<StructField>();
+            field->name = m_last.value;
+
+            Expect(':', "Expected ':'");
+            field->type = ParseType();
+
+            struct_decl->fields.push_back(std::move(field));
+
+            if (Match(','))
             {
-                if (Match(TokenType_Identifier))
-                {
-                    std::unique_ptr<StructField> field = std::make_unique<StructField>();
-                    field->name = m_last.value;
-                    Expect(':', "Expected ':'");
-                    field->type = ParseType();
-                    Expect(';', "Expected ';'");
-                    struct_decl->fields.push_back(std::move(field));
-                }
+                if (Check('}'))
+                    break;
+
+                continue;
             }
+
+            break;
         }
-        
+
+        Expect('}', "Expected '}'");
+
         return struct_decl;
     }
 
