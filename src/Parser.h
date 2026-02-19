@@ -238,8 +238,7 @@ public:
 
                 if (Match("proc"))
                 {
-                    std::unique_ptr<ProcDecl> proc = ParseProcDecl();
-                    proc->is_extern = is_extern;
+                    std::unique_ptr<ProcDecl> proc = ParseProcDecl(is_extern);
                     proc->is_pub = is_pub;
                     proc->line = declLine;
                     module->procs.push_back(std::move(proc));
@@ -1136,12 +1135,13 @@ public:
         return struct_decl;
     }
 
-    std::unique_ptr<ProcDecl> ParseProcDecl(void)
+    std::unique_ptr<ProcDecl> ParseProcDecl(bool is_extern)
     {
         Expect(TokenType_Identifier, "Expected proc name");
         std::unique_ptr<ProcDecl> proc = std::make_unique<ProcDecl>();
         proc->name = m_last.value;
         proc->line = m_lexer.GetCurrentLine();
+        proc->is_extern = is_extern;
 
         if (Match('('))
         {
@@ -1172,7 +1172,9 @@ public:
         if (Match(TokenType_Arrow))
             proc->return_type = ParseType();
 
-        proc->body = ParseBlock();
+        if (is_extern)
+            Expect(';', "Expected ';' after extern proc declaration");
+        else proc->body = ParseBlock();
 
         return proc;
     }
