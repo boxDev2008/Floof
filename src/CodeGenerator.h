@@ -23,8 +23,8 @@ class CodeGenerator
         Type* llvmType;
         Type* pointeeType;
         bool isUnsigned;
-        bool isConst;  // const for the current level
-        std::vector<bool> pointerConst;  // const qualifiers for pointer chain
+        bool isConst;
+        std::vector<bool> pointerConst;
         
         std::shared_ptr<FunctionInfo> functionInfo;
 
@@ -58,7 +58,7 @@ class CodeGenerator
     struct Variable
     {
         TypeInfo type;
-        Value* storage;  // alloca or global
+        Value* storage;
         bool isConst;
 
         Variable() = default;
@@ -92,8 +92,8 @@ class CodeGenerator
 
     struct LoopContext
     {
-        BasicBlock* continueTarget;  // Where 'continue' jumps to
-        BasicBlock* breakTarget;     // Where 'break' jumps to
+        BasicBlock* continueTarget;
+        BasicBlock* breakTarget;
 
         LoopContext() : continueTarget(nullptr), breakTarget(nullptr) {}
         LoopContext(BasicBlock* cont, BasicBlock* brk) 
@@ -114,8 +114,6 @@ public:
         DeclareGlobalVariables(ast);
         RegisterBuiltinFunctions();
         DefineUserFunctionBodies(ast);
-        
-        //m_module->print(llvm::outs(), nullptr);
     }
 
     std::unique_ptr<Module> GetModule() { return std::move(m_module); }
@@ -203,7 +201,7 @@ private:
             {
                 auto it = m_functions.find(proc->name);
                 if (it == m_functions.end())
-                    Error("Function not declared: " + proc->name);
+                    Error("Function not declared: " + proc->name, proc->line);
                 
                 DefineFunctionBody(proc.get(), it->second);
             }
@@ -251,7 +249,7 @@ private:
                 
                 auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(result.value);
                 if (!constInt)
-                    Error("Enum value '" + val.name + "' must be a constant integer expression");
+                    Error("Enum value '" + val.name + "' must be a constant integer expression", val.expr->line);
                 
                 resolved = (int)constInt->getSExtValue();
                 next_value = resolved + 1;
@@ -295,7 +293,6 @@ private:
             
             if (decl->type)
             {
-                // Explicit type provided
                 type = ResolveType(decl->type.get());
                 if (decl->init)
                 {
@@ -307,14 +304,12 @@ private:
             }
             else if (decl->init)
             {
-                // Infer type from initializer
                 TypedValue initValue = EvaluateConstantExpr(decl->init.get());
                 type = initValue.type;
                 initializer = cast<Constant>(initValue.value);
             }
             else
-                Error("Global variable '" + decl->name + 
-                    "' must have either a type or an initializer");
+                Error("Global variable '" + decl->name + "' must have either a type or an initializer", decl->line);
             
             auto linkage = decl->is_pub ? GlobalValue::ExternalLinkage : GlobalValue::InternalLinkage;
             auto* globalVar = new GlobalVariable(
@@ -362,7 +357,7 @@ private:
                     return TypedValue(globalVar, globalIt->second.type);
             }
             
-            Error("Cannot use variable in constant expression: " + id->name);
+            Error("Cannot use variable in constant expression: " + id->name, id->line);
         }
     
         if (auto* num = dynamic_cast<NumberLiteral*>(node))
@@ -371,7 +366,7 @@ private:
             if (expectedType && result.type != *expectedType)
             {
                 Constant* constValue = llvm::cast<Constant>(result.value);
-                return TypedValue(ConstantCast(constValue, result.type, *expectedType), *expectedType);
+                return TypedValue(ConstantCast(constValue, result.type, *expectedType, node->line), *expectedType);
             }
             return result;
         }
@@ -394,7 +389,7 @@ private:
         if (auto* ch = dynamic_cast<CharLiteral*>(node))
         {
             if (ch->value.empty())
-                Error("Empty character literal");
+                Error("Empty character literal", ch->line);
             
             uint8_t charValue = static_cast<uint8_t>(ch->value[0]);
             auto* val = m_builder.getInt8(charValue);
@@ -407,7 +402,7 @@ private:
             TypeInfo targetType = ResolveType(cast->target_type.get());
             
             Constant* constOperand = llvm::cast<Constant>(operand.value);
-            Constant* result = ConstantCast(constOperand, operand.type, targetType);
+            Constant* result = ConstantCast(constOperand, operand.type, targetType, cast->line);
             
             return TypedValue(result, targetType);
         }
@@ -427,13 +422,13 @@ private:
                 
                 if (expectedType && negated.type != *expectedType)
                 {
-                    result = ConstantCast(result, operand.type, *expectedType);
+                    result = ConstantCast(result, operand.type, *expectedType, unary->line);
                     return TypedValue(result, *expectedType);
                 }
                 
                 return negated;
             }
-            Error("Unsupported unary operator in constant expression");
+            Error("Unsupported unary operator in constant expression", unary->line);
         }
         
         if (auto* arrInit = dynamic_cast<ArrayInit*>(node))
@@ -450,7 +445,7 @@ private:
             else
             {
                 if (arrInit->elements.empty())
-                    Error("Cannot infer array type from empty initializer");
+                    Error("Cannot infer array type from empty initializer", arrInit->line);
                 
                 elemType = EvaluateConstantExpr(arrInit->elements[0].get()).type;
                 
@@ -483,7 +478,7 @@ private:
         {
             auto it = m_structs.find(structInit->type_name);
             if (it == m_structs.end())
-                Error("Unknown struct: " + structInit->type_name);
+                Error("Unknown struct: " + structInit->type_name, structInit->line);
             
             const StructInfo& info = it->second;
             std::vector<Constant*> fieldValues;
@@ -510,11 +505,11 @@ private:
         {
             auto it = m_enums.find(enumAccess->enum_name);
             if (it == m_enums.end())
-                Error("Unknown enum: " + enumAccess->enum_name);
+                Error("Unknown enum: " + enumAccess->enum_name, enumAccess->line);
             
             auto valueIt = it->second.values.find(enumAccess->value_name);
             if (valueIt == it->second.values.end())
-                Error("Unknown enum value: " + enumAccess->value_name);
+                Error("Unknown enum value: " + enumAccess->value_name, enumAccess->line);
             
             auto* val = m_builder.getInt32(valueIt->second);
             return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
@@ -536,8 +531,8 @@ private:
             auto* rhsConst = llvm::cast<Constant>(rhs.value);
             
             TypeInfo commonType = PromoteToCommonType(lhs.type, rhs.type);
-            lhsConst = ConstantCast(lhsConst, lhs.type, commonType);
-            rhsConst = ConstantCast(rhsConst, rhs.type, commonType);
+            lhsConst = ConstantCast(lhsConst, lhs.type, commonType, binary->line);
+            rhsConst = ConstantCast(rhsConst, rhs.type, commonType, binary->line);
             
             Constant* result = nullptr;
             switch (binary->op)
@@ -550,15 +545,15 @@ private:
                 case '^': result = ConstantExpr::getXor(lhsConst, rhsConst); break;
                 case TokenType_LeftShift:  result = ConstantExpr::getShl(lhsConst, rhsConst); break;
                 case TokenType_RightShift: result = ConstantExpr::getLShr(lhsConst, rhsConst); break;
-                default: Error("Unsupported binary operator in constant expression");
+                default: Error("Unsupported binary operator in constant expression", binary->line);
             }
             return TypedValue(result, commonType);
         }
         
-        Error("Invalid constant expression for global variable");
+        Error("Invalid constant expression for global variable", node->line);
     }
 
-    Constant* ConstantCast(Constant* value, const TypeInfo& fromType, const TypeInfo& toType)
+    Constant* ConstantCast(Constant* value, const TypeInfo& fromType, const TypeInfo& toType, uint32_t line = 0)
     {
         if (fromType == toType)
             return value;
@@ -567,9 +562,8 @@ private:
         Type* toLLVMType = toType.llvmType;
 
         if ((toType.functionInfo && !fromType.functionInfo))
-            Error("Cannot assign non-function pointer to function pointer");
+            Error("Cannot assign non-function pointer to function pointer", line);
         
-        // Pointer to Pointer
         if (fromLLVMType->isPointerTy() && toLLVMType->isPointerTy())
         {
             if (fromType.pointeeType == toType.pointeeType)
@@ -577,7 +571,6 @@ private:
             return ConstantExpr::getBitCast(value, toLLVMType);
         }
         
-        // Integer to Integer
         if (fromLLVMType->isIntegerTy() && toLLVMType->isIntegerTy())
         {
             unsigned fromBits = fromLLVMType->getIntegerBitWidth();
@@ -596,7 +589,6 @@ private:
             return value;
         }
         
-        // Float to Float
         if (fromLLVMType->isFloatingPointTy() && toLLVMType->isFloatingPointTy())
         {
             unsigned fromBits = fromLLVMType->getPrimitiveSizeInBits();
@@ -609,7 +601,6 @@ private:
             return value;
         }
         
-        // Integer to Float
         if (fromLLVMType->isIntegerTy() && toLLVMType->isFloatingPointTy())
         {
             return (fromLLVMType->isIntegerTy(1) || fromType.isUnsigned)
@@ -617,7 +608,6 @@ private:
                 : ConstantExpr::getSIToFP(value, toLLVMType);
         }
         
-        // Float to Integer
         if (fromLLVMType->isFloatingPointTy() && toLLVMType->isIntegerTy())
         {
             return toType.isUnsigned
@@ -625,15 +615,13 @@ private:
                 : ConstantExpr::getFPToSI(value, toLLVMType);
         }
 
-        // Integer to Pointer
         if (fromLLVMType->isIntegerTy() && toLLVMType->isPointerTy())
             return ConstantExpr::getIntToPtr(value, toLLVMType);
 
-        // Pointer to Integer  
         if (fromLLVMType->isPointerTy() && toLLVMType->isIntegerTy())
             return ConstantExpr::getPtrToInt(value, toLLVMType);
         
-        Error("Cannot cast between incompatible types in constant expression");
+        Error("Cannot cast between incompatible types in constant expression", line);
     }
     
     void RegisterBuiltinFunctions(void)
@@ -653,7 +641,6 @@ private:
             true
         );
 
-        // va_start - void @llvm.va_start(ptr)
         auto* vaStartFunc = Function::Create(
             FunctionType::get(
                 m_builder.getVoidTy(),
@@ -669,7 +656,6 @@ private:
             false
         );
 
-        // va_end - void @llvm.va_end(ptr)
         auto* vaEndFunc = Function::Create(
             FunctionType::get(
                 m_builder.getVoidTy(),
@@ -705,7 +691,6 @@ private:
         auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, proc->is_vararg);
         auto* func = Function::Create(funcType, linkage, proc->name, m_module.get());
         
-        // Set parameter names
         unsigned idx = 0;
         for (auto& arg : func->args())
             arg.setName(proc->params[idx++].name);
@@ -726,7 +711,6 @@ private:
         auto* entry = BasicBlock::Create(m_context, "entry", funcInfo.function);
         m_builder.SetInsertPoint(entry);
         
-        // Allocate and initialize parameters
         unsigned idx = 0;
         for (auto& arg : funcInfo.function->args())
         {
@@ -744,13 +728,12 @@ private:
         m_scopeCount = 0;
         GenerateBlock(proc->body.get(), funcInfo.returnType);
         
-        // Add implicit return if needed
         if (!m_builder.GetInsertBlock()->getTerminator())
         {
             if (funcInfo.returnType.llvmType->isVoidTy())
                 m_builder.CreateRetVoid();
             else
-                Error("Non-void function '" + proc->name + "' must return a value");
+                Error("Non-void function '" + proc->name + "' must return a value", proc->line);
         }
     }
 
@@ -770,7 +753,7 @@ private:
     void GenerateVarDeclHosingAlloc(VarDecl *decl)
     {
         if (IsVariableAccessibleInCurrentScope(decl->name))
-            Error("Variable already declared in this scope: " + decl->name);
+            Error("Variable already declared in this scope: " + decl->name, decl->line);
 
         TypeInfo type;
         
@@ -784,7 +767,7 @@ private:
             type = initValue.type;
         }
         else
-            Error("Variable '" + decl->name + "' must have either a type or an initializer");
+            Error("Variable '" + decl->name + "' must have either a type or an initializer", decl->line);
         
         std::string scopedName = decl->name + '.' + std::to_string(m_currentScope);
         auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, scopedName);
@@ -793,8 +776,7 @@ private:
 
     void GenerateHostingAllocs(BlockStmt* block)
     {
-        uint32_t scopeId = m_scopeCount;
-        m_currentScope = scopeId;
+        uint32_t scopeId = m_currentScope;
         for (const auto& stmt : block->statements)
         {
             if (auto* decl = dynamic_cast<VarDecl*>(stmt.get()))
@@ -819,10 +801,11 @@ private:
             }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
             {
-                m_currentScope = ++m_scopeCount;
+                uint32_t forScopeId = ++m_scopeCount;
+                m_scopes.push_back(Scope{ (int32_t)scopeId, forScopeId });
+                m_currentScope = forScopeId;
                 if (s->init)
                     GenerateVarDeclHosingAlloc(s->init.get());
-                m_scopes.push_back(Scope{ (int32_t)scopeId, m_scopeCount });
                 GenerateHostingAllocs(s->body.get());
                 m_currentScope = scopeId;
             }
@@ -868,9 +851,9 @@ private:
                 m_currentScope = scopeId;
             }
             else if (auto* s = dynamic_cast<BreakStmt*>(stmt.get()))
-                GenerateBreak();
+                GenerateBreak(s);
             else if (auto* s = dynamic_cast<ContinueStmt*>(stmt.get()))
-                GenerateContinue();
+                GenerateContinue(s);
             else if (auto* s = dynamic_cast<MatchStmt*>(stmt.get()))
             {
                 GenerateMatch(s, returnType);
@@ -903,7 +886,7 @@ private:
         
         TypedValue initValue = EvaluateRValue(decl->init.get(), &variable.type);
         if (initValue.type != variable.type)
-            initValue = CastValue(initValue, variable.type);
+            initValue = CastValue(initValue, variable.type, decl->line);
         m_builder.CreateStore(initValue.value, variable.storage);
     }
 
@@ -939,7 +922,7 @@ private:
             {
                 TypedValue elemValue = EvaluateRValue(init->elements[i].get(), &elementType);
                 if (elemValue.type != elementType)
-                    elemValue = CastValue(elemValue, elementType);
+                    elemValue = CastValue(elemValue, elementType, init->elements[i]->line);
                 
                 auto* elemPtr = m_builder.CreateInBoundsGEP(
                     arrayType, arrayPtr,
@@ -951,7 +934,7 @@ private:
             for (size_t i = 0; i < arraySize; i++)
             {
                 Value* elemValue = (i < init->elements.size())
-                    ? CastIfNeeded(EvaluateRValue(init->elements[i].get(), &elementType), elementType).value
+                    ? CastIfNeeded(EvaluateRValue(init->elements[i].get(), &elementType), elementType, init->elements[i]->line).value
                     : CreateZeroValue(elementType.llvmType);
                 
                 auto* elemPtr = m_builder.CreateInBoundsGEP(
@@ -967,12 +950,12 @@ private:
     {
         auto it = m_structs.find(init->type_name);
         if (it == m_structs.end())
-            Error("Unknown struct: " + init->type_name);
+            Error("Unknown struct: " + init->type_name, init->line);
         
         const StructInfo& info = it->second;
         
         if (init->fields.size() > info.fieldIndices.size())
-            Error("Too many fields in struct initializer");
+            Error("Too many fields in struct initializer", init->line);
         
         if (init->fields.size() < info.fieldIndices.size()) {
             uint64_t structBytes = m_module->getDataLayout().getTypeAllocSize(info.type);
@@ -988,11 +971,11 @@ private:
         {
             const TypeInfo* fieldType = FindFieldTypeAtIndex(info, i);
             if (!fieldType)
-                Error("Field type not found at index " + std::to_string(i));
+                Error("Field type not found at index " + std::to_string(i), init->line);
             
             TypedValue fieldValue = EvaluateRValue(init->fields[i].get(), fieldType);
             if (fieldValue.type != *fieldType)
-                fieldValue = CastValue(fieldValue, *fieldType);
+                fieldValue = CastValue(fieldValue, *fieldType, init->fields[i]->line);
             
             auto* fieldPtr = m_builder.CreateStructGEP(info.type, structPtr, i);
             m_builder.CreateStore(fieldValue.value, fieldPtr);
@@ -1010,7 +993,7 @@ private:
         {
             TypedValue retValue = EvaluateRValue(stmt->value.get());
             if (retValue.type != returnType)
-                retValue = CastValue(retValue, returnType);
+                retValue = CastValue(retValue, returnType, stmt->line);
             m_builder.CreateRet(retValue.value);
         }
         else
@@ -1022,7 +1005,7 @@ private:
     void GenerateIf(IfStmt* stmt, const TypeInfo& returnType)
     {
         TypedValue condition = EvaluateRValue(stmt->condition.get());
-        condition = EnsureBooleanType(condition);
+        condition = EnsureBooleanType(condition, stmt->condition->line);
         
         auto* function = m_builder.GetInsertBlock()->getParent();
         auto* thenBB = BasicBlock::Create(m_context, "if.then", function);
@@ -1061,7 +1044,7 @@ private:
         
         m_builder.SetInsertPoint(condBB);
         TypedValue condition = EvaluateRValue(stmt->condition.get());
-        condition = EnsureBooleanType(condition);
+        condition = EnsureBooleanType(condition, stmt->condition->line);
         m_builder.CreateCondBr(condition.value, bodyBB, endBB);
         
         m_builder.SetInsertPoint(bodyBB);
@@ -1077,7 +1060,6 @@ private:
     {
         auto* function = m_builder.GetInsertBlock()->getParent();
         
-        // Initialize loop variable
         if (stmt->init)
         {
             Variable variable = m_locals[stmt->init->name + '.' + std::to_string(m_currentScope)];
@@ -1085,7 +1067,7 @@ private:
             {
                 TypedValue initValue = EvaluateRValue(stmt->init->init.get(), &variable.type);
                 if (initValue.type != variable.type)
-                    initValue = CastValue(initValue, variable.type);
+                    initValue = CastValue(initValue, variable.type, stmt->init->line);
                 m_builder.CreateStore(initValue.value, variable.storage);
             }
         }
@@ -1095,14 +1077,13 @@ private:
         auto* incBB = BasicBlock::Create(m_context, "for.inc", function);
         auto* endBB = BasicBlock::Create(m_context, "for.end", function);
         
-        // Continue jumps to increment, not condition
         LoopContext loopCtx = PushLoop(incBB, endBB);
         
         m_builder.CreateBr(condBB);
         
         m_builder.SetInsertPoint(condBB);
         TypedValue condition = EvaluateRValue(stmt->condition.get());
-        condition = EnsureBooleanType(condition);
+        condition = EnsureBooleanType(condition, stmt->condition->line);
         m_builder.CreateCondBr(condition.value, bodyBB, endBB);
         
         m_builder.SetInsertPoint(bodyBB);
@@ -1118,19 +1099,19 @@ private:
         m_builder.SetInsertPoint(endBB);
     }
 
-    void GenerateBreak()
+    void GenerateBreak(BreakStmt* stmt)
     {
         if (!m_loopContext.breakTarget)
-            Error("'break' outside of loop");
+            Error("'break' outside of loop", stmt->line);
         
         m_builder.CreateBr(m_loopContext.breakTarget);
         CreateUnreachableBlock();
     }
 
-    void GenerateContinue()
+    void GenerateContinue(ContinueStmt* stmt)
     {
         if (!m_loopContext.continueTarget)
-            Error("'continue' outside of loop");
+            Error("'continue' outside of loop", stmt->line);
         
         m_builder.CreateBr(m_loopContext.continueTarget);
         CreateUnreachableBlock();
@@ -1191,7 +1172,7 @@ private:
             
             TypedValue caseValue = EvaluateRValue(case_stmt->value.get());
             if (caseValue.type != matchValue.type)
-                caseValue = CastValue(caseValue, matchValue.type);
+                caseValue = CastValue(caseValue, matchValue.type, case_stmt->value->line);
             
             auto* cond = m_builder.CreateICmpEQ(matchValue.value, caseValue.value);
             m_builder.CreateCondBr(cond, caseBB, nextCaseBB);
@@ -1209,7 +1190,7 @@ private:
     {
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
-            Variable var = LookupVariable(id->name);
+            Variable var = LookupVariable(id->name, id->line);
             TypeInfo type = var.type;
             type.isConst = var.isConst;
             return TypedValue(var.storage, type);
@@ -1221,7 +1202,7 @@ private:
             {
                 TypedValue ptr = EvaluateRValue(unary->operand.get());
                 if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
-                    Error("Cannot dereference non-pointer");
+                    Error("Cannot dereference non-pointer", unary->line);
 
                 bool pointeeIsConst = false;
                 std::vector<bool> newPointerConst;
@@ -1229,7 +1210,6 @@ private:
                 if (ptr.type.pointerConst.size() > 1)
                 {
                     pointeeIsConst = ptr.type.pointerConst[0];
-                    
                     newPointerConst = std::vector<bool>(
                         ptr.type.pointerConst.begin() + 1, 
                         ptr.type.pointerConst.end()
@@ -1267,7 +1247,7 @@ private:
             return TypedValue(m_builder.CreateBitCast(operand.value, m_builder.getPtrTy()), targetType);
         }
         
-        Error("Expression is not an lvalue");
+        Error("Expression is not an lvalue", node->line);
     }
 
     TypedValue EvaluateRValue(ExprNode* node, const TypeInfo* expectedType = nullptr)
@@ -1296,7 +1276,7 @@ private:
                 );
             }
             
-            Variable var = LookupVariable(id->name);
+            Variable var = LookupVariable(id->name, id->line);
             return TypedValue(m_builder.CreateLoad(var.type.llvmType, var.storage), var.type);
         }
         
@@ -1309,7 +1289,7 @@ private:
         if (auto* ch = dynamic_cast<CharLiteral*>(node))
         {
             if (ch->value.empty())
-                Error("Empty character literal");
+                Error("Empty character literal", ch->line);
             
             uint8_t charValue = static_cast<uint8_t>(ch->value[0]);
             auto* val = m_builder.getInt8(charValue);
@@ -1338,11 +1318,11 @@ private:
         {
             auto it = m_enums.find(enumAccess->enum_name);
             if (it == m_enums.end())
-                Error("Unknown enum: " + enumAccess->enum_name);
+                Error("Unknown enum: " + enumAccess->enum_name, enumAccess->line);
             
             auto valueIt = it->second.values.find(enumAccess->value_name);
             if (valueIt == it->second.values.end())
-                Error("Unknown enum value: " + enumAccess->value_name);
+                Error("Unknown enum value: " + enumAccess->value_name, enumAccess->line);
             
             auto* val = m_builder.getInt32(valueIt->second);
             return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
@@ -1394,7 +1374,7 @@ private:
             return TypedValue(result, targetType);
         }
 
-        Error("Invalid rvalue expression");
+        Error("Invalid rvalue expression", node->line);
     }
 
     TypedValue EvaluateNumberLiteral(NumberLiteral* lit)
@@ -1475,7 +1455,7 @@ private:
     {
         TypedValue operand = EvaluateRValue(cast->operand.get());
         TypeInfo targetType = ResolveType(cast->target_type.get());
-        return CastValue(operand, targetType);
+        return CastValue(operand, targetType, cast->line);
     }
 
     TypedValue EvaluateFunctionCall(CallExpr *call)
@@ -1485,13 +1465,13 @@ private:
             if (ident->name == "va_start")
             {
                 if (call->args.size() != 2)
-                    Error("va_start requires exactly 2 arguments: va_list and last named parameter");
+                    Error("va_start requires exactly 2 arguments: va_list and last named parameter", call->line);
                 
                 TypedValue vaListArg = EvaluateLValue(call->args[0].get());
                 
                 auto funcIt = m_functions.find("llvm.va_start");
                 if (funcIt == m_functions.end())
-                    Error("llvm.va_start intrinsic not found");
+                    Error("llvm.va_start intrinsic not found", call->line);
                 
                 Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
                 
@@ -1502,13 +1482,13 @@ private:
             if (ident->name == "va_end")
             {
                 if (call->args.size() != 1)
-                    Error("va_end requires exactly 1 argument: va_list");
+                    Error("va_end requires exactly 1 argument: va_list", call->line);
 
                 TypedValue vaListArg = EvaluateLValue(call->args[0].get());
 
                 auto funcIt = m_functions.find("llvm.va_end");
                 if (funcIt == m_functions.end())
-                    Error("llvm.va_end intrinsic not found");
+                    Error("llvm.va_end intrinsic not found", call->line);
 
                 Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
 
@@ -1516,22 +1496,20 @@ private:
                 return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
             }
 
-            // Check if it's a direct function name
             auto funcIt = m_functions.find(ident->name);
             if (funcIt != m_functions.end())
             {
-                // Direct function call
                 const FunctionInfo& func = funcIt->second;
                 
                 if (func.isVarArg)
                 {
                     if (call->args.size() < func.paramTypes.size())
-                        Error("Too few arguments for " + ident->name);
+                        Error("Too few arguments for " + ident->name, call->line);
                 }
                 else
                 {
                     if (call->args.size() != func.paramTypes.size())
-                        Error("Argument count mismatch for " + ident->name);
+                        Error("Argument count mismatch for " + ident->name, call->line);
                 }
                 
                 std::vector<Value*> args;
@@ -1542,7 +1520,7 @@ private:
                     if (i < func.paramTypes.size())
                     {
                         if (arg.type != func.paramTypes[i])
-                            arg = CastValue(arg, func.paramTypes[i]);
+                            arg = CastValue(arg, func.paramTypes[i], call->args[i]->line);
                     }
                     
                     args.push_back(arg.value);
@@ -1552,29 +1530,25 @@ private:
                 return TypedValue(result, func.returnType);
             }
             
-            // Not a direct function - check if it's a function pointer variable
-            Variable var = LookupVariable(ident->name);
+            Variable var = LookupVariable(ident->name, ident->line);
             
             if (!var.type.functionInfo)
-                Error("Variable '" + ident->name + "' is not callable");
+                Error("Variable '" + ident->name + "' is not callable", call->line);
             
             const FunctionInfo& funcInfo = *var.type.functionInfo;
             
             if (funcInfo.isVarArg)
             {
                 if (call->args.size() < funcInfo.paramTypes.size())
-                    Error("Too few arguments");
+                    Error("Too few arguments", call->line);
             }
             else
             {
                 if (call->args.size() != funcInfo.paramTypes.size())
-                    Error("Argument count mismatch");
+                    Error("Argument count mismatch", call->line);
             }
             
-            // Load the function pointer
             Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
-            
-            // Get the function type from the pointer type
             FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
             
             std::vector<Value*> args;
@@ -1585,7 +1559,7 @@ private:
                 if (i < funcInfo.paramTypes.size())
                 {
                     if (arg.type != funcInfo.paramTypes[i])
-                        arg = CastValue(arg, funcInfo.paramTypes[i]);
+                        arg = CastValue(arg, funcInfo.paramTypes[i], call->args[i]->line);
                 }
                 
                 args.push_back(arg.value);
@@ -1595,27 +1569,24 @@ private:
             return TypedValue(result, funcInfo.returnType);
         }
         
-        // For any other callable expression (array access, member access, etc.)
         TypedValue calleeValue = EvaluateRValue(call->callee.get());
         
         if (!calleeValue.type.functionInfo)
-            Error("Expression is not callable");
+            Error("Expression is not callable", call->line);
         
         const FunctionInfo& funcInfo = *calleeValue.type.functionInfo;
         
-        // Validation
         if (funcInfo.isVarArg)
         {
             if (call->args.size() < funcInfo.paramTypes.size())
-                Error("Too few arguments for function call");
+                Error("Too few arguments for function call", call->line);
         }
         else
         {
             if (call->args.size() != funcInfo.paramTypes.size())
-                Error("Argument count mismatch for function call");
+                Error("Argument count mismatch for function call", call->line);
         }
         
-        // Get the function type
         FunctionType* funcType = cast<FunctionType>(calleeValue.type.pointeeType);
         
         std::vector<Value*> args;
@@ -1626,7 +1597,7 @@ private:
             if (i < funcInfo.paramTypes.size())
             {
                 if (arg.type != funcInfo.paramTypes[i])
-                    arg = CastValue(arg, funcInfo.paramTypes[i]);
+                    arg = CastValue(arg, funcInfo.paramTypes[i], call->args[i]->line);
             }
             
             args.push_back(arg.value);
@@ -1641,7 +1612,7 @@ private:
         TypedValue index = EvaluateRValue(access->index.get());
         
         if (!index.type.llvmType->isIntegerTy(64))
-            index = CastValue(index, TypeInfo(m_builder.getInt64Ty(), false));
+            index = CastValue(index, TypeInfo(m_builder.getInt64Ty(), false), access->index->line);
         
         TypedValue base = EvaluateLValue(access->array.get());
         Type* baseType = base.type.llvmType;
@@ -1673,7 +1644,7 @@ private:
         if (baseType->isPointerTy())
         {
             if (!base.type.pointeeType)
-                Error("Cannot index pointer without pointee type");
+                Error("Cannot index pointer without pointee type", access->line);
             
             Value* ptr = m_builder.CreateLoad(baseType, base.value);
             Value* gep = m_builder.CreateInBoundsGEP(
@@ -1696,7 +1667,7 @@ private:
             return TypedValue(gep, elemTypeInfo);
         }
         
-        Error("Cannot index non-array/non-pointer type");
+        Error("Cannot index non-array/non-pointer type", access->line);
     }
 
     TypedValue EvaluateMemberAccess(MemberAccess* access)
@@ -1705,15 +1676,15 @@ private:
         
         Type* structType = structPtr.type.llvmType;
         if (!structType->isStructTy())
-            Error("Member access on non-struct type");
+            Error("Member access on non-struct type", access->line);
         
         const StructInfo* structInfo = FindStructInfo(structType);
         if (!structInfo)
-            Error("Unknown struct type");
+            Error("Unknown struct type", access->line);
         
         auto it = structInfo->fieldIndices.find(access->member);
         if (it == structInfo->fieldIndices.end())
-            Error("Unknown member: " + access->member);
+            Error("Unknown member: " + access->member, access->line);
         
         unsigned fieldIndex = it->second;
         TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
@@ -1728,19 +1699,19 @@ private:
         TypedValue ptr = EvaluateRValue(access->object.get());
         
         if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
-            Error("Cannot use -> on non-pointer type");
+            Error("Cannot use -> on non-pointer type", access->line);
         
         Type* pointeeType = ptr.type.pointeeType;
         if (!pointeeType->isStructTy())
-            Error("Cannot access member on non-struct pointer");
+            Error("Cannot access member on non-struct pointer", access->line);
         
         const StructInfo* structInfo = FindStructInfo(pointeeType);
         if (!structInfo)
-            Error("Unknown struct type");
+            Error("Unknown struct type", access->line);
         
         auto it = structInfo->fieldIndices.find(access->member);
         if (it == structInfo->fieldIndices.end())
-            Error("Unknown member: " + access->member);
+            Error("Unknown member: " + access->member, access->line);
         
         unsigned fieldIndex = it->second;
     
@@ -1773,7 +1744,7 @@ private:
         else
         {
             if (init->elements.empty())
-                Error("Cannot infer array type from empty initializer");
+                Error("Cannot infer array type from empty initializer", init->line);
             
             arraySize = init->elements.size();
             
@@ -1836,7 +1807,7 @@ private:
     {
         auto it = m_structs.find(init->type_name);
         if (it == m_structs.end())
-            Error("Unknown struct: " + init->type_name);
+            Error("Unknown struct: " + init->type_name, init->line);
         
         const StructInfo& info = it->second;
         auto* alloca = m_builder.CreateAlloca(info.type, nullptr, "struct_tmp");
@@ -1872,7 +1843,7 @@ private:
         {
             TypedValue ptr = EvaluateRValue(unary->operand.get());
             if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
-                Error("Cannot dereference non-pointer");
+                Error("Cannot dereference non-pointer", unary->line);
 
             bool pointeeIsConst = false;
             if (!ptr.type.pointerConst.empty())
@@ -1901,12 +1872,11 @@ private:
             return TypedValue(result, TypeInfo(m_builder.getInt1Ty(), false));
         }
         
-        Error("Unknown unary operator");
+        Error("Unknown unary operator", unary->line);
     }
 
     TypedValue EvaluateBinaryExpr(BinaryExpr* binary)
     {
-        // Handle assignment
         if (binary->op == '=')
         {
             TypedValue lhs = EvaluateLValue(binary->left.get());
@@ -1914,20 +1884,18 @@ private:
             if (lhs.type.isConst)
             {
                 if (auto* id = dynamic_cast<Identifier*>(binary->left.get()))
-                    Error("Cannot assign to constant variable '" + id->name + "'");
+                    Error("Cannot assign to constant variable '" + id->name + "'", binary->line);
                 else if (auto* unary = dynamic_cast<UnaryExpr*>(binary->left.get()))
                 {
                     if (unary->op == '*')
-                        Error("Cannot assign to const-qualified pointee");
+                        Error("Cannot assign to const-qualified pointee", binary->line);
                 }
                 else if (auto* member = dynamic_cast<MemberAccess*>(binary->left.get()))
-                    Error("Cannot assign to constant member '" + member->member + "'");
+                    Error("Cannot assign to constant member '" + member->member + "'", binary->line);
                 else if (dynamic_cast<ArrayAccess*>(binary->left.get()))
-                    Error("Cannot assign to constant array element");
-                else if (dynamic_cast<UnaryExpr*>(binary->left.get()))
-                    Error("Cannot assign to constant through pointer dereference");
+                    Error("Cannot assign to constant array element", binary->line);
                 else
-                    Error("Cannot assign to constant expression");
+                    Error("Cannot assign to constant expression", binary->line);
             }
 
             if (lhs.type.llvmType->isArrayTy() || lhs.type.llvmType->isStructTy())
@@ -1940,7 +1908,7 @@ private:
                     : EvaluateLValue(binary->right.get());
                 
                 if (rhs.type != lhs.type)
-                    Error("Type mismatch in aggregate assignment");
+                    Error("Type mismatch in aggregate assignment", binary->line);
                 
                 if (isInitializer) {
                     auto* tempAlloca = m_builder.CreateAlloca(rhs.type.llvmType, nullptr, "temp_aggregate");
@@ -1963,7 +1931,7 @@ private:
             TypedValue rhs = EvaluateRValue(binary->right.get());
             
             if (rhs.type != lhs.type)
-                rhs = CastValue(rhs, lhs.type);
+                rhs = CastValue(rhs, lhs.type, binary->line);
             m_builder.CreateStore(rhs.value, lhs.value);
             return rhs;
         }
@@ -1977,19 +1945,18 @@ private:
             if (lhs.type.isConst)
             {
                 if (auto* id = dynamic_cast<Identifier*>(binary->left.get()))
-                    Error("Cannot assign to constant variable '" + id->name + "'");
+                    Error("Cannot assign to constant variable '" + id->name + "'", binary->line);
                 else if (auto* member = dynamic_cast<MemberAccess*>(binary->left.get()))
-                    Error("Cannot assign to constant member '" + member->member + "'");
+                    Error("Cannot assign to constant member '" + member->member + "'", binary->line);
                 else if (dynamic_cast<ArrayAccess*>(binary->left.get()))
-                    Error("Cannot assign to constant array element");
+                    Error("Cannot assign to constant array element", binary->line);
                 else if (dynamic_cast<UnaryExpr*>(binary->left.get()))
-                    Error("Cannot assign to constant through pointer dereference");
+                    Error("Cannot assign to constant through pointer dereference", binary->line);
                 else
-                    Error("Cannot assign to constant expression");
+                    Error("Cannot assign to constant expression", binary->line);
             }
             
             TypedValue currentValue(m_builder.CreateLoad(lhs.type.llvmType, lhs.value), lhs.type);
-            
             TypedValue rhs = EvaluateRValue(binary->right.get());
             
             char opChar;
@@ -2000,7 +1967,7 @@ private:
                 case TokenType_StarEqual:    opChar = '*'; break;
                 case TokenType_SlashEqual:   opChar = '/'; break;
                 case TokenType_PercentEqual: opChar = '%'; break;
-                default: Error("Unknown compound assignment operator");
+                default: Error("Unknown compound assignment operator", binary->line);
             }
             
             if ((binary->op == TokenType_PlusEqual || binary->op == TokenType_MinusEqual) &&
@@ -2014,8 +1981,8 @@ private:
             }
             
             TypeInfo commonType = PromoteToCommonType(currentValue.type, rhs.type);
-            currentValue = CastIfNeeded(currentValue, commonType);
-            rhs = CastIfNeeded(rhs, commonType);
+            currentValue = CastIfNeeded(currentValue, commonType, binary->line);
+            rhs = CastIfNeeded(rhs, commonType, binary->line);
             
             const bool isFloat = commonType.llvmType->isFloatingPointTy();
             const bool isUnsigned = commonType.isUnsigned;
@@ -2028,13 +1995,13 @@ private:
                 case '*': result = isFloat ? m_builder.CreateFMul(currentValue.value, rhs.value) : m_builder.CreateMul(currentValue.value, rhs.value); break;
                 case '/': result = CreateDivision(currentValue.value, rhs.value, isFloat, isUnsigned); break;
                 case '%': result = CreateRemainder(currentValue.value, rhs.value, isFloat, isUnsigned); break;
-                default: Error("Unknown binary operator in compound assignment");
+                default: Error("Unknown binary operator in compound assignment", binary->line);
             }
             
             TypedValue resultValue(result, commonType);
             
             if (resultValue.type != lhs.type)
-                resultValue = CastValue(resultValue, lhs.type);
+                resultValue = CastValue(resultValue, lhs.type, binary->line);
             
             m_builder.CreateStore(resultValue.value, lhs.value);
             return resultValue;
@@ -2050,8 +2017,8 @@ private:
         }
 
         TypeInfo commonType = PromoteToCommonType(lhs.type, rhs.type);
-        lhs = CastIfNeeded(lhs, commonType);
-        rhs = CastIfNeeded(rhs, commonType);
+        lhs = CastIfNeeded(lhs, commonType, binary->line);
+        rhs = CastIfNeeded(rhs, commonType, binary->line);
         
         const bool isFloat = commonType.llvmType->isFloatingPointTy();
         const bool isUnsigned = commonType.isUnsigned;
@@ -2067,23 +2034,23 @@ private:
             case '/': result = CreateDivision(lhs.value, rhs.value, isFloat, isUnsigned); break;
             case '%': result = CreateRemainder(lhs.value, rhs.value, isFloat, isUnsigned); break;
             case '&': 
-                if (isFloat) Error("Bitwise AND not supported on floating-point types");
+                if (isFloat) Error("Bitwise AND not supported on floating-point types", binary->line);
                 result = m_builder.CreateAnd(lhs.value, rhs.value); 
                 break;
             case '|': 
-                if (isFloat) Error("Bitwise OR not supported on floating-point types");
+                if (isFloat) Error("Bitwise OR not supported on floating-point types", binary->line);
                 result = m_builder.CreateOr(lhs.value, rhs.value); 
                 break;
             case '^': 
-                if (isFloat) Error("Bitwise XOR not supported on floating-point types");
+                if (isFloat) Error("Bitwise XOR not supported on floating-point types", binary->line);
                 result = m_builder.CreateXor(lhs.value, rhs.value); 
                 break;
-            case 'l': // 
-                if (isFloat) Error("Left shift not supported on floating-point types");
+            case TokenType_LeftShift:
+                if (isFloat) Error("Left shift not supported on floating-point types", binary->line);
                 result = m_builder.CreateShl(lhs.value, rhs.value); 
                 break;
-            case 'r': // >>
-                if (isFloat) Error("Right shift not supported on floating-point types");
+            case TokenType_RightShift:
+                if (isFloat) Error("Right shift not supported on floating-point types", binary->line);
                 result = isUnsigned ? m_builder.CreateLShr(lhs.value, rhs.value) : m_builder.CreateAShr(lhs.value, rhs.value);
                 break;
             case TokenType_EqualEqual: result = CreateEquality(lhs.value, rhs.value, isFloat, true); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
@@ -2092,7 +2059,7 @@ private:
             case TokenType_LessEqual: result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SLE, CmpInst::ICMP_ULE, CmpInst::FCMP_OLE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case '>': result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SGT, CmpInst::ICMP_UGT, CmpInst::FCMP_OGT); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
             case TokenType_GreaterEqual: result = CreateComparison(lhs.value, rhs.value, isFloat, isUnsigned, CmpInst::ICMP_SGE, CmpInst::ICMP_UGE, CmpInst::FCMP_OGE); resultType = TypeInfo(m_builder.getInt1Ty(), false); break;
-            default: Error("Unknown binary operator");
+            default: Error("Unknown binary operator", binary->line);
         }
         
         return TypedValue(result, resultType);
@@ -2100,7 +2067,6 @@ private:
 
     std::optional<TypedValue> TryPointerArithmetic(char op, TypedValue& lhs, TypedValue& rhs)
     {
-        // Pointer + Integer
         if (lhs.type.llvmType->isPointerTy() && rhs.type.llvmType->isIntegerTy())
         {
             rhs = CastIfNeeded(rhs, TypeInfo(m_builder.getInt64Ty(), false));
@@ -2109,7 +2075,6 @@ private:
             return TypedValue(result, lhs.type);
         }
         
-        // Integer + Pointer
         if (lhs.type.llvmType->isIntegerTy() && rhs.type.llvmType->isPointerTy() && op == '+')
         {
             lhs = CastIfNeeded(lhs, TypeInfo(m_builder.getInt64Ty(), false));
@@ -2117,7 +2082,6 @@ private:
             return TypedValue(result, rhs.type);
         }
         
-        // Pointer - Pointer
         if (lhs.type.llvmType->isPointerTy() && rhs.type.llvmType->isPointerTy() && op == '-')
         {
             Value* lhsInt = m_builder.CreatePtrToInt(lhs.value, m_builder.getInt64Ty());
@@ -2138,7 +2102,7 @@ private:
                 TypeInfo(Type::getVoidTy(m_context), false);
             
             FunctionInfo funcInfo;
-            funcInfo.isVarArg = false; // TODO: change this when we have support for varArgs
+            funcInfo.isVarArg = false;
             funcInfo.function = nullptr;
 
             std::vector<Type*> paramLLVMTypes;
@@ -2177,7 +2141,6 @@ private:
         return ResolveSimpleType(node);
     }
 
-    // Resolves a type including pointer depth
     TypeInfo ResolveSimpleType(TypeNode* node)
     {
         Type* baseType = nullptr;
@@ -2203,13 +2166,11 @@ private:
         }
 
         if (!baseType)
-            Error("Unknown type: " + node->name);
+            Error("Unknown type: " + node->name, node->line);
         
-        // Apply pointer depth with const qualifiers
         if (node->pointer_depth > 0)
         {
             Type* pointeeType = baseType->isVoidTy() ? m_builder.getInt8Ty() : baseType;
-            bool pointeeConst = node->is_const;
             
             std::vector<bool> ptrConst = node->pointer_const;
             bool topLevelConst = !ptrConst.empty() ? ptrConst.back() : false;
@@ -2220,7 +2181,6 @@ private:
         return TypeInfo(baseType, isUnsigned, node->is_const, nullptr, nullptr, {});
     }
 
-    // Helper to get builtin type - returns nullptr if not found
     Type* GetBuiltinType(const std::string& name, bool& outIsUnsigned)
     {
         static const std::unordered_map<std::string, std::function<Type*(IRBuilder<>&)>> typeMap = {
@@ -2254,7 +2214,7 @@ private:
         return nullptr;
     }
     
-    TypedValue CastValue(TypedValue value, TypeInfo targetType)
+    TypedValue CastValue(TypedValue value, TypeInfo targetType, uint32_t line = 0)
     {
         if (value.type == targetType)
             return value;
@@ -2263,9 +2223,8 @@ private:
         Type* toType = targetType.llvmType;
 
         if ((targetType.functionInfo && !value.type.functionInfo))
-            Error("Cannot assign non-function pointer to function pointer");
+            Error("Cannot assign non-function pointer to function pointer", line);
         
-        // Pointer to Pointer
         if (fromType->isPointerTy() && toType->isPointerTy())
         {
             if (value.type.pointeeType == targetType.pointeeType)
@@ -2273,7 +2232,6 @@ private:
             return TypedValue(m_builder.CreateBitCast(value.value, toType), targetType);
         }
         
-        // Integer to Integer
         if (fromType->isIntegerTy() && toType->isIntegerTy())
         {
             unsigned fromBits = fromType->getIntegerBitWidth();
@@ -2281,7 +2239,6 @@ private:
             
             if (fromBits < toBits)
             {
-                // i1 (bool) always zero-extends
                 Value* result = (fromBits == 1 || value.type.isUnsigned)
                     ? m_builder.CreateZExt(value.value, toType)
                     : m_builder.CreateSExt(value.value, toType);
@@ -2294,7 +2251,6 @@ private:
             return TypedValue(value.value, targetType);
         }
         
-        // Float to Float
         if (fromType->isFloatingPointTy() && toType->isFloatingPointTy())
         {
             unsigned fromBits = fromType->getPrimitiveSizeInBits();
@@ -2308,7 +2264,6 @@ private:
             return TypedValue(result, targetType);
         }
         
-        // Integer to Float
         if (fromType->isIntegerTy() && toType->isFloatingPointTy())
         {
             Value* result = (fromType->isIntegerTy(1) || value.type.isUnsigned)
@@ -2317,7 +2272,6 @@ private:
             return TypedValue(result, targetType);
         }
         
-        // Float to Integer
         if (fromType->isFloatingPointTy() && toType->isIntegerTy())
         {
             Value* result = targetType.isUnsigned
@@ -2326,15 +2280,13 @@ private:
             return TypedValue(result, targetType);
         }
 
-        // Integer to Pointer
         if (fromType->isIntegerTy() && toType->isPointerTy())
             return TypedValue(m_builder.CreateIntToPtr(value.value, toType), targetType);
 
-        // Pointer to Integer
         if (fromType->isPointerTy() && toType->isIntegerTy())
             return TypedValue(m_builder.CreatePtrToInt(value.value, toType), targetType);
         
-        Error("Cannot cast between incompatible types");
+        Error("Cannot cast between incompatible types", line);
     }
     
     TypeInfo PromoteToCommonType(const TypeInfo& left, const TypeInfo& right)
@@ -2342,7 +2294,6 @@ private:
         Type* leftType = left.llvmType;
         Type* rightType = right.llvmType;
         
-        // Float promotion
         if (leftType->isFloatingPointTy() || rightType->isFloatingPointTy())
         {
             if (leftType->isFloatingPointTy() && rightType->isFloatingPointTy())
@@ -2353,7 +2304,6 @@ private:
             return leftType->isFloatingPointTy() ? left : right;
         }
         
-        // Integer promotion
         if (leftType->isIntegerTy() && rightType->isIntegerTy())
         {
             unsigned leftBits = leftType->getIntegerBitWidth();
@@ -2365,7 +2315,6 @@ private:
             return (leftBits > rightBits) ? left : right;
         }
 
-        // Pointer and Integer - promote integer to pointer type
         if (leftType->isPointerTy() && rightType->isIntegerTy())
             return left;
         if (leftType->isIntegerTy() && rightType->isPointerTy())
@@ -2374,19 +2323,19 @@ private:
         return left;
     }
 
-    TypedValue CastIfNeeded(TypedValue value, const TypeInfo& targetType)
+    TypedValue CastIfNeeded(TypedValue value, const TypeInfo& targetType, uint32_t line = 0)
     {
-        return (value.type != targetType) ? CastValue(value, targetType) : value;
+        return (value.type != targetType) ? CastValue(value, targetType, line) : value;
     }
 
-    TypedValue EnsureBooleanType(TypedValue value)
+    TypedValue EnsureBooleanType(TypedValue value, uint32_t line = 0)
     {
         if (value.type.llvmType->isIntegerTy(1))
             return value;
-        return CastValue(value, TypeInfo(m_builder.getInt1Ty(), false));
+        return CastValue(value, TypeInfo(m_builder.getInt1Ty(), false), line);
     }
     
-    Variable LookupVariable(const std::string& name)
+    Variable LookupVariable(const std::string& name, uint32_t line = 0)
     {
         int32_t scopeIdx = m_currentScope;
         while (scopeIdx >= 0)
@@ -2402,7 +2351,7 @@ private:
         if (it != m_globals.end())
             return it->second;
         
-        Error("Unknown variable: " + name);
+        Error("Unknown variable: " + name, line);
     }
 
     const StructInfo* FindStructInfo(Type* structType) const
@@ -2487,9 +2436,13 @@ private:
             : m_builder.CreateICmp(signedPred, lhs, rhs);
     }
 
-    void Error(const std::string& msg)
+    // line = 0 means "no specific source location known"
+    [[noreturn]] void Error(const std::string& msg, uint32_t line = 0)
     {
-        throw std::runtime_error(msg + " in module \'" + m_module->getName().str() + '\'');
+        std::string location = " in module '" + m_module->getName().str() + "'";
+        if (line > 0)
+            location = " at line " + std::to_string(line) + location;
+        throw std::runtime_error(msg + location);
     }
     
     std::vector<Scope> m_scopes;

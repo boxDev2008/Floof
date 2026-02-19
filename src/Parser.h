@@ -8,6 +8,7 @@
 
 struct ASTNode {
     virtual ~ASTNode() = default;
+    uint32_t line = 0;
 };
 
 struct TypeNode : ASTNode {
@@ -227,11 +228,11 @@ public:
     {
         std::unique_ptr<ModuleAST> module = std::make_unique<ModuleAST>();
         
-        // Parse all top-level declarations until EOF
         while (m_current.type != TokenType_EOF)
         {
             if (Check(TokenType_Identifier))
             {
+                uint32_t declLine = CurrentLine();
                 const bool is_pub = Match("pub");
                 const bool is_extern = Match("extern");
 
@@ -240,23 +241,27 @@ public:
                     std::unique_ptr<ProcDecl> proc = ParseProcDecl();
                     proc->is_extern = is_extern;
                     proc->is_pub = is_pub;
+                    proc->line = declLine;
                     module->procs.push_back(std::move(proc));
                 }
                 else if (Match("struct"))
                 {
                     std::unique_ptr<StructDecl> decl = ParseStructDecl();
                     decl->is_pub = is_pub;
+                    decl->line = declLine;
                     module->structs.push_back(std::move(decl));
                 }
                 else if (Match("enum"))
                 {
                     std::unique_ptr<EnumDecl> decl = ParseEnumDecl();
                     decl->is_pub = is_pub;
+                    decl->line = declLine;
                     module->enums.push_back(std::move(decl));
                 }
                 else if (Match("using"))
                 {
                     auto using_decl = std::make_unique<UsingDecl>();
+                    using_decl->line = declLine;
                     Expect(TokenType_Identifier, "Expected module name after 'using'");
                     using_decl->name = m_last.value;
                     using_decl->is_pub = is_pub;
@@ -271,13 +276,14 @@ public:
                 else
                 {
                     std::string name = m_current.value;
+                    uint32_t varLine = CurrentLine();
                     Advance();
                     
                     if (Check(':'))
                     {
-                        // It's a global variable
                         auto var = std::make_unique<GlobalVarDecl>();
                         var->name = name;
+                        var->line = varLine;
                         
                         Expect(':', "Expected ':'");
                         
@@ -302,7 +308,6 @@ public:
             }
             else
             {
-                // If we get here, we have an unexpected token
                 std::string msg = "Unexpected token at module level: ";
                 if (m_current.type == TokenType_Identifier)
                     msg += m_current.value;
@@ -320,6 +325,7 @@ public:
     std::unique_ptr<TypeNode> ParseType(void)
     {
         std::unique_ptr<TypeNode> type = std::make_unique<TypeNode>();
+        type->line = CurrentLine();
         
         if (Match("const"))
             type->is_const = true;
@@ -350,7 +356,6 @@ public:
                 } while (Match(','));
             }
 
-            
             Expect(')', "Expected ')'");
             
             while (Match('['))
@@ -366,7 +371,6 @@ public:
             return type;
         }
         
-        // Regular type parsing
         if (Check(TokenType_Identifier))
         {
             type->name = m_current.value;
@@ -402,17 +406,19 @@ public:
         return ParseAssignment();
     }
 
-    // Assignment: = += -= *= /=
     std::unique_ptr<ExprNode> ParseAssignment(void)
     {
-        auto expr = ParseBitwiseOr();  // Start with lowest precedence binary operator
+        auto expr = ParseBitwiseOr();
         
+        uint32_t opLine = CurrentLine();
+
         if (Match('='))
         {
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             binary->op = '=';
-            binary->right = ParseAssignment(); // right-associative
+            binary->right = ParseAssignment();
             return binary;
         }
 
@@ -421,6 +427,7 @@ public:
             Match(TokenType_PercentEqual))
         {
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             binary->op = m_last.type;
             binary->right = ParseAssignment();
@@ -430,14 +437,17 @@ public:
         return expr;
     }
 
-    // Bitwise OR: |
     std::unique_ptr<ExprNode> ParseBitwiseOr(void)
     {
         auto expr = ParseBitwiseXor();
         
-        while (Match('|'))
+        while (true)
         {
+            uint32_t opLine = CurrentLine();
+            if (!Match('|')) break;
+
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             binary->op = '|';
             binary->right = ParseBitwiseXor();
@@ -447,14 +457,17 @@ public:
         return expr;
     }
 
-    // Bitwise XOR: ^
     std::unique_ptr<ExprNode> ParseBitwiseXor(void)
     {
         auto expr = ParseBitwiseAnd();
         
-        while (Match('^'))
+        while (true)
         {
+            uint32_t opLine = CurrentLine();
+            if (!Match('^')) break;
+
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             binary->op = '^';
             binary->right = ParseBitwiseAnd();
@@ -464,14 +477,17 @@ public:
         return expr;
     }
 
-    // Bitwise AND: &
     std::unique_ptr<ExprNode> ParseBitwiseAnd(void)
     {
         auto expr = ParseComparison();
         
-        while (Match('&'))
+        while (true)
         {
+            uint32_t opLine = CurrentLine();
+            if (!Match('&')) break;
+
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             binary->op = '&';
             binary->right = ParseComparison();
@@ -481,16 +497,20 @@ public:
         return expr;
     }
 
-    // Comparison: == != < <= > >=
     std::unique_ptr<ExprNode> ParseComparison(void)
     {
-        auto expr = ParseShift();  // Changed from ParseAdditive
+        auto expr = ParseShift();
         
-        while (Match(TokenType_EqualEqual) || Match(TokenType_NotEqual) || 
-            Match('<') || Match(TokenType_LessEqual) || 
-            Match('>') || Match(TokenType_GreaterEqual))
+        while (true)
         {
+            uint32_t opLine = CurrentLine();
+            if (!Match(TokenType_EqualEqual) && !Match(TokenType_NotEqual) &&
+                !Match('<') && !Match(TokenType_LessEqual) &&
+                !Match('>') && !Match(TokenType_GreaterEqual))
+                break;
+
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             
             if (m_last.type == TokenType_EqualEqual)
@@ -504,43 +524,44 @@ public:
             else
                 binary->op = m_last.value[0];
             
-            binary->right = ParseShift();  // Changed from ParseAdditive
+            binary->right = ParseShift();
             expr = std::move(binary);
         }
         
         return expr;
     }
 
-    // Shift operators: << >>
     std::unique_ptr<ExprNode> ParseShift(void)
     {
-        auto expr = ParseAdditive();  // Call next level down
+        auto expr = ParseAdditive();
         
-        while (Match(TokenType_LeftShift) || Match(TokenType_RightShift))
+        while (true)
         {
+            uint32_t opLine = CurrentLine();
+            if (!Match(TokenType_LeftShift) && !Match(TokenType_RightShift)) break;
+
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
-            
-            if (m_last.type == TokenType_LeftShift)
-                binary->op = TokenType_LeftShift;
-            else
-                binary->op = TokenType_RightShift;
-            
-            binary->right = ParseAdditive();  // Call next level down
+            binary->op = (m_last.type == TokenType_LeftShift) ? TokenType_LeftShift : TokenType_RightShift;
+            binary->right = ParseAdditive();
             expr = std::move(binary);
         }
         
         return expr;
     }
 
-    // Additive: + -
     std::unique_ptr<ExprNode> ParseAdditive(void)
     {
-        auto expr = ParseMultiplicative();  // Back to calling ParseMultiplicative
+        auto expr = ParseMultiplicative();
         
-        while (Match('+') || Match('-'))
+        while (true)
         {
+            uint32_t opLine = CurrentLine();
+            if (!Match('+') && !Match('-')) break;
+
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             binary->op = m_last.value[0];
             binary->right = ParseMultiplicative();
@@ -550,14 +571,17 @@ public:
         return expr;
     }
 
-    // Multiplicative: * / %
     std::unique_ptr<ExprNode> ParseMultiplicative(void)
     {
         auto expr = ParseUnary();
         
-        while (Match('*') || Match('/') || Match('%'))
+        while (true)
         {
+            uint32_t opLine = CurrentLine();
+            if (!Match('*') && !Match('/') && !Match('%')) break;
+
             auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
             binary->left = std::move(expr);
             binary->op = m_last.value[0];
             binary->right = ParseUnary();
@@ -567,12 +591,13 @@ public:
         return expr;
     }
 
-    // Unary: - ! & * ~
     std::unique_ptr<ExprNode> ParseUnary(void)
     {
+        uint32_t opLine = CurrentLine();
         if (Match('-') || Match('!') || Match('&') || Match('*') || Match('~'))
         {
             auto unary = std::make_unique<UnaryExpr>();
+            unary->line = opLine;
             unary->op = m_last.value[0];
             unary->is_prefix = true;
             unary->operand = ParseUnary();
@@ -582,16 +607,17 @@ public:
         return ParsePostfix();
     }
 
-    // Postfix: [] . ()
     std::unique_ptr<ExprNode> ParsePostfix(void)
     {
         auto expr = ParsePrimary();
         
         while (true)
         {
+            uint32_t opLine = CurrentLine();
             if (Match('['))
             {
                 auto access = std::make_unique<ArrayAccess>();
+                access->line = opLine;
                 access->array = std::move(expr);
                 access->index = ParseExpr();
                 Expect(']', "Expected ']'");
@@ -600,6 +626,7 @@ public:
             else if (Match('.'))
             {
                 auto member = std::make_unique<MemberAccess>();
+                member->line = opLine;
                 member->object = std::move(expr);
                 Expect(TokenType_Identifier, "Expected member name");
                 member->member = m_last.value;
@@ -608,6 +635,7 @@ public:
             else if (Match(TokenType_Arrow))
             {
                 auto member = std::make_unique<PointerMemberAccess>();
+                member->line = opLine;
                 member->object = std::move(expr);
                 Expect(TokenType_Identifier, "Expected member name");
                 member->member = m_last.value;
@@ -616,6 +644,7 @@ public:
             else if (Match('('))
             {
                 auto call = std::make_unique<CallExpr>();
+                call->line = opLine;
                 call->callee = std::move(expr);
                 
                 if (!Check(')'))
@@ -634,12 +663,14 @@ public:
         return expr;
     }
 
-    // Primary: literals, identifiers, parenthesized expressions
     std::unique_ptr<ExprNode> ParsePrimary(void)
     {
+        uint32_t primaryLine = CurrentLine();
+
         if (Match(TokenType_Number))
         {
             auto num = std::make_unique<NumberLiteral>();
+            num->line = primaryLine;
             num->value = m_last.value;
             return num;
         }
@@ -647,6 +678,7 @@ public:
         if (Match(TokenType_String))
         {
             auto str = std::make_unique<::StringLiteral>();
+            str->line = primaryLine;
             str->value = m_last.value;
             return str;
         }
@@ -654,6 +686,7 @@ public:
         if (Match(TokenType_Char))
         {
             auto chr = std::make_unique<CharLiteral>();
+            chr->line = primaryLine;
             chr->value = m_last.value;
             return chr;
         }
@@ -668,6 +701,7 @@ public:
         if (Match('['))
         {
             auto arr = std::make_unique<ArrayInit>();
+            arr->line = primaryLine;
             
             if (!Check(']'))
             {
@@ -687,6 +721,7 @@ public:
             if (name == "sizeof" && Match('('))
             {
                 auto sizeofExpr = std::make_unique<SizeofExpr>();
+                sizeofExpr->line = primaryLine;
                 sizeofExpr->type = ParseType();
                 Expect(')', "Expected ')' after sizeof type");
                 return sizeofExpr;
@@ -695,6 +730,7 @@ public:
             if (name == "cast" && Match('('))
             {
                 auto cast = std::make_unique<CastExpr>();
+                cast->line = primaryLine;
                 cast->target_type = ParseType();
                 Expect(')', "Expected ')' after cast type");
                 cast->operand = ParseUnary();
@@ -704,6 +740,7 @@ public:
             if (name == "va_arg" && Match('('))
             {
                 auto vaArg = std::make_unique<VaArgExpr>();
+                vaArg->line = primaryLine;
                 vaArg->va_list = ParseExpr();
                 Expect(',', "Expected ',' after va_list");
                 vaArg->type = ParseType();
@@ -716,6 +753,7 @@ public:
                 Expect(TokenType_Identifier, "Expected enum value name after ':'");
                 std::string valueName = m_last.value;
                 auto enumAccess = std::make_unique<EnumAccess>();
+                enumAccess->line = primaryLine;
                 enumAccess->enum_name = name;
                 enumAccess->value_name = valueName;
                 return enumAccess;
@@ -724,6 +762,7 @@ public:
             if (!m_parsingStatement && Match('{'))
             {
                 auto init = std::make_unique<StructInit>();
+                init->line = primaryLine;
                 init->type_name = name;
                 
                 if (!Check('}'))
@@ -738,49 +777,45 @@ public:
             }
             
             auto ident = std::make_unique<Identifier>();
+            ident->line = primaryLine;
             ident->name = name;
             return ident;
         }
         
-        throw std::runtime_error("Expected expression");
+        throw std::runtime_error("Expected expression on line " + std::to_string(primaryLine) + " in module " + m_moduleName);
     }
 
-    // Parse variable declaration
-    // Syntax: name: [const] type [= initializer];
     std::unique_ptr<VarDecl> ParseVarDecl(void)
     {
         auto var = std::make_unique<VarDecl>();
         
-        // Variable name
         Expect(TokenType_Identifier, "Expected variable name");
         var->name = m_last.value;
+        var->line = m_lexer.GetCurrentLine();
         
-        // Colon
         Expect(':', "Expected ':' after variable name");
         
-        // Type
-        if (Check(TokenType_Identifier) || Check('('))  // Added Check('(')
+        if (Check(TokenType_Identifier) || Check('('))
             var->type = ParseType();
         
-        // Optional initializer
         if (Match('='))
         {
             var->init = ParseExpr();
         }
         
-        // Semicolon
         Expect(';', "Expected ';' after variable declaration");
         
         return var;
     }
 
-    // Parse statement
     std::unique_ptr<StmtNode> ParseStmt(void)
     {
-        // Return statement
+        uint32_t stmtLine = CurrentLine();
+
         if (Match("return"))
         {
             auto ret = std::make_unique<ReturnStmt>();
+            ret->line = stmtLine;
             if (!Match(';'))
             {
                 ret->value = ParseExpr();
@@ -789,27 +824,26 @@ public:
             return ret;
         }
 
-
-        // Break statement
         if (Match("break"))
         {
             auto breakStmt = std::make_unique<BreakStmt>();
+            breakStmt->line = stmtLine;
             Expect(';', "Expected ';' after 'break'");
             return breakStmt;
         }
 
-        // Continue statement
         if (Match("continue"))
         {
             auto continueStmt = std::make_unique<ContinueStmt>();
+            continueStmt->line = stmtLine;
             Expect(';', "Expected ';' after 'continue'");
             return continueStmt;
         }
 
-        // If statement
         if (Match("if"))
         {
             auto statement = std::make_unique<IfStmt>();
+            statement->line = stmtLine;
             m_parsingStatement = true;
             statement->condition = ParseExpr();
             m_parsingStatement = false;
@@ -819,10 +853,10 @@ public:
             return statement;
         }
         
-        // While loop
         if (Match("while"))
         {
             auto statement = std::make_unique<WhileStmt>();
+            statement->line = stmtLine;
             m_parsingStatement = true;
             statement->condition = ParseExpr();
             m_parsingStatement = false;
@@ -830,10 +864,10 @@ public:
             return statement;
         }
         
-        // For loop
         if (Match("for"))
         {
             auto statement = std::make_unique<ForStmt>();
+            statement->line = stmtLine;
             statement->init = ParseVarDecl();
             m_parsingStatement = true;
             statement->condition = ParseExpr();
@@ -845,32 +879,28 @@ public:
         }
 
         if (Match("match"))
-            return ParseMatchStmt();
+        {
+            auto stmt = ParseMatchStmt();
+            stmt->line = stmtLine;
+            return stmt;
+        }
         
-        // Block statement
         if (Check('{'))
         {
             return ParseBlock();
         }
         
-        // Try to distinguish variable declaration from expression
-        // Variable declarations have pattern: identifier ':'
-        // Expressions can start with identifiers too: identifier '=' or identifier '('
-        
         if (Check(TokenType_Identifier))
         {
-            // Peek by actually advancing and then deciding what to do
             std::string ident_name = m_current.value;
-            Advance(); // consume the identifier
+            uint32_t identLine = CurrentLine();
+            Advance();
             
             if (Check(':'))
             {
-                // It's a variable declaration!
-                // We already consumed the identifier, so we need to handle it here
-                // or rewind somehow. Let's just parse it inline:
-                
                 auto var = std::make_unique<VarDecl>();
                 var->name = ident_name;
+                var->line = identLine;
                 
                 Expect(':', "Expected ':'");
                 
@@ -888,23 +918,19 @@ public:
             }
             else
             {
-                // It's an expression statement
-                // We already consumed the identifier, so we need to build the expression
-                // starting from this identifier
-                
                 auto ident = std::make_unique<Identifier>();
                 ident->name = ident_name;
+                ident->line = identLine;
                 
-                // Now continue parsing the rest of the expression
-                // Handle postfix operations
                 std::unique_ptr<ExprNode> expr = std::move(ident);
                 
-                // Check for postfix operators like [], ., ()
                 while (true)
                 {
+                    uint32_t postfixLine = CurrentLine();
                     if (Match('['))
                     {
                         auto access = std::make_unique<ArrayAccess>();
+                        access->line = postfixLine;
                         access->array = std::move(expr);
                         access->index = ParseExpr();
                         Expect(']', "Expected ']'");
@@ -913,6 +939,7 @@ public:
                     else if (Match('.'))
                     {
                         auto member = std::make_unique<MemberAccess>();
+                        member->line = postfixLine;
                         member->object = std::move(expr);
                         Expect(TokenType_Identifier, "Expected member name");
                         member->member = m_last.value;
@@ -921,6 +948,7 @@ public:
                     else if (Match(TokenType_Arrow))
                     {
                         auto member = std::make_unique<PointerMemberAccess>();
+                        member->line = postfixLine;
                         member->object = std::move(expr);
                         Expect(TokenType_Identifier, "Expected member name");
                         member->member = m_last.value;
@@ -929,6 +957,7 @@ public:
                     else if (Match('('))
                     {
                         auto call = std::make_unique<CallExpr>();
+                        call->line = postfixLine;
                         call->callee = std::move(expr);
                         
                         if (!Check(')'))
@@ -947,11 +976,12 @@ public:
                     }
                 }
                 
-                // Now check for assignment
+                uint32_t assignLine = CurrentLine();
                 if (Match('=') || Match(TokenType_PlusEqual) || Match(TokenType_MinusEqual) ||
                     Match(TokenType_StarEqual) || Match(TokenType_SlashEqual) || Match(TokenType_PercentEqual))
                 {
                     auto binary = std::make_unique<BinaryExpr>();
+                    binary->line = assignLine;
                     binary->left = std::move(expr);
                     binary->op = m_last.type;
                     binary->right = ParseAssignment();
@@ -959,25 +989,27 @@ public:
                 }
                 
                 auto stmt = std::make_unique<ExprStmt>();
+                stmt->line = stmtLine;
                 stmt->expr = std::move(expr);
                 Expect(';', "Expected ';'");
                 return stmt;
             }
         }
         
-        // Other expression statements
         auto stmt = std::make_unique<ExprStmt>();
+        stmt->line = stmtLine;
         stmt->expr = ParseExpr();
         Expect(';', "Expected ';' after expression");
         return stmt;
     }
 
-    // Update ParseBlock to use ParseStmt
     std::unique_ptr<BlockStmt> ParseBlock(void)
     {
+        uint32_t blockLine = CurrentLine();
         Expect('{', "Expected '{'");
         
         auto block = std::make_unique<BlockStmt>();
+        block->line = blockLine;
         
         while (!Check('}') && !Check(TokenType_EOF))
         {
@@ -994,10 +1026,10 @@ public:
         
         Expect(TokenType_Identifier, "Expected enum name");
         enum_decl->name = m_last.value;
+        enum_decl->line = m_lexer.GetCurrentLine();
         
         Expect('{', "Expected '{'");
         
-        int next_value = 0;
         while (!Check('}'))
         {
             Expect(TokenType_Identifier, "Expected enum value name");
@@ -1020,6 +1052,7 @@ public:
     std::unique_ptr<MatchStmt> ParseMatchStmt(void)
     {
         auto match = std::make_unique<MatchStmt>();
+        match->line = CurrentLine();
         
         m_parsingStatement = true;
         match->value = ParseExpr();
@@ -1067,6 +1100,7 @@ public:
 
         Expect(TokenType_Identifier, "Expected struct name");
         struct_decl->name = m_last.value;
+        struct_decl->line = m_lexer.GetCurrentLine();
         
         if (Match('{'))
         {
@@ -1092,6 +1126,7 @@ public:
         Expect(TokenType_Identifier, "Expected proc name");
         std::unique_ptr<ProcDecl> proc = std::make_unique<ProcDecl>();
         proc->name = m_last.value;
+        proc->line = m_lexer.GetCurrentLine();
 
         if (Match('('))
         {
@@ -1128,6 +1163,8 @@ public:
     }
 
 private:
+
+    uint32_t CurrentLine() const { return m_lexer.GetCurrentLine(); }
 
     void Advance(void)
     {
