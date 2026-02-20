@@ -1,6 +1,6 @@
 Yet another language that tries to be the modern c equivelent
 
-```c
+```rust
 enum EntityType {
     Player,
     Enemy,
@@ -61,3 +61,4 @@ pub proc main() -> i32 {
     return 0;
 }
 ```
+
