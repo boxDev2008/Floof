@@ -1024,7 +1024,7 @@ private:
         if (elseBB)
         {
             m_builder.SetInsertPoint(elseBB);
-            m_currentScope++;
+            m_currentScope = ++m_scopeCount;
             GenerateBlock(stmt->else_branch.get(), returnType);
             if (!m_builder.GetInsertBlock()->getTerminator())
                 m_builder.CreateBr(mergeBB);
