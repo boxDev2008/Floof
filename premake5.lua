@@ -69,6 +69,7 @@ project "floof"
             "LLVMDebugInfoCodeView",
             "LLVMDebugInfoMSF",
             "LLVMDebugInfoDWARF",
+            "LLVMDebugInfoDWARFLowLevel",    -- DWARFExpression, UnwindLocation, CFIProgram extensions (split from LLVMDebugInfoDWARF in LLVM 19)
             "LLVMGlobalISel",
             "LLVMBinaryFormat",
             "LLVMRemarks",
@@ -83,6 +84,10 @@ project "floof"
             "LLVMCFGuard",
             "LLVMInstrumentation",  -- For ASan support
             "LLVMipo",              -- Interprocedural optimizations (may contain these symbols)
+            "LLVMTargetParser",     -- Triple, SubtargetFeatures, getDefaultTargetTriple (split from LLVMSupport in LLVM 17)
+            "LLVMIRPrinter",        -- PrintFunctionPass (split out in LLVM 17)
+            "LLVMCodeGenTypes",     -- LLT constructor/print (split out in LLVM 19)
+            "LLVMCGData",           -- CodeGenData, StableFunctionMap, OutlinedHashTree (new in LLVM 19)
             "version",
             "ntdll"  -- For RtlGetLastNtStatus
         }

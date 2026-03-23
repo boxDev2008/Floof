@@ -172,8 +172,8 @@ private:
 
         llvm::TargetOptions opt;
         return target->createTargetMachine(
-            targetTriple, "generic", "", opt, llvm::Reloc::PIC_,
-            llvm::CodeModel::Small, llvm::CodeGenOpt::Aggressive);
+            llvm::Triple(targetTriple), "generic", "", opt, llvm::Reloc::PIC_,
+            llvm::CodeModel::Small, llvm::CodeGenOptLevel::Aggressive);
     }
 
     std::string compileSingleModule(
@@ -187,7 +187,7 @@ private:
 
         std::unique_ptr<llvm::TargetMachine> targetMachine(
             baseTM.getTarget().createTargetMachine(
-                baseTM.getTargetTriple().str(),
+                baseTM.getTargetTriple(),
                 baseTM.getTargetCPU(),
                 baseTM.getTargetFeatureString(),
                 baseTM.Options,
@@ -205,7 +205,7 @@ private:
         );
         auto module = codeGen.GetModule();
 
-        module->setTargetTriple(targetMachine->getTargetTriple().str());
+        module->setTargetTriple(targetMachine->getTargetTriple());
         module->setDataLayout(targetMachine->createDataLayout());
 
         fs::path objectPath = projectDir / "obj" / (moduleName + ".o");
@@ -217,7 +217,7 @@ private:
 
         llvm::legacy::PassManager pass;
         if (targetMachine->addPassesToEmitFile(
-                pass, dest, nullptr, llvm::CGFT_ObjectFile))
+                pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
         {
             throw std::runtime_error("TargetMachine can't emit object file");
         }

@@ -7,10 +7,11 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/FileSystem.h>
-#include <llvm/Support/Host.h>
+#include <llvm/TargetParser/Host.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
 #include <llvm/MC/TargetRegistry.h>
+#include <llvm/IR/ConstantFold.h>
 #include <unordered_set>
 
 using namespace llvm;
@@ -383,7 +384,7 @@ private:
                 strGlobal,
                 indices
             );
-            return TypedValue(strPtr, TypeInfo(m_builder.getInt8PtrTy(), false, m_builder.getInt8Ty()));
+            return TypedValue(strPtr, TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false, m_builder.getInt8Ty()));
         }
 
         if (auto* ch = dynamic_cast<CharLiteral*>(node))
@@ -415,8 +416,9 @@ private:
                 Constant* constOperand = llvm::cast<Constant>(operand.value);
                 
                 Constant* result = operand.type.llvmType->isFloatingPointTy()
-                    ? ConstantExpr::getFNeg(constOperand)
-                    : ConstantExpr::getNeg(constOperand);
+                    ? llvm::ConstantFoldUnaryInstruction(llvm::Instruction::FNeg, constOperand)
+                    : llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Sub,
+                          llvm::Constant::getNullValue(constOperand->getType()), constOperand);
                 
                 TypedValue negated(result, operand.type);
                 
@@ -537,14 +539,14 @@ private:
             Constant* result = nullptr;
             switch (binary->op)
             {
-                case '+': result = ConstantExpr::getAdd(lhsConst, rhsConst); break;
-                case '-': result = ConstantExpr::getSub(lhsConst, rhsConst); break;
-                case '*': result = ConstantExpr::getMul(lhsConst, rhsConst); break;
-                case '|': result = ConstantExpr::getOr(lhsConst, rhsConst); break;
-                case '&': result = ConstantExpr::getAnd(lhsConst, rhsConst); break;
-                case '^': result = ConstantExpr::getXor(lhsConst, rhsConst); break;
-                case TokenType_LeftShift:  result = ConstantExpr::getShl(lhsConst, rhsConst); break;
-                case TokenType_RightShift: result = ConstantExpr::getLShr(lhsConst, rhsConst); break;
+                case '+': result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Add,  lhsConst, rhsConst); break;
+                case '-': result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Sub,  lhsConst, rhsConst); break;
+                case '*': result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Mul,  lhsConst, rhsConst); break;
+                case '|': result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Or,   lhsConst, rhsConst); break;
+                case '&': result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::And,  lhsConst, rhsConst); break;
+                case '^': result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Xor,  lhsConst, rhsConst); break;
+                case TokenType_LeftShift:  result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Shl,  lhsConst, rhsConst); break;
+                case TokenType_RightShift: result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::LShr, lhsConst, rhsConst); break;
                 default: Error("Unsupported binary operator in constant expression", binary->line);
             }
             return TypedValue(result, commonType);
@@ -568,7 +570,7 @@ private:
         {
             if (fromType.pointeeType == toType.pointeeType)
                 return value;
-            return ConstantExpr::getBitCast(value, toLLVMType);
+            return llvm::ConstantFoldCastInstruction(llvm::Instruction::BitCast, value, toLLVMType);
         }
         
         if (fromLLVMType->isIntegerTy() && toLLVMType->isIntegerTy())
@@ -579,12 +581,12 @@ private:
             if (fromBits < toBits)
             {
                 return (fromBits == 1 || fromType.isUnsigned)
-                    ? ConstantExpr::getZExt(value, toLLVMType)
-                    : ConstantExpr::getSExt(value, toLLVMType);
+                    ? llvm::ConstantFoldCastInstruction(llvm::Instruction::ZExt, value, toLLVMType)
+                    : llvm::ConstantFoldCastInstruction(llvm::Instruction::SExt, value, toLLVMType);
             }
             else if (fromBits > toBits)
             {
-                return ConstantExpr::getTrunc(value, toLLVMType);
+                return llvm::ConstantFoldCastInstruction(llvm::Instruction::Trunc, value, toLLVMType);
             }
             return value;
         }
@@ -595,31 +597,31 @@ private:
             unsigned toBits = toLLVMType->getPrimitiveSizeInBits();
             
             if (fromBits < toBits)
-                return ConstantExpr::getFPExtend(value, toLLVMType);
+                return llvm::ConstantFoldCastInstruction(llvm::Instruction::FPExt, value, toLLVMType);
             else if (fromBits > toBits)
-                return ConstantExpr::getFPTrunc(value, toLLVMType);
+                return llvm::ConstantFoldCastInstruction(llvm::Instruction::FPTrunc, value, toLLVMType);
             return value;
         }
         
         if (fromLLVMType->isIntegerTy() && toLLVMType->isFloatingPointTy())
         {
             return (fromLLVMType->isIntegerTy(1) || fromType.isUnsigned)
-                ? ConstantExpr::getUIToFP(value, toLLVMType)
-                : ConstantExpr::getSIToFP(value, toLLVMType);
+                ? llvm::ConstantFoldCastInstruction(llvm::Instruction::UIToFP, value, toLLVMType)
+                : llvm::ConstantFoldCastInstruction(llvm::Instruction::SIToFP, value, toLLVMType);
         }
         
         if (fromLLVMType->isFloatingPointTy() && toLLVMType->isIntegerTy())
         {
             return toType.isUnsigned
-                ? ConstantExpr::getFPToUI(value, toLLVMType)
-                : ConstantExpr::getFPToSI(value, toLLVMType);
+                ? llvm::ConstantFoldCastInstruction(llvm::Instruction::FPToUI, value, toLLVMType)
+                : llvm::ConstantFoldCastInstruction(llvm::Instruction::FPToSI, value, toLLVMType);
         }
 
         if (fromLLVMType->isIntegerTy() && toLLVMType->isPointerTy())
-            return ConstantExpr::getIntToPtr(value, toLLVMType);
+            return llvm::ConstantFoldCastInstruction(llvm::Instruction::IntToPtr, value, toLLVMType);
 
         if (fromLLVMType->isPointerTy() && toLLVMType->isIntegerTy())
-            return ConstantExpr::getPtrToInt(value, toLLVMType);
+            return llvm::ConstantFoldCastInstruction(llvm::Instruction::PtrToInt, value, toLLVMType);
         
         Error("Cannot cast between incompatible types in constant expression", line);
     }
@@ -629,14 +631,14 @@ private:
         auto* printfFunc = Function::Create(
             FunctionType::get(
                 m_builder.getInt32Ty(),
-                {m_builder.getInt8PtrTy()},
+                {llvm::PointerType::getUnqual(m_builder.getContext())},
                 true
             ),
             Function::ExternalLinkage, "printf", m_module.get()
         );
         m_functions["printf"] = FunctionInfo(
             printfFunc,
-            {TypeInfo(m_builder.getInt8PtrTy(), false)},
+            {TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false)},
             TypeInfo(m_builder.getInt32Ty(), false),
             true
         );
@@ -1447,8 +1449,8 @@ private:
 
     TypedValue EvaluateStringLiteral(::StringLiteral* lit)
     {
-        auto* str = m_builder.CreateGlobalStringPtr(lit->value, ".str");
-        return TypedValue(str, TypeInfo(m_builder.getInt8PtrTy(), false, m_builder.getInt8Ty()));
+        auto* str = m_builder.CreateGlobalString(lit->value, ".str");
+        return TypedValue(str, TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false, m_builder.getInt8Ty()));
     }
 
     TypedValue EvaluateCast(CastExpr *cast)
