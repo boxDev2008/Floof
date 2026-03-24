@@ -791,6 +791,7 @@ private:
                 if (s->else_branch)
                 {
                     m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                    m_currentScope = m_scopeCount;
                     GenerateHostingAllocs(s->else_branch.get());
                 }
                 m_currentScope = scopeId;
@@ -804,9 +805,8 @@ private:
             }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
             {
-                uint32_t forScopeId = ++m_scopeCount;
-                m_scopes.push_back(Scope{ (int32_t)scopeId, forScopeId });
-                m_currentScope = forScopeId;
+                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                m_currentScope = m_scopeCount;
                 if (s->init)
                     GenerateVarDeclHosingAlloc(s->init.get());
                 GenerateHostingAllocs(s->body.get());
