@@ -244,7 +244,7 @@ private:
             case 't': value = "\t"; break;
             case 'r': value = "\r"; break;
             case '\\': value = "\\"; break;
-            case '0': value = "\0"; break;
+            case '0': value =  std::string(1, '\0');; break;
             case '\'': value = "'"; break;
             case '"': value = "\""; break;
             default: value = std::string(1, current); break;

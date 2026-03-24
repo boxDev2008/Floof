@@ -345,7 +345,7 @@ public:
                         }
                         else
                         {
-                            throw std::runtime_error("Expected ':' after parameter name in function type");
+                            throw std::runtime_error("Expected ':' after parameter name in function type on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
                         }
                     }
                     else

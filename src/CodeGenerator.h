@@ -786,18 +786,19 @@ private:
             else if (auto* s = dynamic_cast<IfStmt*>(stmt.get()))
             {
                 m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                m_currentScope = m_scopeCount;
                 GenerateHostingAllocs(s->then_branch.get());
-                m_currentScope = scopeId;
                 if (s->else_branch)
                 {
                     m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
                     GenerateHostingAllocs(s->else_branch.get());
-                    m_currentScope = scopeId;
                 }
+                m_currentScope = scopeId;
             }
             else if (auto* s = dynamic_cast<WhileStmt*>(stmt.get()))
             {
                 m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                m_currentScope = m_scopeCount;
                 GenerateHostingAllocs(s->then_branch.get());
                 m_currentScope = scopeId;
             }
@@ -816,6 +817,7 @@ private:
                 for (auto &c : s->cases)
                 {
                     m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                    m_currentScope = m_scopeCount;
                     GenerateHostingAllocs(c->body.get());
                 }
                 m_currentScope = scopeId;
