@@ -32,8 +32,6 @@ struct Token
     int line;
 };
 
-#include <iostream>
-
 class Lexer
 {
 private:
