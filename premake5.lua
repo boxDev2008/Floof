@@ -95,11 +95,9 @@ project "floof"
     filter "system:linux"
         systemversion "latest"
 
-        -- LLVM on Linux is typically a single shared library: libLLVM.so
         links {
             "LLVM",
 
-            -- Required system libraries LLVM depends on
             "pthread",
             "dl",
             "z",
@@ -107,19 +105,16 @@ project "floof"
             "tinfo"
         }
 
-        -- Ensure the runtime loader can find libLLVM.so
         linkoptions {
             "-Wl,-rpath," .. llvm_libdir
         }
 
-        -- LLVM expects these on Linux
         defines {
             "__STDC_CONSTANT_MACROS",
             "__STDC_FORMAT_MACROS",
             "__STDC_LIMIT_MACROS"
         }
 
-        -- Clang/GCC warnings LLVM headers expect
         buildoptions {
             "-fPIC"
         }
