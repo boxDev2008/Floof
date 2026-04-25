@@ -169,6 +169,7 @@ struct EnumDecl : ASTNode
 {
     std::string name;
     std::vector<EnumValue> values;
+    std::unique_ptr<TypeNode> base_type;
     bool is_pub = false;
 };
 
@@ -1026,7 +1027,10 @@ public:
         Expect(TokenType_Identifier, "Expected enum name");
         enum_decl->name = m_last.value;
         enum_decl->line = m_lexer.GetCurrentLine();
-        
+
+        if (Match(':'))
+            enum_decl->base_type = ParseType();
+
         Expect('{', "Expected '{'");
         
         while (!Check('}'))

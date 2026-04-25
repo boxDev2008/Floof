@@ -76,6 +76,7 @@ class CodeGenerator
     struct EnumInfo
     {
         std::string name;
+        TypeInfo baseType;
         std::unordered_map<std::string, int> values;
     };
 
@@ -240,19 +241,22 @@ private:
         EnumInfo info;
         info.name = decl->name;
 
-        int next_value = 0;
+        TypeInfo baseType = decl->base_type
+            ? ResolveType(decl->base_type.get())
+            : TypeInfo(m_builder.getInt32Ty(), false);
+        info.baseType = baseType;
+
+        int64_t next_value = 0;
         for (const auto& val : decl->values)
         {
-            int resolved;
+            int64_t resolved;
             if (val.expr)
             {
                 TypedValue result = EvaluateConstantExpr(val.expr.get());
-                
                 auto* constInt = llvm::dyn_cast<llvm::ConstantInt>(result.value);
                 if (!constInt)
                     Error("Enum value '" + val.name + "' must be a constant integer expression", val.expr->line);
-                
-                resolved = (int)constInt->getSExtValue();
+                resolved = (int64_t)constInt->getSExtValue();
                 next_value = resolved + 1;
             }
             else
@@ -513,8 +517,9 @@ private:
             if (valueIt == it->second.values.end())
                 Error("Unknown enum value: " + enumAccess->value_name, enumAccess->line);
             
-            auto* val = m_builder.getInt32(valueIt->second);
-            return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
+            const TypeInfo& baseType = it->second.baseType;
+            auto* val = llvm::ConstantInt::get(baseType.llvmType, valueIt->second, !baseType.isUnsigned);
+            return TypedValue(val, baseType);
         }
 
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
@@ -1328,8 +1333,9 @@ private:
             if (valueIt == it->second.values.end())
                 Error("Unknown enum value: " + enumAccess->value_name, enumAccess->line);
             
-            auto* val = m_builder.getInt32(valueIt->second);
-            return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
+            const TypeInfo& baseType = it->second.baseType;
+            auto* val = llvm::ConstantInt::get(baseType.llvmType, valueIt->second, !baseType.isUnsigned);
+            return TypedValue(val, baseType);
         }
 
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
@@ -2164,8 +2170,8 @@ private:
             auto enumIt = m_enums.find(node->name);
             if (enumIt != m_enums.end())
             {
-                baseType = m_builder.getInt32Ty();
-                isUnsigned = false;
+                baseType = enumIt->second.baseType.llvmType;
+                isUnsigned = enumIt->second.baseType.isUnsigned;
             }
         }
 
