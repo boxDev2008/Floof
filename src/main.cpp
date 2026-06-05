@@ -10,6 +10,8 @@
 #include <thread>
 #include <mutex>
 #include <atomic>
+#include <chrono>
+#include <iomanip>
 
 #include <toml++/toml.hpp>
 
@@ -21,50 +23,79 @@
 #endif
 
 namespace fs = std::filesystem;
+using Clock = std::chrono::steady_clock;
+using Seconds = std::chrono::duration<double>;
 
-void EnableConsoleFeatures(void)
+static void EnableConsoleFeatures(void)
 {
 #ifdef _WIN32
     HANDLE hOut = GetStdHandle(STD_OUTPUT_HANDLE);
     DWORD dwMode = 0;
     GetConsoleMode(hOut, &dwMode);
-    dwMode |= ENABLE_VIRTUAL_TERMINAL_PROCESSING;
-    SetConsoleMode(hOut, dwMode);
-
+    SetConsoleMode(hOut, dwMode | ENABLE_VIRTUAL_TERMINAL_PROCESSING);
     SetConsoleOutputCP(CP_UTF8);
-
     std::cout.imbue(std::locale("en_US.UTF-8"));
     std::cerr.imbue(std::locale("en_US.UTF-8"));
 #endif
 }
 
-namespace Color
+namespace C
 {
-    constexpr const char *RESET = "\033[0m";
-    constexpr const char *BOLD = "\033[1m";
-    constexpr const char *DIM = "\033[2m";
-
-    constexpr const char *RED = "\033[31m";
-    constexpr const char *GREEN = "\033[32m";
-    constexpr const char *YELLOW = "\033[33m";
-    constexpr const char *BLUE = "\033[34m";
-    constexpr const char *MAGENTA = "\033[35m";
-    constexpr const char *CYAN = "\033[36m";
-    constexpr const char *WHITE = "\033[37m";
-
-    constexpr const char *BRIGHT_GREEN = "\033[92m";
-    constexpr const char *BRIGHT_CYAN = "\033[96m";
-    constexpr const char *BRIGHT_YELLOW = "\033[93m";
+    constexpr const char* RESET   = "\033[0m";
+    constexpr const char* BOLD    = "\033[1m";
+    constexpr const char* DIM     = "\033[2m";
+    constexpr const char* RED     = "\033[31m";
+    constexpr const char* CYAN    = "\033[36m";
+    constexpr const char* BGREEN  = "\033[92m";
+    constexpr const char* BCYAN   = "\033[96m";
+    constexpr const char* BYELLOW = "\033[93m";
 }
 
-namespace
+static std::string fmtSeconds(double s)
 {
-    constexpr const char *MAIN_TEMPLATE = R"(pub proc main -> i32 {
+    std::ostringstream o;
+    o << std::fixed << std::setprecision(6) << s << "s";
+    return o.str();
+}
+
+static void step(const std::string& msg)
+{
+    std::cout << C::DIM << "  └─ " << C::RESET << msg << "\n";
+}
+
+struct BuildConfig
+{
+    std::string projectName;
+    bool isDebug = false;
+    std::vector<std::string> libraries;
+    std::vector<std::string> libraryPaths;
+
+    static BuildConfig load(const fs::path& path)
+    {
+        BuildConfig cfg;
+        auto tbl = toml::parse_file(path.string());
+
+        cfg.projectName = tbl["project"]["name"].as_string()->get();
+        cfg.isDebug     = tbl["build"]["debug"].as_boolean()->get();
+
+        if (auto libs = tbl["linker"]["libraries"].as_array())
+            for (const auto& v : *libs)
+                cfg.libraries.push_back(v.as_string()->get());
+
+        if (auto paths = tbl["linker"]["library_paths"].as_array())
+            for (const auto& v : *paths)
+                cfg.libraryPaths.push_back(v.as_string()->get());
+
+        return cfg;
+    }
+};
+
+constexpr const char* MAIN_FLOOF = R"(pub proc main -> i32 {
     printf("Hello Floof!\n");
     return 0;
 })";
 
-    constexpr const char *BUILD_TOML_TEMPLATE = R"([project]
+constexpr const char* BUILD_TOML = R"([project]
 name = "{}"
 version = "1.0.0"
 
@@ -74,439 +105,286 @@ debug = false
 [linker]
 libraries = []
 library_paths = [])";
+
+static void initLLVM(void)
+{
+    llvm::InitializeAllTargetInfos();
+    llvm::InitializeAllTargets();
+    llvm::InitializeAllTargetMCs();
+    llvm::InitializeAllAsmParsers();
+    llvm::InitializeAllAsmPrinters();
 }
 
-class ProjectBuilder;
-struct BuildConfig;
-
-struct BuildConfig
+static llvm::TargetMachine* makeTargetMachine(void)
 {
-    std::string projectName;
-    bool isDebug;
-    std::vector<std::string> libraries;
-    std::vector<std::string> libraryPaths;
+    std::string triple = llvm::sys::getDefaultTargetTriple();
+    std::string error;
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, error);
+    if (!target)
+        throw std::runtime_error("Target lookup failed: " + error);
 
-    static BuildConfig fromToml(const fs::path &configPath)
-    {
-        BuildConfig config;
-        toml::table tbl = toml::parse_file(configPath.string());
+    llvm::TargetOptions opt;
+    return target->createTargetMachine(
+        llvm::Triple(triple), "generic", "", opt,
+        llvm::Reloc::PIC_, llvm::CodeModel::Small, llvm::CodeGenOptLevel::Aggressive);
+}
 
-        config.projectName = tbl["project"]["name"].as_string()->get();
-        config.isDebug = tbl["build"]["debug"].as_boolean()->get();
-
-        if (auto libs = tbl["linker"]["libraries"].as_array())
-        {
-            for (const auto &lib : *libs)
-            {
-                config.libraries.push_back(lib.as_string()->get());
-            }
-        }
-
-        if (auto paths = tbl["linker"]["library_paths"].as_array())
-        {
-            for (const auto &path : *paths)
-            {
-                config.libraryPaths.push_back(path.as_string()->get());
-            }
-        }
-
-        return config;
-    }
-};
-
-class ProjectBuilder
+static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const fs::path& srcDir)
 {
-private:
-    fs::path projectDir;
-    LLVMContext context;
+    std::map<std::string, std::unique_ptr<ModuleAST>> modules;
 
-    void initializeLLVM()
+    for (const auto& entry : fs::recursive_directory_iterator(srcDir))
     {
-        llvm::InitializeAllTargetInfos();
-        llvm::InitializeAllTargets();
-        llvm::InitializeAllTargetMCs();
-        llvm::InitializeAllAsmParsers();
-        llvm::InitializeAllAsmPrinters();
+        if (!entry.is_regular_file() || entry.path().extension() != ".floof")
+            continue;
+
+        std::ifstream file(entry.path());
+        std::stringstream buf;
+        buf << file.rdbuf();
+
+        auto rel = fs::relative(entry.path(), srcDir).replace_extension("").string();
+        std::replace(rel.begin(), rel.end(), '/', '.');
+        std::replace(rel.begin(), rel.end(), '\\', '.');
+
+        Lexer lexer(buf.str());
+        Parser parser(lexer, rel);
+        modules.emplace(rel, parser.ParseModule());
     }
 
-    std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles()
-    {
-        std::map<std::string, std::unique_ptr<ModuleAST>> moduleMap;
-        
-        for (const auto &entry : fs::recursive_directory_iterator(projectDir / "src"))
-        {
-            if (!entry.is_regular_file() || entry.path().extension() != ".floof")
-                continue;
-                
-            fs::path path = entry.path();
-            std::ifstream file(path);
-            std::stringstream buffer;
-            buffer << file.rdbuf();
+    return modules;
+}
 
-            fs::path relativePath = fs::relative(path, projectDir / "src");
-            std::string moduleName = relativePath.replace_extension("").string();
-            
-            std::replace(moduleName.begin(), moduleName.end(), '/', '.');
-            std::replace(moduleName.begin(), moduleName.end(), '\\', '.');
-            
-            Lexer lexer(buffer.str());
-            Parser parser(lexer, moduleName);
-            auto module = parser.ParseModule();
-            
-            moduleMap.insert({moduleName, std::move(module)});
+static std::string compileModule(
+    const std::string& name,
+    const ModuleAST& ast,
+    const std::map<std::string, std::unique_ptr<ModuleAST>>& allModules,
+    const fs::path& projectDir,
+    const llvm::TargetMachine& baseTM)
+{
+    llvm::LLVMContext ctx;
+
+    std::unique_ptr<llvm::TargetMachine> tm(
+        baseTM.getTarget().createTargetMachine(
+            baseTM.getTargetTriple(), baseTM.getTargetCPU(),
+            baseTM.getTargetFeatureString(), baseTM.Options,
+            baseTM.getRelocationModel(), baseTM.getCodeModel(), baseTM.getOptLevel()));
+
+    CodeGenerator cg(ctx,
+        const_cast<ModuleAST&>(ast), name,
+        const_cast<std::map<std::string, std::unique_ptr<ModuleAST>>&>(allModules));
+
+    auto mod = cg.GetModule();
+    mod->setTargetTriple(tm->getTargetTriple());
+    mod->setDataLayout(tm->createDataLayout());
+
+    fs::path obj = projectDir / "obj" / (name + ".o");
+    std::error_code ec;
+    llvm::raw_fd_ostream dest(obj.string(), ec, llvm::sys::fs::OF_None);
+    if (ec)
+        throw std::runtime_error("Could not open file: " + ec.message());
+
+    llvm::legacy::PassManager pm;
+    if (tm->addPassesToEmitFile(pm, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
+        throw std::runtime_error("TargetMachine can't emit object file");
+
+    pm.run(*mod);
+    dest.flush();
+
+    return "\"" + obj.string() + "\" ";
+}
+
+static std::string compileAll(
+    std::map<std::string, std::unique_ptr<ModuleAST>>& modules,
+    llvm::TargetMachine* baseTM,
+    const fs::path& projectDir)
+{
+    const size_t threadCount = std::min<size_t>(std::thread::hardware_concurrency(), modules.size());
+
+    std::vector<std::pair<const std::string*, const ModuleAST*>> tasks;
+    for (const auto& [name, ast] : modules)
+        tasks.emplace_back(&name, ast.get());
+
+    std::vector<std::string> results(tasks.size());
+    std::atomic<size_t> next{0};
+    std::mutex printMx, errorMx;
+    std::exception_ptr firstErr;
+
+    auto worker = [&]()
+    {
+        while (true)
+        {
+            size_t i = next.fetch_add(1, std::memory_order_relaxed);
+            if (i >= tasks.size()) break;
+
+            auto t0 = Clock::now();
+            try { results[i] = compileModule(*tasks[i].first, *tasks[i].second, modules, projectDir, *baseTM); }
+            catch (...) { std::lock_guard lk(errorMx); if (!firstErr) firstErr = std::current_exception(); }
+            double elapsed = Seconds(Clock::now() - t0).count();
+
+            std::lock_guard lk(printMx);
+            step("Compiled " + std::string(C::CYAN) + *tasks[i].first + ".floof" +
+                 C::RESET + C::DIM + " (" + fmtSeconds(elapsed) + ")" + C::RESET);
         }
-        
-        return moduleMap;
-    }
+    };
 
-    llvm::TargetMachine *createTargetMachine()
-    {
-        std::string targetTriple = llvm::sys::getDefaultTargetTriple();
-        std::string error;
+    auto t0 = Clock::now();
+    std::vector<std::thread> threads;
+    for (size_t i = 0; i < threadCount; ++i)
+        threads.emplace_back(worker);
+    for (auto& t : threads) t.join();
+    double elapsed = Seconds(Clock::now() - t0).count();
 
-        const llvm::Target *target = llvm::TargetRegistry::lookupTarget(targetTriple, error);
-        if (!target)
-        {
-            throw std::runtime_error("Target lookup failed: " + error);
-        }
+    if (firstErr) std::rethrow_exception(firstErr);
 
-        llvm::TargetOptions opt;
-        return target->createTargetMachine(
-            llvm::Triple(targetTriple), "generic", "", opt, llvm::Reloc::PIC_,
-            llvm::CodeModel::Small, llvm::CodeGenOptLevel::Aggressive);
-    }
+    step(std::string("Compiled ") + C::BGREEN + std::to_string(tasks.size()) + C::RESET +
+         " module(s) across " + C::BYELLOW + std::to_string(threadCount) + C::RESET +
+         " thread(s)" + C::DIM + " (" + fmtSeconds(elapsed) + ")" + C::RESET);
 
-    std::string compileSingleModule(
-        const std::string& moduleName,
-        const ModuleAST& moduleAST,
-        const std::map<std::string, std::unique_ptr<ModuleAST>>& moduleMap,
-        const fs::path& projectDir,
-        const llvm::TargetMachine& baseTM)
-    {
-        llvm::LLVMContext localContext;
+    std::string objectFiles;
+    for (const auto& r : results) objectFiles += r;
+    return objectFiles;
+}
 
-        std::unique_ptr<llvm::TargetMachine> targetMachine(
-            baseTM.getTarget().createTargetMachine(
-                baseTM.getTargetTriple(),
-                baseTM.getTargetCPU(),
-                baseTM.getTargetFeatureString(),
-                baseTM.Options,
-                baseTM.getRelocationModel(),
-                baseTM.getCodeModel(),
-                baseTM.getOptLevel()
-            )
-        );
-
-        CodeGenerator codeGen(
-            localContext,
-            const_cast<ModuleAST&>(moduleAST),
-            moduleName,
-            const_cast<std::map<std::string, std::unique_ptr<ModuleAST>>&>(moduleMap)
-        );
-        auto module = codeGen.GetModule();
-
-        module->setTargetTriple(targetMachine->getTargetTriple());
-        module->setDataLayout(targetMachine->createDataLayout());
-
-        fs::path objectPath = projectDir / "obj" / (moduleName + ".o");
-
-        std::error_code ec;
-        llvm::raw_fd_ostream dest(objectPath.string(), ec, llvm::sys::fs::OF_None);
-        if (ec)
-            throw std::runtime_error("Could not open file: " + ec.message());
-
-        llvm::legacy::PassManager pass;
-        if (targetMachine->addPassesToEmitFile(
-                pass, dest, nullptr, llvm::CodeGenFileType::ObjectFile))
-        {
-            throw std::runtime_error("TargetMachine can't emit object file");
-        }
-
-        pass.run(*module);
-        dest.flush();
-
-        return "\"" + objectPath.string() + "\" ";
-    }
-
-    std::string compileModulesToObjects(
-        std::map<std::string, std::unique_ptr<ModuleAST>>& moduleMap,
-        llvm::TargetMachine* baseTM)
-    {
-        const size_t hardwareMax = std::thread::hardware_concurrency();
-        const int requestedThreads = (int)hardwareMax;
-
-        const size_t threadCount = (size_t)requestedThreads < hardwareMax
-            ? (size_t)requestedThreads
-            : hardwareMax;
-        const size_t finalThreadCount = threadCount < moduleMap.size()
-            ? threadCount
-            : moduleMap.size();
-
-        std::vector<std::pair<const std::string*, const ModuleAST*>> tasks;
-        tasks.reserve(moduleMap.size());
-        for (const auto& [name, ast] : moduleMap)
-        {
-            std::cout << Color::DIM << "  └─ " << Color::RESET
-                    << "Compiling " << Color::CYAN << name << ".floof"
-                    << Color::RESET << "...\n";
-            tasks.emplace_back(&name, ast.get());
-        }
-
-        std::vector<std::string> results(tasks.size());
-        std::atomic<size_t> nextTask{0};
-        std::mutex errorMutex;
-        std::exception_ptr firstError = nullptr;
-        
-        auto worker = [&]()
-        {
-            while (true)
-            {
-                size_t i = nextTask.fetch_add(1, std::memory_order_relaxed);
-                if (i >= tasks.size()) break;
-
-                try
-                {
-                    results[i] = compileSingleModule(
-                        *tasks[i].first,
-                        *tasks[i].second,
-                        moduleMap,
-                        projectDir,
-                        *baseTM
-                    );
-                }
-                catch (...)
-                {
-                    std::lock_guard<std::mutex> lock(errorMutex);
-                    if (!firstError)
-                        firstError = std::current_exception();
-                }
-            }
-        };
-
-        std::vector<std::thread> threads;
-        threads.reserve(finalThreadCount);
-        for (size_t i = 0; i < finalThreadCount; ++i)
-            threads.emplace_back(worker);
-
-        for (auto& t : threads)
-            t.join();
-
-        if (firstError)
-            std::rethrow_exception(firstError);
-
-        std::string objectFiles;
-        for (const auto& r : results)
-            objectFiles += r;
-
-        std::cout << Color::DIM << "  └─ " << Color::RESET
-                << "Compiled " << Color::BRIGHT_GREEN
-                << tasks.size() << Color::RESET << " module(s) across "
-                << Color::BRIGHT_YELLOW << finalThreadCount << Color::RESET << " thread(s)\n";
-
-        return objectFiles;
-    }
-
-    void linkObjects(const std::string &objectFiles, const BuildConfig &config)
-    {
-        std::cout << Color::DIM << "  └─ " << Color::RESET << "Linking...\n";
-        std::string executableName = config.projectName;
+static void link(const std::string& objectFiles, const BuildConfig& cfg, const fs::path& projectDir)
+{
+    std::string exe = cfg.projectName;
 #ifdef _WIN32
-        executableName += ".exe";
+    exe += ".exe";
 #endif
+    std::string cmd = "clang -o " + (projectDir / "build" / exe).string() + " " + objectFiles;
+    if (cfg.isDebug) cmd += " -g -O0";
+    for (const auto& l : cfg.libraries)    cmd += " -l" + l;
+    for (const auto& p : cfg.libraryPaths) cmd += " -L" + p;
 
-        std::string outputPath = (projectDir / "build" / executableName).string();
-        std::string command = "clang -o " + outputPath + " " + objectFiles;
+    std::cout << C::DIM << "  └─ " << C::RESET << "Linking...";
+    auto t0 = Clock::now();
+    int rc = system(cmd.c_str());
+    double elapsed = Seconds(Clock::now() - t0).count();
 
-        if (config.isDebug)
-            command += " -g -O0";
+    if (rc != 0)
+        throw std::runtime_error("Linking failed with code: " + std::to_string(rc));
 
-        for (const auto &lib : config.libraries)
-            command += " -l" + lib;
+    std::cout << C::DIM << " (" << fmtSeconds(elapsed) << ")" << C::RESET << "\n";
+}
 
-        for (const auto &path : config.libraryPaths)
-            command += " -L" + path;
+static void cmdNew(const fs::path& dir)
+{
+    std::cout << C::BCYAN << "Creating new Floof project..." << C::RESET << "\n\n";
 
-        int result = system(command.c_str());
-        if (result != 0)
-            throw std::runtime_error("Linking failed with code: " + std::to_string(result));
-    }
+    fs::create_directory(dir);
+    fs::create_directory(dir / "src");
+    step("Created directory structure");
 
-public:
-    ProjectBuilder()
-    {
-        initializeLLVM();
-    }
+    std::ofstream(dir / "src/main.floof") << MAIN_FLOOF;
+    step("Generated src/main.floof");
 
-    void createNewProject(const fs::path &path)
-    {
-        projectDir = path;
+    std::string toml = BUILD_TOML;
+    toml.replace(toml.find("{}"), 2, dir.filename().string());
+    std::ofstream(dir / "build.toml") << toml;
+    step("Generated build.toml");
 
-        std::cout << Color::BRIGHT_CYAN << "Creating new Floof project..." << Color::RESET << "\n\n";
+    std::cout << "\n" << C::BGREEN << "✓ " << C::BOLD
+              << "Project '" << dir.filename().string() << "' created successfully!"
+              << C::RESET << "\n";
+}
 
-        fs::create_directory(projectDir);
-        fs::create_directory(projectDir / "src");
+static void cmdBuild(const fs::path& dir)
+{
+    std::cout << C::BCYAN << "Building " << C::BOLD
+              << dir.filename().string() << C::RESET << "...\n\n";
 
-        std::cout << Color::DIM << "  └─ " << Color::RESET << "Created directory structure\n";
+    auto t0 = Clock::now();
 
-        // Create main.floof
-        std::ofstream mainFile(projectDir / "src/main.floof");
-        mainFile << MAIN_TEMPLATE;
-        mainFile.close();
+    fs::create_directories(dir / "obj");
+    fs::create_directories(dir / "build");
 
-        std::cout << Color::DIM << "  └─ " << Color::RESET << "Generated src/main.floof\n";
+    auto modules = parseSourceFiles(dir / "src");
+    auto tm = std::unique_ptr<llvm::TargetMachine>(makeTargetMachine());
+    auto objectFiles = compileAll(modules, tm.get(), dir);
 
-        // Create build.toml
-        std::string tomlContent = BUILD_TOML_TEMPLATE;
-        size_t pos = tomlContent.find("{}");
-        if (pos != std::string::npos)
-        {
-            tomlContent.replace(pos, 2, projectDir.filename().string());
-        }
+    auto cfg = BuildConfig::load(dir / "build.toml");
+    link(objectFiles, cfg, dir);
 
-        std::ofstream configFile(projectDir / "build.toml");
-        configFile << tomlContent;
-        configFile.close();
+    double total = Seconds(Clock::now() - t0).count();
+    std::cout << "\n" << C::BGREEN << "✓ " << C::BOLD << "Build completed successfully! " << C::DIM << '(' << fmtSeconds(total) << ")\n\n" << C::RESET;
+}
 
-        std::cout << Color::DIM << "  └─ " << Color::RESET << "Generated build.toml\n\n";
-        std::cout << Color::BRIGHT_GREEN << "✓ " << Color::BOLD << "Project '"
-                  << projectDir.filename().string() << "' created successfully!"
-                  << Color::RESET << '\n';
-    }
+static void cmdRun(const fs::path& dir)
+{
+    auto cfg = BuildConfig::load(dir / "build.toml");
 
-    void buildProject(const fs::path &path)
-    {
-        projectDir = path;
+    std::cout << C::BCYAN << "Running " << C::BOLD << cfg.projectName << C::RESET << "...\n"
+              << C::DIM << "─────────────────────────────────────" << C::RESET << "\n\n";
 
-        std::cout << Color::BRIGHT_CYAN << "Building " << Color::BOLD
-                  << projectDir.filename().string() << Color::RESET << "...\n\n";
-
-        fs::create_directories(projectDir / "obj");
-        fs::create_directories(projectDir / "build");
-
-        auto moduleMap = parseSourceFiles();
-        auto targetMachine = std::unique_ptr<llvm::TargetMachine>(createTargetMachine());
-
-        std::string objectFiles = compileModulesToObjects(moduleMap, targetMachine.get());
-
-        BuildConfig config = BuildConfig::fromToml(projectDir / "build.toml");
-        linkObjects(objectFiles, config);
-
-        std::cout << "\n"
-                  << Color::BRIGHT_GREEN << "✓ " << Color::BOLD
-                  << "Build completed successfully!" << Color::RESET << '\n';
-    }
-
-    void runProject(const fs::path &path)
-    {
-        projectDir = path;
-
-        BuildConfig config = BuildConfig::fromToml(projectDir / "build.toml");
-
-        std::cout << Color::BRIGHT_CYAN << "Running " << Color::BOLD
-                  << config.projectName << Color::RESET << "...\n";
-        std::cout << Color::DIM << "─────────────────────────────────────"
-                  << Color::RESET << "\n\n";
-
-        std::string command = "cd " + (projectDir / "build").string() +
+    std::string cmd = "cd " + (dir / "build").string() +
 #ifdef _WIN32
-    " && .\\" + config.projectName;
+        " && .\\" + cfg.projectName;
 #else
-    " && ./" + config.projectName;
+        " && ./" + cfg.projectName;
 #endif
 
-    int status = system(command.c_str());
-    
+    int status = system(cmd.c_str());
     int exitCode;
-    #ifdef _WIN32
-        exitCode = status;
-    #else
-        if (WIFEXITED(status))
-            exitCode = WEXITSTATUS(status);
-        else if (WIFSIGNALED(status))
-            exitCode = 128 + WTERMSIG(status);
-        else
-            exitCode = status;
-    #endif
+#ifdef _WIN32
+    exitCode = status;
+#else
+    if      (WIFEXITED(status))   exitCode = WEXITSTATUS(status);
+    else if (WIFSIGNALED(status)) exitCode = 128 + WTERMSIG(status);
+    else                          exitCode = status;
+#endif
 
-        std::cout << "\n"
-                  << Color::DIM << "─────────────────────────────────────"
-                  << Color::RESET << "\n";
+    std::cout << "\n" << C::DIM << "─────────────────────────────────────" << C::RESET << "\n";
+    std::cout << "Finished with exit code "
+              << (exitCode == 0 ? C::BGREEN : C::RED) << exitCode << C::RESET << "\n";
+}
 
-        if (exitCode == 0)
-        {
-            std::cout << "Finished with exit code " << Color::BRIGHT_GREEN
-                      << exitCode << Color::RESET << '\n';
-        }
-        else
-        {
-            std::cout << "Finished with exit code " << Color::RED
-                      << exitCode << Color::RESET << '\n';
-        }
-    }
-};
-
-int main(int argc, char **argv)
+int main(int argc, char** argv)
 {
     try
     {
         EnableConsoleFeatures();
+
         if (argc < 3)
         {
-            std::cerr << Color::RED << "✗ Error: " << Color::RESET
-                      << "Missing arguments\n\n";
-            std::cerr << Color::BOLD << "Usage: " << Color::RESET
-                      << "floof <command> <project_path>\n\n";
-            std::cerr << Color::BOLD << "Commands:\n"
-                      << Color::RESET;
-            std::cerr << Color::CYAN << "  new" << Color::RESET
-                      << "       - Create a new Floof project\n";
-            std::cerr << Color::CYAN << "  build" << Color::RESET
-                      << "     - Build the project\n";
-            std::cerr << Color::CYAN << "  run" << Color::RESET
-                      << "       - Run the compiled project\n";
-            std::cerr << Color::CYAN << "  buildrun" << Color::RESET
-                      << "  - Build and run the project\n";
+            std::cerr << C::RED << "✗ Error: " << C::RESET << "Missing arguments\n\n"
+                      << C::BOLD << "Usage: " << C::RESET << "floof <command> <project_path>\n\n"
+                      << C::BOLD << "Commands:\n" << C::RESET
+                      << C::CYAN << "  new"      << C::RESET << "       - Create a new Floof project\n"
+                      << C::CYAN << "  build"    << C::RESET << "     - Build the project\n"
+                      << C::CYAN << "  run"      << C::RESET << "       - Run the compiled project\n"
+                      << C::CYAN << "  buildrun" << C::RESET << "  - Build and run the project\n";
             return 1;
         }
 
-        ProjectBuilder builder;
-        std::string command = argv[1];
-        fs::path projectPath = argv[2];
+        initLLVM();
 
-        if (command == "new")
-            builder.createNewProject(projectPath);
-        else if (command == "build")
-            builder.buildProject(projectPath);
-        else if (command == "run")
-            builder.runProject(projectPath);
-        else if (command == "buildrun")
-        {
-            builder.buildProject(projectPath);
-            builder.runProject(projectPath);
-        }
+        std::string cmd  = argv[1];
+        fs::path    path = argv[2];
+
+        if      (cmd == "new")      cmdNew(path);
+        else if (cmd == "build")    cmdBuild(path);
+        else if (cmd == "run")      cmdRun(path);
+        else if (cmd == "buildrun") { cmdBuild(path); cmdRun(path); }
         else
         {
-            std::cerr << Color::RED << "✗ Error: " << Color::RESET
-                      << "Unknown command '" << Color::YELLOW << command
-                      << Color::RESET << "'\n\n";
-            std::cerr << Color::BOLD << "Available commands: " << Color::RESET
-                      << Color::CYAN << "new" << Color::RESET << ", "
-                      << Color::CYAN << "build" << Color::RESET << ", "
-                      << Color::CYAN << "run" << Color::RESET << ", "
-                      << Color::CYAN << "buildrun" << Color::RESET << "\n";
+            std::cerr << C::RED << "✗ Error: " << C::RESET
+                      << "Unknown command '" << C::BYELLOW << cmd << C::RESET << "'\n\n"
+                      << C::BOLD << "Available commands: " << C::RESET
+                      << C::CYAN << "new"      << C::RESET << ", "
+                      << C::CYAN << "build"    << C::RESET << ", "
+                      << C::CYAN << "run"      << C::RESET << ", "
+                      << C::CYAN << "buildrun" << C::RESET << "\n";
             return 1;
         }
     }
-    catch (const toml::parse_error &err)
+    catch (const toml::parse_error& err)
     {
-        std::cerr << Color::RED << "✗ Build configuration error:\n"
-                  << Color::RESET << err << '\n';
+        std::cerr << C::RED << "✗ Build configuration error:\n" << C::RESET << err << "\n";
         return 1;
     }
-    catch (const std::exception &e)
+    catch (const std::exception& e)
     {
-        std::cerr << Color::RED << "✗ Error: " << Color::RESET
-                  << e.what() << '\n';
+        std::cerr << C::RED << "✗ Error: " << C::RESET << e.what() << "\n";
         return 1;
     }
 
