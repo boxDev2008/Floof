@@ -156,6 +156,7 @@ struct ForStmt : StmtNode {
 struct StructField {
     std::string name;
     std::unique_ptr<TypeNode> type;
+    std::unique_ptr<ExprNode> default_value;
 };
 
 struct StructDecl : ASTNode {
@@ -1169,13 +1170,15 @@ public:
             Expect(':', "Expected ':'");
             field->type = ParseType();
 
+            if (Match('='))
+                field->default_value = ParseExpr();
+
             struct_decl->fields.push_back(std::move(field));
 
             if (Match(','))
             {
                 if (Check('}'))
                     break;
-
                 continue;
             }
 

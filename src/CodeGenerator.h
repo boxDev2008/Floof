@@ -71,6 +71,7 @@ class CodeGenerator
         StructType* type;
         std::unordered_map<std::string, unsigned> fieldIndices;
         std::unordered_map<std::string, TypeInfo> fieldTypes;
+        std::unordered_map<std::string, ExprNode*> fieldDefaults;
     };
 
     struct EnumInfo
@@ -277,18 +278,19 @@ private:
         auto* structType = StructType::create(m_context, decl->name);
         StructInfo info;
         info.type = structType;
-        
+
         std::vector<Type*> memberTypes;
         for (unsigned i = 0; i < decl->fields.size(); i++)
         {
             const auto& field = decl->fields[i];
             TypeInfo fieldType = ResolveType(field->type.get());
-            
+
             memberTypes.push_back(fieldType.llvmType);
             info.fieldIndices[field->name] = i;
             info.fieldTypes[field->name] = fieldType;
+            info.fieldDefaults[field->name] = field->default_value.get();
         }
-        
+
         structType->setBody(memberTypes, decl->is_packed);
         m_structs[decl->name] = info;
     }
@@ -492,8 +494,7 @@ private:
                 }
             }
             
-            return TypedValue(ConstantArray::get(arrayType, elements), 
-                            TypeInfo(arrayType, elemType.isUnsigned));
+            return TypedValue(ConstantArray::get(arrayType, elements), TypeInfo(arrayType, elemType.isUnsigned));
         }
         
         if (auto* structInit = dynamic_cast<StructInit*>(node))
@@ -501,12 +502,9 @@ private:
             auto it = m_structs.find(structInit->type_name);
             if (it == m_structs.end())
                 Error("Unknown struct: " + structInit->type_name, structInit->line);
-            
+
             const StructInfo& info = it->second;
-            std::vector<Constant*> fieldValues;
-            
-            for (unsigned i = 0; i < info.fieldIndices.size(); i++)
-                fieldValues.push_back(nullptr);
+            std::vector<Constant*> fieldValues(info.fieldIndices.size(), nullptr);
 
             for (unsigned i = 0; i < structInit->fields.size(); i++)
             {
@@ -519,15 +517,27 @@ private:
                 fieldValues[fieldIdx] = llvm::cast<Constant>(constVal.value);
             }
 
-            for (unsigned i = 0; i < info.fieldIndices.size(); i++)
-                if (!fieldValues[i])
+            for (const auto& [name, idx] : info.fieldIndices)
+            {
+                if (fieldValues[idx])
+                    continue;
+
+                const TypeInfo* ft = FindFieldTypeAtIndex(info, idx);
+
+                ExprNode* defaultExpr = nullptr;
+                auto defIt = info.fieldDefaults.find(name);
+                if (defIt != info.fieldDefaults.end())
+                    defaultExpr = defIt->second;
+
+                if (defaultExpr)
                 {
-                    const TypeInfo* ft = FindFieldTypeAtIndex(info, i);
-                    fieldValues[i] = Constant::getNullValue(ft->llvmType);
+                    TypedValue defVal = EvaluateConstantExpr(defaultExpr, ft);
+                    fieldValues[idx] = llvm::cast<Constant>(defVal.value);
                 }
-            
-            return TypedValue(ConstantStruct::get(info.type, fieldValues), 
-                            TypeInfo(info.type, false));
+                else fieldValues[idx] = Constant::getNullValue(ft->llvmType);
+            }
+
+            return TypedValue(ConstantStruct::get(info.type, fieldValues), TypeInfo(info.type, false));
         }
 
         if (auto* enumAccess = dynamic_cast<EnumAccess*>(node))
@@ -985,22 +995,14 @@ private:
         auto it = m_structs.find(init->type_name);
         if (it == m_structs.end())
             Error("Unknown struct: " + init->type_name, init->line);
-        
+
         const StructInfo& info = it->second;
-        
+
         if (init->fields.size() > info.fieldIndices.size())
             Error("Too many fields in struct initializer", init->line);
-        
-        if (init->fields.size() < info.fieldIndices.size()) {
-            uint64_t structBytes = m_module->getDataLayout().getTypeAllocSize(info.type);
-            m_builder.CreateMemSet(
-                structPtr,
-                m_builder.getInt8(0),
-                structBytes,
-                MaybeAlign()
-            );
-        }
-        
+
+        std::vector<bool> fieldSet(info.fieldIndices.size(), false);
+
         for (unsigned i = 0; i < init->fields.size(); i++)
         {
             const FieldInit& fi = init->fields[i];
@@ -1008,13 +1010,37 @@ private:
             const TypeInfo* fieldType = FindFieldTypeAtIndex(info, fieldIdx);
             if (!fieldType)
                 Error("Field type not found", init->line);
-            
+
             TypedValue fieldValue = EvaluateRValue(fi.value.get(), fieldType);
             if (fieldValue.type != *fieldType)
                 fieldValue = CastValue(fieldValue, *fieldType, fi.value->line);
-            
+
             auto* fieldPtr = m_builder.CreateStructGEP(info.type, structPtr, fieldIdx);
             m_builder.CreateStore(fieldValue.value, fieldPtr);
+            fieldSet[fieldIdx] = true;
+        }
+
+        for (const auto& [name, idx] : info.fieldIndices)
+        {
+            if (fieldSet[idx])
+                continue;
+
+            const TypeInfo* fieldType = FindFieldTypeAtIndex(info, idx);
+            auto* fieldPtr = m_builder.CreateStructGEP(info.type, structPtr, idx);
+
+            ExprNode* defaultExpr = nullptr;
+            auto defIt = info.fieldDefaults.find(name);
+            if (defIt != info.fieldDefaults.end())
+                defaultExpr = defIt->second;
+
+            if (defaultExpr)
+            {
+                TypedValue defValue = EvaluateRValue(defaultExpr, fieldType);
+                if (defValue.type != *fieldType)
+                    defValue = CastValue(defValue, *fieldType, 0);
+                m_builder.CreateStore(defValue.value, fieldPtr);
+            }
+            else m_builder.CreateStore(CreateZeroValue(fieldType->llvmType), fieldPtr);
         }
     }
 
