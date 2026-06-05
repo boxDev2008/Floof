@@ -1527,23 +1527,120 @@ private:
         return CastValue(operand, targetType, cast->line);
     }
 
+    std::vector<Value*> BuildCallArgs(
+        const FunctionInfo& funcInfo,
+        const std::vector<std::unique_ptr<ExprNode>>& callArgs,
+        uint32_t line)
+    {
+        if (funcInfo.isVarArg)
+        {
+            if (callArgs.size() < funcInfo.paramTypes.size())
+                Error("Too few arguments in call", line);
+        }
+        else
+        {
+            size_t required = funcInfo.paramTypes.size();
+            for (size_t i = 0; i < funcInfo.defaultValues.size(); i++)
+                if (funcInfo.defaultValues[i]) { required = i; break; }
+
+            if (callArgs.size() < required)
+                Error("Too few arguments: expected at least "
+                    + std::to_string(required) + ", got "
+                    + std::to_string(callArgs.size()), line);
+            if (callArgs.size() > funcInfo.paramTypes.size())
+                Error("Too many arguments: expected "
+                    + std::to_string(funcInfo.paramTypes.size()) + ", got "
+                    + std::to_string(callArgs.size()), line);
+        }
+
+        std::vector<Value*> args;
+
+        for (size_t i = 0; i < funcInfo.paramTypes.size(); i++)
+        {
+            TypedValue arg;
+            if (i < callArgs.size())
+                arg = EvaluateRValue(callArgs[i].get());
+            else
+            {
+                if (!funcInfo.defaultValues[i])
+                    Error("Missing argument " + std::to_string(i + 1)
+                        + " and no default value available", line);
+                arg = EvaluateRValue(funcInfo.defaultValues[i]);
+            }
+
+            if (arg.type != funcInfo.paramTypes[i])
+                arg = CastValue(arg, funcInfo.paramTypes[i], line);
+            args.push_back(arg.value);
+        }
+
+        for (size_t i = funcInfo.paramTypes.size(); i < callArgs.size(); i++)
+            args.push_back(EvaluateRValue(callArgs[i].get()).value);
+
+        return args;
+    }
+
     TypedValue EvaluateFunctionCall(CallExpr *call)
     {
+        auto buildArgs = [&](const FunctionInfo& funcInfo, uint32_t line) -> std::vector<Value*>
+        {
+            if (funcInfo.isVarArg)
+            {
+                if (call->args.size() < funcInfo.paramTypes.size())
+                    Error("Too few arguments in call", line);
+            }
+            else
+            {
+                size_t required = funcInfo.paramTypes.size();
+                for (size_t i = 0; i < funcInfo.defaultValues.size(); i++)
+                    if (funcInfo.defaultValues[i]) { required = i; break; }
+
+                if (call->args.size() < required)
+                    Error("Too few arguments: expected at least "
+                        + std::to_string(required) + ", got "
+                        + std::to_string(call->args.size()), line);
+                if (call->args.size() > funcInfo.paramTypes.size())
+                    Error("Too many arguments: expected "
+                        + std::to_string(funcInfo.paramTypes.size()) + ", got "
+                        + std::to_string(call->args.size()), line);
+            }
+
+            std::vector<Value*> args;
+            for (size_t i = 0; i < funcInfo.paramTypes.size(); i++)
+            {
+                TypedValue arg;
+                if (i < call->args.size())
+                    arg = EvaluateRValue(call->args[i].get());
+                else
+                {
+                    if (!funcInfo.defaultValues[i])
+                        Error("Missing argument " + std::to_string(i + 1)
+                            + " and no default value available", line);
+                    arg = EvaluateRValue(funcInfo.defaultValues[i]);
+                }
+                if (arg.type != funcInfo.paramTypes[i])
+                    arg = CastValue(arg, funcInfo.paramTypes[i], line);
+                args.push_back(arg.value);
+            }
+            for (size_t i = funcInfo.paramTypes.size(); i < call->args.size(); i++)
+                args.push_back(EvaluateRValue(call->args[i].get()).value);
+
+            return args;
+        };
+
         if (auto* ident = dynamic_cast<Identifier*>(call->callee.get()))
         {
             if (ident->name == "va_start")
             {
                 if (call->args.size() != 2)
                     Error("va_start requires exactly 2 arguments: va_list and last named parameter", call->line);
-                
+
                 TypedValue vaListArg = EvaluateLValue(call->args[0].get());
-                
+
                 auto funcIt = m_functions.find("llvm.va_start");
                 if (funcIt == m_functions.end())
                     Error("llvm.va_start intrinsic not found", call->line);
-                
+
                 Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-                
                 m_builder.CreateCall(funcIt->second.function, {vaListPtr});
                 return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
             }
@@ -1560,7 +1657,6 @@ private:
                     Error("llvm.va_end intrinsic not found", call->line);
 
                 Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-
                 m_builder.CreateCall(funcIt->second.function, {vaListPtr});
                 return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
             }
@@ -1569,127 +1665,30 @@ private:
             if (funcIt != m_functions.end())
             {
                 const FunctionInfo& func = funcIt->second;
-                
-                if (func.isVarArg)
-                {
-                    if (call->args.size() < func.paramTypes.size())
-                        Error("Too few arguments for " + ident->name, call->line);
-                }
-                else
-                {
-                    size_t required = func.defaultValues.empty() ? func.paramTypes.size()
-                        : [&]{
-                            size_t r = 0;
-                            for (size_t i = 0; i < func.defaultValues.size(); i++)
-                                if (!func.defaultValues[i]) r = i + 1;
-                            return r;
-                        }();
-
-                    if (call->args.size() < required)
-                        Error("Too few arguments for " + ident->name + ": expected at least "
-                            + std::to_string(required) + ", got " + std::to_string(call->args.size()), call->line);
-                    if (!func.isVarArg && call->args.size() > func.paramTypes.size())
-                        Error("Too many arguments for " + ident->name, call->line);
-                }
-                
-                std::vector<Value*> args;
-                for (size_t i = 0; i < func.paramTypes.size(); i++)
-                {
-                    TypedValue arg;
-                    if (i < call->args.size())
-                    {
-                        arg = EvaluateRValue(call->args[i].get());
-                    }
-                    else
-                    {
-                        if (!func.defaultValues[i])
-                            Error("Missing argument " + std::to_string(i+1) + " for " + ident->name, call->line);
-                        arg = EvaluateRValue(func.defaultValues[i]);
-                    }
-                    if (arg.type != func.paramTypes[i])
-                        arg = CastValue(arg, func.paramTypes[i], call->line);
-                    args.push_back(arg.value);
-                }
-                for (size_t i = func.paramTypes.size(); i < call->args.size(); i++)
-                    args.push_back(EvaluateRValue(call->args[i].get()).value);
-                
+                auto args = buildArgs(func, call->line);
                 auto* result = m_builder.CreateCall(func.function, args);
                 return TypedValue(result, func.returnType);
             }
-            
+
             Variable var = LookupVariable(ident->name, ident->line);
-            
             if (!var.type.functionInfo)
                 Error("Variable '" + ident->name + "' is not callable", call->line);
-            
+
             const FunctionInfo& funcInfo = *var.type.functionInfo;
-            
-            if (funcInfo.isVarArg)
-            {
-                if (call->args.size() < funcInfo.paramTypes.size())
-                    Error("Too few arguments", call->line);
-            }
-            else
-            {
-                if (call->args.size() != funcInfo.paramTypes.size())
-                    Error("Argument count mismatch", call->line);
-            }
-            
+            auto args = buildArgs(funcInfo, call->line);
             Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
             FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
-            
-            std::vector<Value*> args;
-            for (size_t i = 0; i < call->args.size(); i++)
-            {
-                TypedValue arg = EvaluateRValue(call->args[i].get());
-                
-                if (i < funcInfo.paramTypes.size())
-                {
-                    if (arg.type != funcInfo.paramTypes[i])
-                        arg = CastValue(arg, funcInfo.paramTypes[i], call->args[i]->line);
-                }
-                
-                args.push_back(arg.value);
-            }
-            
             auto* result = m_builder.CreateCall(funcType, funcPtr, args);
             return TypedValue(result, funcInfo.returnType);
         }
-        
+
         TypedValue calleeValue = EvaluateRValue(call->callee.get());
-        
         if (!calleeValue.type.functionInfo)
             Error("Expression is not callable", call->line);
-        
+
         const FunctionInfo& funcInfo = *calleeValue.type.functionInfo;
-        
-        if (funcInfo.isVarArg)
-        {
-            if (call->args.size() < funcInfo.paramTypes.size())
-                Error("Too few arguments for function call", call->line);
-        }
-        else
-        {
-            if (call->args.size() != funcInfo.paramTypes.size())
-                Error("Argument count mismatch for function call", call->line);
-        }
-        
+        auto args = buildArgs(funcInfo, call->line);
         FunctionType* funcType = cast<FunctionType>(calleeValue.type.pointeeType);
-        
-        std::vector<Value*> args;
-        for (size_t i = 0; i < call->args.size(); i++)
-        {
-            TypedValue arg = EvaluateRValue(call->args[i].get());
-            
-            if (i < funcInfo.paramTypes.size())
-            {
-                if (arg.type != funcInfo.paramTypes[i])
-                    arg = CastValue(arg, funcInfo.paramTypes[i], call->args[i]->line);
-            }
-            
-            args.push_back(arg.value);
-        }
-        
         auto* result = m_builder.CreateCall(funcType, calleeValue.value, args);
         return TypedValue(result, funcInfo.returnType);
     }
