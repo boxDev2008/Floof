@@ -84,12 +84,16 @@ class CodeGenerator
     {
         Function* function;
         std::vector<TypeInfo> paramTypes;
+        std::vector<ExprNode*> defaultValues;
         TypeInfo returnType;
         bool isVarArg;
-        
+
         FunctionInfo() : function(nullptr), isVarArg(false) {}
-        FunctionInfo(Function* fn, const std::vector<TypeInfo>& params, const TypeInfo& ret, bool varArg = false)
-            : function(fn), paramTypes(params), returnType(ret), isVarArg(varArg) {}
+        
+        FunctionInfo(Function* fn, const std::vector<TypeInfo>& params, const TypeInfo& ret,
+                    bool varArg = false, std::vector<ExprNode*> defaults = {})
+            : function(fn), paramTypes(params), returnType(ret), isVarArg(varArg),
+            defaultValues(std::move(defaults)) {}
     };
 
     struct LoopContext
@@ -287,6 +291,18 @@ private:
         
         structType->setBody(memberTypes, decl->is_packed);
         m_structs[decl->name] = info;
+    }
+
+    unsigned ResolveFieldIndex(const StructInfo& info, const FieldInit& fi, unsigned positionalIndex, uint32_t line)
+    {
+        if (!fi.name.empty())
+        {
+            auto it = info.fieldIndices.find(fi.name);
+            if (it == info.fieldIndices.end())
+                Error("Unknown field name '" + fi.name + "' in struct initializer", line);
+            return it->second;
+        }
+        return positionalIndex;
     }
     
     void DeclareGlobalVariables(const ModuleAST& ast)
@@ -490,18 +506,25 @@ private:
             std::vector<Constant*> fieldValues;
             
             for (unsigned i = 0; i < info.fieldIndices.size(); i++)
+                fieldValues.push_back(nullptr);
+
+            for (unsigned i = 0; i < structInit->fields.size(); i++)
             {
-                const TypeInfo* fieldType = FindFieldTypeAtIndex(info, i);
-                if (i < structInit->fields.size())
-                {
-                    auto constVal = EvaluateConstantExpr(structInit->fields[i].get(), fieldType);
-                    fieldValues.push_back(llvm::cast<Constant>(constVal.value));
-                }
-                else
-                {
-                    fieldValues.push_back(Constant::getNullValue(fieldType->llvmType));
-                }
+                const FieldInit& fi = structInit->fields[i];
+                unsigned fieldIdx = ResolveFieldIndex(info, fi, i, structInit->line);
+                if (fieldIdx >= fieldValues.size())
+                    Error("Field index out of range in struct initializer", structInit->line);
+                const TypeInfo* fieldType = FindFieldTypeAtIndex(info, fieldIdx);
+                auto constVal = EvaluateConstantExpr(fi.value.get(), fieldType);
+                fieldValues[fieldIdx] = llvm::cast<Constant>(constVal.value);
             }
+
+            for (unsigned i = 0; i < info.fieldIndices.size(); i++)
+                if (!fieldValues[i])
+                {
+                    const TypeInfo* ft = FindFieldTypeAtIndex(info, i);
+                    fieldValues[i] = Constant::getNullValue(ft->llvmType);
+                }
             
             return TypedValue(ConstantStruct::get(info.type, fieldValues), 
                             TypeInfo(info.type, false));
@@ -683,26 +706,28 @@ private:
     {
         std::vector<Type*> paramLLVMTypes;
         std::vector<TypeInfo> paramTypes;
-        
+        std::vector<ExprNode*> defaultValues;
+
         for (const auto& param : proc->params)
         {
             TypeInfo paramType = ResolveType(param.type.get());
             paramLLVMTypes.push_back(paramType.llvmType);
             paramTypes.push_back(paramType);
+            defaultValues.push_back(param.default_value.get());
         }
-        
-        TypeInfo returnType = proc->return_type 
+
+        TypeInfo returnType = proc->return_type
             ? ResolveType(proc->return_type.get())
             : TypeInfo(Type::getVoidTy(m_context), false);
-        
+
         auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, proc->is_vararg);
         auto* func = Function::Create(funcType, linkage, proc->name, m_module.get());
-        
+
         unsigned idx = 0;
         for (auto& arg : func->args())
             arg.setName(proc->params[idx++].name);
-        
-        FunctionInfo info(func, paramTypes, returnType, proc->is_vararg);
+
+        FunctionInfo info(func, paramTypes, returnType, proc->is_vararg, std::move(defaultValues));
         m_functions[proc->name] = info;
         return info;
     }
@@ -812,8 +837,8 @@ private:
             {
                 m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
                 m_currentScope = m_scopeCount;
-                if (s->init)
-                    GenerateVarDeclHosingAlloc(s->init.get());
+                if (s->init_decl)
+                    GenerateVarDeclHosingAlloc(s->init_decl.get());
                 GenerateHostingAllocs(s->body.get());
                 m_currentScope = scopeId;
             }
@@ -978,15 +1003,17 @@ private:
         
         for (unsigned i = 0; i < init->fields.size(); i++)
         {
-            const TypeInfo* fieldType = FindFieldTypeAtIndex(info, i);
+            const FieldInit& fi = init->fields[i];
+            unsigned fieldIdx = ResolveFieldIndex(info, fi, i, init->line);
+            const TypeInfo* fieldType = FindFieldTypeAtIndex(info, fieldIdx);
             if (!fieldType)
-                Error("Field type not found at index " + std::to_string(i), init->line);
+                Error("Field type not found", init->line);
             
-            TypedValue fieldValue = EvaluateRValue(init->fields[i].get(), fieldType);
+            TypedValue fieldValue = EvaluateRValue(fi.value.get(), fieldType);
             if (fieldValue.type != *fieldType)
-                fieldValue = CastValue(fieldValue, *fieldType, init->fields[i]->line);
+                fieldValue = CastValue(fieldValue, *fieldType, fi.value->line);
             
-            auto* fieldPtr = m_builder.CreateStructGEP(info.type, structPtr, i);
+            auto* fieldPtr = m_builder.CreateStructGEP(info.type, structPtr, fieldIdx);
             m_builder.CreateStore(fieldValue.value, fieldPtr);
         }
     }
@@ -1068,42 +1095,48 @@ private:
     void GenerateFor(ForStmt* stmt, const TypeInfo& returnType)
     {
         auto* function = m_builder.GetInsertBlock()->getParent();
-        
-        if (stmt->init)
+
+        if (stmt->init_decl)
         {
-            Variable variable = m_locals[stmt->init->name + '.' + std::to_string(m_currentScope)];
-            if (stmt->init->init)
+            Variable variable = m_locals[stmt->init_decl->name + '.' + std::to_string(m_currentScope)];
+            if (stmt->init_decl->init)
             {
-                TypedValue initValue = EvaluateRValue(stmt->init->init.get(), &variable.type);
+                TypedValue initValue = EvaluateRValue(stmt->init_decl->init.get(), &variable.type);
                 if (initValue.type != variable.type)
-                    initValue = CastValue(initValue, variable.type, stmt->init->line);
+                    initValue = CastValue(initValue, variable.type, stmt->init_decl->line);
                 m_builder.CreateStore(initValue.value, variable.storage);
             }
         }
-        
+        else if (stmt->init_expr)
+            EvaluateRValue(stmt->init_expr.get());
+
         auto* condBB = BasicBlock::Create(m_context, "for.cond", function);
         auto* bodyBB = BasicBlock::Create(m_context, "for.body", function);
-        auto* incBB = BasicBlock::Create(m_context, "for.inc", function);
-        auto* endBB = BasicBlock::Create(m_context, "for.end", function);
-        
+        auto* incBB  = BasicBlock::Create(m_context, "for.inc",  function);
+        auto* endBB  = BasicBlock::Create(m_context, "for.end",  function);
+
         LoopContext loopCtx = PushLoop(incBB, endBB);
-        
         m_builder.CreateBr(condBB);
-        
+
         m_builder.SetInsertPoint(condBB);
-        TypedValue condition = EvaluateRValue(stmt->condition.get());
-        condition = EnsureBooleanType(condition, stmt->condition->line);
-        m_builder.CreateCondBr(condition.value, bodyBB, endBB);
-        
+        if (stmt->condition)
+        {
+            TypedValue condition = EvaluateRValue(stmt->condition.get());
+            condition = EnsureBooleanType(condition, stmt->condition->line);
+            m_builder.CreateCondBr(condition.value, bodyBB, endBB);
+        }
+        else m_builder.CreateBr(bodyBB);
+
         m_builder.SetInsertPoint(bodyBB);
         GenerateBlock(stmt->body.get(), returnType);
         if (!m_builder.GetInsertBlock()->getTerminator())
             m_builder.CreateBr(incBB);
-        
+
         m_builder.SetInsertPoint(incBB);
-        EvaluateRValue(stmt->increment.get());
+        if (stmt->increment)
+            EvaluateRValue(stmt->increment.get());
         m_builder.CreateBr(condBB);
-        
+
         PopLoop(loopCtx);
         m_builder.SetInsertPoint(endBB);
     }
@@ -1518,23 +1551,41 @@ private:
                 }
                 else
                 {
-                    if (call->args.size() != func.paramTypes.size())
-                        Error("Argument count mismatch for " + ident->name, call->line);
+                    size_t required = func.defaultValues.empty() ? func.paramTypes.size()
+                        : [&]{
+                            size_t r = 0;
+                            for (size_t i = 0; i < func.defaultValues.size(); i++)
+                                if (!func.defaultValues[i]) r = i + 1;
+                            return r;
+                        }();
+
+                    if (call->args.size() < required)
+                        Error("Too few arguments for " + ident->name + ": expected at least "
+                            + std::to_string(required) + ", got " + std::to_string(call->args.size()), call->line);
+                    if (!func.isVarArg && call->args.size() > func.paramTypes.size())
+                        Error("Too many arguments for " + ident->name, call->line);
                 }
                 
                 std::vector<Value*> args;
-                for (size_t i = 0; i < call->args.size(); i++)
+                for (size_t i = 0; i < func.paramTypes.size(); i++)
                 {
-                    TypedValue arg = EvaluateRValue(call->args[i].get());
-                    
-                    if (i < func.paramTypes.size())
+                    TypedValue arg;
+                    if (i < call->args.size())
                     {
-                        if (arg.type != func.paramTypes[i])
-                            arg = CastValue(arg, func.paramTypes[i], call->args[i]->line);
+                        arg = EvaluateRValue(call->args[i].get());
                     }
-                    
+                    else
+                    {
+                        if (!func.defaultValues[i])
+                            Error("Missing argument " + std::to_string(i+1) + " for " + ident->name, call->line);
+                        arg = EvaluateRValue(func.defaultValues[i]);
+                    }
+                    if (arg.type != func.paramTypes[i])
+                        arg = CastValue(arg, func.paramTypes[i], call->line);
                     args.push_back(arg.value);
                 }
+                for (size_t i = func.paramTypes.size(); i < call->args.size(); i++)
+                    args.push_back(EvaluateRValue(call->args[i].get()).value);
                 
                 auto* result = m_builder.CreateCall(func.function, args);
                 return TypedValue(result, func.returnType);

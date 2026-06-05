@@ -74,9 +74,14 @@ struct PointerMemberAccess : ExprNode {
     std::string member;
 };
 
+struct FieldInit {
+    std::string name;
+    std::unique_ptr<ExprNode> value;
+};
+
 struct StructInit : ExprNode {
     std::string type_name;
-    std::vector<std::unique_ptr<ExprNode>> fields;
+    std::vector<FieldInit> fields;
 };
 
 struct ArrayInit : ExprNode {
@@ -141,7 +146,8 @@ struct WhileStmt : StmtNode {
 };
 
 struct ForStmt : StmtNode {
-    std::unique_ptr<VarDecl> init;
+    std::unique_ptr<VarDecl> init_decl;
+    std::unique_ptr<ExprNode> init_expr;
     std::unique_ptr<ExprNode> condition;
     std::unique_ptr<ExprNode> increment;
     std::unique_ptr<BlockStmt> body;
@@ -193,6 +199,7 @@ struct EnumAccess : ExprNode {
 struct Parameter {
     std::string name;
     std::unique_ptr<TypeNode> type;
+    std::unique_ptr<ExprNode> default_value;
 };
 
 struct ProcDecl : ASTNode {
@@ -768,7 +775,16 @@ public:
                 if (!Check('}'))
                 {
                     do {
-                        init->fields.push_back(ParseExpr());
+                        if (Check('}')) break;
+                        FieldInit fi;
+                        if (Check(TokenType_Identifier) && PeekIs(':'))
+                        {
+                            fi.name = m_current.value;
+                            Advance();
+                            Advance();
+                        }
+                        fi.value = ParseExpr();
+                        init->fields.push_back(std::move(fi));
                     } while (Match(','));
                 }
                 
@@ -866,16 +882,9 @@ public:
         
         if (Match("for"))
         {
-            auto statement = std::make_unique<ForStmt>();
-            statement->line = stmtLine;
-            statement->init = ParseVarDecl();
-            m_parsingStatement = true;
-            statement->condition = ParseExpr();
-            Expect(';', "Expected ';'");
-            statement->increment = ParseExpr();
-            m_parsingStatement = false;
-            statement->body = ParseBlock();
-            return statement;
+            auto stmt = ParseForStmt();
+            stmt->line = stmtLine;
+            return stmt;
         }
 
         if (Match("match"))
@@ -1052,6 +1061,45 @@ public:
         return enum_decl;
     }
 
+    std::unique_ptr<ForStmt> ParseForStmt(void)
+    {
+        auto statement = std::make_unique<ForStmt>();
+
+        if (!Check(';'))
+        {
+            if (Check(TokenType_Identifier) && PeekIs(':'))
+            {
+                statement->init_decl = ParseVarDecl();
+            }
+            else
+            {
+                m_parsingStatement = true;
+                statement->init_expr = ParseExpr();
+                m_parsingStatement = false;
+                Expect(';', "Expected ';' after for-init expression");
+            }
+        }
+        else Advance();
+
+        if (!Check(';'))
+        {
+            m_parsingStatement = true;
+            statement->condition = ParseExpr();
+            m_parsingStatement = false;
+        }
+        Expect(';', "Expected ';' after for-condition");
+
+        if (!Check('{'))
+        {
+            m_parsingStatement = true;
+            statement->increment = ParseExpr();
+            m_parsingStatement = false;
+        }
+
+        statement->body = ParseBlock();
+        return statement;
+    }
+
     std::unique_ptr<MatchStmt> ParseMatchStmt(void)
     {
         auto match = std::make_unique<MatchStmt>();
@@ -1149,6 +1197,7 @@ public:
 
         if (Match('('))
         {
+            bool hasDefault = false;
             while (!Match(')'))
             {
                 if ((Match('.') && Match('.') && Match('.')))
@@ -1164,9 +1213,22 @@ public:
                     param.name = m_last.value;
                     Expect(':', "Expected ':'");
                     param.type = ParseType();
-                    
+
+                    if (Match('='))
+                    {
+                        param.default_value = ParseExpr();
+                        hasDefault = true;
+                    }
+                    else if (hasDefault)
+                    {
+                        throw std::runtime_error(
+                            "Required parameter '" + param.name + "' cannot follow a parameter"
+                            " with a default value on line " + std::to_string(m_lexer.GetCurrentLine())
+                            + " in module " + m_moduleName);
+                    }
+
                     proc->params.push_back(std::move(param));
-                    
+
                     if (!Check(')'))
                         Expect(',', "Expected ',' or ')' after parameter");
                 }
@@ -1189,7 +1251,27 @@ private:
 
     void Advance(void)
     {
-        m_current = m_lexer.Next();
+        if (m_hasNext)
+        {
+            m_current = m_next;
+            m_hasNext = false;
+        }
+        else m_current = m_lexer.Next();
+    }
+
+    const Token &PeekNext(void)
+    {
+        if (!m_hasNext)
+        {
+            m_next = m_lexer.Next();
+            m_hasNext = true;
+        }
+        return m_next;
+    }
+
+    bool PeekIs(int type)
+    {
+        return PeekNext().type == type;
     }
 
     bool Check(int type)
@@ -1229,5 +1311,7 @@ private:
     Lexer &m_lexer;
     Token m_current;
     Token m_last;
+    Token m_next;
+    bool m_hasNext = false;
     bool m_parsingStatement = false;
 };
