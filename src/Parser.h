@@ -1117,13 +1117,9 @@ public:
             auto case_stmt = std::make_unique<MatchCase>();
             
             if (Match("else"))
-            {
                 case_stmt->is_else = true;
-            }
             else
-            {
                 case_stmt->value = ParseExpr();
-            }
             
             case_stmt->body = ParseBlock();
             match->cases.push_back(std::move(case_stmt));
