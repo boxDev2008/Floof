@@ -5,13 +5,11 @@
 #include <filesystem>
 #include <fstream>
 #include <sstream>
-#include <memory>
 #include <map>
 #include <thread>
 #include <mutex>
 #include <atomic>
 #include <chrono>
-#include <iomanip>
 
 #include <toml++/toml.hpp>
 
