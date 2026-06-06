@@ -244,6 +244,7 @@ public:
                 uint32_t declLine = CurrentLine();
                 const bool is_pub = Match("pub");
                 const bool is_extern = Match("extern");
+                const bool is_packed = Match("packed");
 
                 if (Match("proc"))
                 {
@@ -256,6 +257,7 @@ public:
                 {
                     std::unique_ptr<StructDecl> decl = ParseStructDecl();
                     decl->is_pub = is_pub;
+                    decl->is_packed = is_packed;
                     decl->line = declLine;
                     module->structs.push_back(std::move(decl));
                 }
@@ -1135,20 +1137,6 @@ public:
     std::unique_ptr<StructDecl> ParseStructDecl(void)
     {
         std::unique_ptr<StructDecl> struct_decl = std::make_unique<StructDecl>();
-
-        if (Match('('))
-        {
-            Expect(TokenType_Identifier, "Expected attribute name");
-            if (m_last.value == "packed")
-                struct_decl->is_packed = true;
-            else
-                throw std::runtime_error(
-                    "Invalid attribute name " + m_last.value +
-                    " on line " + std::to_string(m_lexer.GetCurrentLine()) +
-                    " in module " + m_moduleName);
-
-            Expect(')', "Expected ')'");
-        }
 
         Expect(TokenType_Identifier, "Expected struct name");
         struct_decl->name = m_last.value;

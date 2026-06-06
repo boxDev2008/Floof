@@ -50,7 +50,7 @@
         },
         {
           "name": "keyword.other.flooflang",
-          "match": "\\b(using|pub|proc|struct|enum|const|extern)\\b"
+          "match": "\\b(using|pub|proc|struct|enum|const|extern|packed)\\b"
         }
       ]
     },
