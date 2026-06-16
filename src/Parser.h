@@ -3,6 +3,7 @@
 #include <vector>
 #include <memory>
 #include <stdexcept>
+#include <cstdint>
 
 #include "Lexer.h"
 
