@@ -152,6 +152,11 @@ struct WhileStmt : StmtNode {
     std::unique_ptr<BlockStmt> then_branch;
 };
 
+struct DoWhileStmt : StmtNode {
+    std::unique_ptr<ExprNode> condition;
+    std::unique_ptr<BlockStmt> then_branch;
+};
+
 struct ForStmt : StmtNode {
     std::unique_ptr<VarDecl> init_decl;
     std::unique_ptr<ExprNode> init_expr;
@@ -906,6 +911,20 @@ public:
             statement->condition = ParseExpr();
             m_parsingStatement = false;
             statement->then_branch = ParseBlock();
+            return statement;
+        }
+        
+        if (Match("do"))
+        {
+            auto statement = std::make_unique<DoWhileStmt>();
+            statement->line = stmtLine;
+            statement->then_branch = ParseBlock();
+            if (!Match("while"))
+                throw std::runtime_error(std::string("Expected 'while' after 'do' block on line ") + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
+            m_parsingStatement = true;
+            statement->condition = ParseExpr();
+            m_parsingStatement = false;
+            Expect(';', "Expected ';' after do-while condition");
             return statement;
         }
         

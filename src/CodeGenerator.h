@@ -858,6 +858,13 @@ private:
                 GenerateHostingAllocs(s->then_branch.get());
                 m_currentScope = scopeId;
             }
+            else if (auto* s = dynamic_cast<DoWhileStmt*>(stmt.get()))
+            {
+                m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
+                m_currentScope = m_scopeCount;
+                GenerateHostingAllocs(s->then_branch.get());
+                m_currentScope = scopeId;
+            }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
             {
                 m_scopes.push_back(Scope{ (int32_t)scopeId, ++m_scopeCount });
@@ -901,6 +908,12 @@ private:
             {
                 m_currentScope = ++m_scopeCount;
                 GenerateWhile(s, returnType);
+                m_currentScope = scopeId;
+            }
+            else if (auto* s = dynamic_cast<DoWhileStmt*>(stmt.get()))
+            {
+                m_currentScope = ++m_scopeCount;
+                GenerateDoWhile(s, returnType);
                 m_currentScope = scopeId;
             }
             else if (auto* s = dynamic_cast<ForStmt*>(stmt.get()))
@@ -1129,6 +1142,31 @@ private:
         if (!m_builder.GetInsertBlock()->getTerminator())
             m_builder.CreateBr(condBB);
         
+        PopLoop(loopCtx);
+        m_builder.SetInsertPoint(endBB);
+    }
+
+    void GenerateDoWhile(DoWhileStmt* stmt, const TypeInfo& returnType)
+    {
+        auto* function = m_builder.GetInsertBlock()->getParent();
+        auto* bodyBB = BasicBlock::Create(m_context, "dowhile.body", function);
+        auto* condBB = BasicBlock::Create(m_context, "dowhile.cond", function);
+        auto* endBB  = BasicBlock::Create(m_context, "dowhile.end",  function);
+
+        LoopContext loopCtx = PushLoop(condBB, endBB);
+
+        m_builder.CreateBr(bodyBB);
+
+        m_builder.SetInsertPoint(bodyBB);
+        GenerateBlock(stmt->then_branch.get(), returnType);
+        if (!m_builder.GetInsertBlock()->getTerminator())
+            m_builder.CreateBr(condBB);
+
+        m_builder.SetInsertPoint(condBB);
+        TypedValue condition = EvaluateRValue(stmt->condition.get());
+        condition = EnsureBooleanType(condition, stmt->condition->line);
+        m_builder.CreateCondBr(condition.value, bodyBB, endBB);
+
         PopLoop(loopCtx);
         m_builder.SetInsertPoint(endBB);
     }

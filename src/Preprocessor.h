@@ -48,25 +48,6 @@ public:
         {
             std::string line = lines[i];
 
-            while (!line.empty() && line.back() == '\\')
-            {
-                line.pop_back();
-
-                while (!line.empty() && (line.back() == ' ' || line.back() == '\t'))
-                    line.pop_back();
-                line += ' ';
-                ++i; ++m_lineNo;
-                if (i < lines.size())
-                {
-                    std::string next = lines[i];
-
-                    size_t s = next.find_first_not_of(" \t");
-                    if (s != std::string::npos)
-                        next = next.substr(s);
-                    line += next;
-                }
-            }
-
             std::string trimmed = ltrim(line);
 
             if (!trimmed.empty() && trimmed[0] == '#')
@@ -155,7 +136,60 @@ public:
                     }
 
                     while (j < rest.size() && std::isspace((unsigned char)rest[j])) ++j;
-                    def.body = rest.substr(j);
+                    std::string afterSig = rest.substr(j);
+
+                    bool braceBody = false;
+
+                    if (!afterSig.empty() && afterSig[0] == '{')
+                    {
+                        braceBody = true;
+                    }
+                    else if (trim(afterSig).empty())
+                    {
+                        size_t next = i + 1;
+                        if (next < lines.size() && ltrim(lines[next]) == "{")
+                        {
+                            braceBody = true;
+                            ++i; ++m_lineNo;
+                            afterSig = "{";
+                        }
+                    }
+
+                    if (braceBody)
+                    {
+                        std::string bodyAccum;
+                        int braceDepth = 1;
+                        size_t k = afterSig.find('{') + 1;
+
+                        for (; k < afterSig.size() && braceDepth > 0; ++k)
+                        {
+                            if      (afterSig[k] == '{') { ++braceDepth; bodyAccum += afterSig[k]; }
+                            else if (afterSig[k] == '}') { --braceDepth; if (braceDepth > 0) bodyAccum += afterSig[k]; }
+                            else                          { bodyAccum += afterSig[k]; }
+                        }
+
+                        while (braceDepth > 0 && i + 1 < lines.size())
+                        {
+                            ++i; ++m_lineNo;
+                            const std::string& bodyLine = lines[i];
+                            for (size_t c = 0; c < bodyLine.size() && braceDepth > 0; ++c)
+                            {
+                                if      (bodyLine[c] == '{') { ++braceDepth; bodyAccum += bodyLine[c]; }
+                                else if (bodyLine[c] == '}') { --braceDepth; if (braceDepth > 0) bodyAccum += bodyLine[c]; }
+                                else                          { bodyAccum += bodyLine[c]; }
+                            }
+                            if (braceDepth > 0) bodyAccum += '\n';
+                        }
+
+                        if (braceDepth != 0)
+                            error("Unterminated '{' in macro body for '" + name + "'");
+
+                        def.body = trim(bodyAccum);
+                    }
+                    else
+                    {
+                        def.body = afterSig;
+                    }
 
                     macros[name] = def;
                     if (is_pub)
