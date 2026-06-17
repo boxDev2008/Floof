@@ -46,7 +46,7 @@
       "patterns": [
         {
           "name": "keyword.control.flooflang",
-          "match": "\\b(if|else|while|for|match|break|continue|return)\\b"
+          "match": "\\b(if|else|while|for|match|break|continue|return|end)\\b"
         },
         {
           "name": "keyword.other.flooflang",
