@@ -1,5 +1,6 @@
 #include "Parser.h"
 #include "CodeGenerator.h"
+#include "Preprocessor.h"
 
 #include <iostream>
 #include <filesystem>
@@ -129,7 +130,8 @@ static llvm::TargetMachine* makeTargetMachine(void)
 
 static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const fs::path& srcDir)
 {
-    std::map<std::string, std::unique_ptr<ModuleAST>> modules;
+    struct RawFile { std::string rel; std::string source; };
+    std::vector<RawFile> raw;
 
     for (const auto& entry : fs::recursive_directory_iterator(srcDir))
     {
@@ -144,9 +146,80 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
         std::replace(rel.begin(), rel.end(), '/', '.');
         std::replace(rel.begin(), rel.end(), '\\', '.');
 
-        Lexer lexer(buf.str());
-        Parser parser(lexer, rel);
-        modules.emplace(rel, parser.ParseModule());
+        raw.push_back({rel, buf.str()});
+    }
+
+    std::map<std::string, std::unordered_map<std::string, MacroDef>> moduleExports;
+    std::map<std::string, std::string> preprocessed;
+
+    for (const auto& rf : raw)
+    {
+        Preprocessor pp;
+        preprocessed[rf.rel] = pp.process(rf.source, rf.rel);
+        moduleExports[rf.rel] = pp.exports;
+    }
+
+    auto scanUsings = [](const std::string& src) -> std::vector<std::string>
+    {
+        std::vector<std::string> deps;
+        std::istringstream ss(src);
+        std::string line;
+        while (std::getline(ss, line))
+        {
+            size_t s = line.find_first_not_of(" \t");
+            if (s == std::string::npos) continue;
+            line = line.substr(s);
+
+            size_t pos = 0;
+            if (line.size() > 3 && line.substr(0, 3) == "pub")
+            {
+                size_t ns = line.find_first_not_of(" \t", 3);
+                if (ns == std::string::npos) continue;
+                pos = ns;
+            }
+            if (line.size() < pos + 5 || line.substr(pos, 5) != "using") continue;
+            size_t ns = line.find_first_not_of(" \t", pos + 5);
+            if (ns == std::string::npos) continue;
+            pos = ns;
+
+            std::string modName;
+            while (pos < line.size() && (std::isalnum((unsigned char)line[pos]) ||
+                                          line[pos] == '_' || line[pos] == '.'))
+                modName += line[pos++];
+
+            if (!modName.empty())
+                deps.push_back(modName);
+        }
+        return deps;
+    };
+
+    for (const auto& rf : raw)
+    {
+        auto deps = scanUsings(rf.source);
+        bool needsRedo = false;
+        for (const auto& dep : deps)
+            if (moduleExports.count(dep)) { needsRedo = true; break; }
+
+        if (needsRedo)
+        {
+            Preprocessor pp;
+            for (const auto& dep : deps)
+            {
+                auto it = moduleExports.find(dep);
+                if (it != moduleExports.end())
+                    pp.importExports(it->second);
+            }
+            preprocessed[rf.rel] = pp.process(rf.source, rf.rel);
+        }
+    }
+
+    std::map<std::string, std::unique_ptr<ModuleAST>> modules;
+    for (const auto& rf : raw)
+    {
+        const std::string& src = preprocessed.at(rf.rel);
+        Lexer lexer(src);
+        Parser parser(lexer, rf.rel);
+        modules.emplace(rf.rel, parser.ParseModule());
     }
 
     return modules;
