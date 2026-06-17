@@ -102,6 +102,8 @@ public:
                     continue;
                 }
 
+                size_t defStartLine = i;
+
                 if (emitting)
                 {
                     std::string name;
@@ -234,7 +236,9 @@ public:
                         exports[name] = def;
                 }
 
-                result += '\n';
+                size_t linesConsumed = (i - defStartLine) + 1;
+                for (size_t n = 0; n < linesConsumed; ++n)
+                    result += '\n';
                 continue;
             }
 
