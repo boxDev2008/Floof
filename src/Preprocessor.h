@@ -155,6 +155,14 @@ public:
                         }
                     }
 
+                    bool backslashBody = false;
+                    if (!braceBody)
+                    {
+                        std::string sigLineTrimmed = rtrim(afterSig);
+                        if (!sigLineTrimmed.empty() && sigLineTrimmed.back() == '\\')
+                            backslashBody = true;
+                    }
+
                     if (braceBody)
                     {
                         std::string bodyAccum;
@@ -184,7 +192,37 @@ public:
                         if (braceDepth != 0)
                             error("Unterminated '{' in macro body for '" + name + "'");
 
-                        def.body = trim(bodyAccum);
+                        def.body = "do { " + trim(bodyAccum) + " } while (0)";
+                    }
+                    else if (backslashBody)
+                    {
+                        std::string bodyAccum;
+
+                        std::string firstChunk = rtrim(afterSig);
+                        firstChunk.pop_back();
+                        bool firstContinues = true;
+                        bodyAccum += trim(firstChunk);
+
+                        bool continues = firstContinues;
+                        while (continues && i + 1 < lines.size())
+                        {
+                            ++i; ++m_lineNo;
+                            std::string bodyLine = rtrim(lines[i]);
+
+                            continues = (!bodyLine.empty() && bodyLine.back() == '\\');
+                            if (continues)
+                                bodyLine.pop_back();
+
+                            std::string piece = trim(bodyLine);
+                            if (!bodyAccum.empty() && !piece.empty())
+                                bodyAccum += ' ';
+                            bodyAccum += piece;
+                        }
+
+                        if (continues)
+                            error("Unterminated '\\' continuation in macro body for '" + name + "'");
+
+                        def.body = bodyAccum;
                     }
                     else
                     {
