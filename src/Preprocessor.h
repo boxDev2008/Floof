@@ -349,7 +349,6 @@ private:
                 auto it = macros.find(ident);
                 if (it == macros.end())
                 {
-
                     result += ident;
                     continue;
                 }
@@ -383,9 +382,7 @@ private:
 
                         if (args.size() != def.params.size())
                         {
-
                             result += ident;
-
                             continue;
                         }
 
