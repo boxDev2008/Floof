@@ -430,6 +430,21 @@ private:
             return TypedValue(result, targetType);
         }
 
+        if (auto* ternary = dynamic_cast<TernaryExpr*>(node))
+        {
+            TypedValue cond = EvaluateConstantExpr(ternary->condition.get());
+            TypedValue thenVal = EvaluateConstantExpr(ternary->then_expr.get());
+            TypedValue elseVal = EvaluateConstantExpr(ternary->else_expr.get());
+            if (elseVal.type != thenVal.type)
+                elseVal = TypedValue(ConstantCast(llvm::cast<Constant>(elseVal.value), elseVal.type, thenVal.type, ternary->else_expr->line), thenVal.type);
+            auto* result = llvm::ConstantFoldSelectInstruction(
+                llvm::cast<Constant>(cond.value),
+                llvm::cast<Constant>(thenVal.value),
+                llvm::cast<Constant>(elseVal.value));
+            if (!result) Error("Could not constant-fold ternary expression", ternary->line);
+            return TypedValue(result, thenVal.type);
+        }
+
         if (auto* unary = dynamic_cast<UnaryExpr*>(node))
         {
             if (unary->op == '-')
@@ -1422,7 +1437,10 @@ private:
         
         if (auto* binary = dynamic_cast<BinaryExpr*>(node))
             return EvaluateBinaryExpr(binary);
-        
+
+        if (auto* ternary = dynamic_cast<TernaryExpr*>(node))
+            return EvaluateTernary(ternary);
+
         if (auto* vaArg = dynamic_cast<VaArgExpr*>(node))
         {
             TypedValue vaList = EvaluateLValue(vaArg->va_list.get());
@@ -1902,6 +1920,17 @@ private:
         
         auto* structValue = m_builder.CreateLoad(info.type, alloca);
         return TypedValue(structValue, TypeInfo(info.type, false));
+    }
+
+    TypedValue EvaluateTernary(TernaryExpr* ternary)
+    {
+        TypedValue cond = EvaluateRValue(ternary->condition.get());
+        cond = EnsureBooleanType(cond, ternary->condition->line);
+        TypedValue thenVal = EvaluateRValue(ternary->then_expr.get());
+        TypedValue elseVal = EvaluateRValue(ternary->else_expr.get());
+        if (elseVal.type != thenVal.type)
+            elseVal = CastValue(elseVal, thenVal.type, ternary->else_expr->line);
+        return TypedValue(m_builder.CreateSelect(cond.value, thenVal.value, elseVal.value), thenVal.type);
     }
 
     TypedValue EvaluateUnaryExpr(UnaryExpr* unary)

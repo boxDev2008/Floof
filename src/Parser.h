@@ -128,6 +128,12 @@ struct VaArgExpr : ExprNode {
     std::unique_ptr<TypeNode> type;
 };
 
+struct TernaryExpr : ExprNode {
+    std::unique_ptr<ExprNode> condition;
+    std::unique_ptr<ExprNode> then_expr;
+    std::unique_ptr<ExprNode> else_expr;
+};
+
 struct BreakStmt : StmtNode { };
 
 struct ContinueStmt : StmtNode { };
@@ -419,7 +425,7 @@ public:
 
     std::unique_ptr<ExprNode> ParseAssignment(void)
     {
-        auto expr = ParseBitwiseOr();
+        auto expr = ParseTernary();
         
         uint32_t opLine = CurrentLine();
 
@@ -445,6 +451,25 @@ public:
             return binary;
         }
         
+        return expr;
+    }
+
+    std::unique_ptr<ExprNode> ParseTernary(void)
+    {
+        auto expr = ParseBitwiseOr();
+
+        if (Match('?'))
+        {
+            uint32_t opLine = CurrentLine();
+            auto ternary = std::make_unique<TernaryExpr>();
+            ternary->line = opLine;
+            ternary->condition = std::move(expr);
+            ternary->then_expr = ParseExpr();
+            Expect(':', "Expected ':' in ternary expression");
+            ternary->else_expr = ParseTernary();
+            return ternary;
+        }
+
         return expr;
     }
 
