@@ -1,6 +1,7 @@
 #pragma once
 
 #include <vector>
+#include <set>
 #include <memory>
 #include <stdexcept>
 #include <cstdint>
@@ -11,6 +12,18 @@ struct ASTNode {
     virtual ~ASTNode() = default;
     uint32_t line = 0;
 };
+
+enum AttributeType : uint8_t {
+    ATTRIBUTE_TYPE_PLATFORM,
+    ATTRIBUTE_TYPE_WHEN
+};
+
+struct Attribute {
+    std::set<std::string> arguments;
+    AttributeType type;
+};
+
+typedef std::vector<Attribute> AttributeList;
 
 struct TypeNode : ASTNode {
     std::string name;
@@ -174,6 +187,7 @@ struct StructField {
 struct StructDecl : ASTNode {
     std::string name;
     std::vector<std::unique_ptr<StructField>> fields;
+    AttributeList attributes;
     bool is_packed = false;
     bool is_pub = false;
 };
@@ -189,6 +203,7 @@ struct EnumDecl : ASTNode
     std::string name;
     std::vector<EnumValue> values;
     std::unique_ptr<TypeNode> base_type;
+    AttributeList attributes;
     bool is_pub = false;
 };
 
@@ -220,6 +235,7 @@ struct ProcDecl : ASTNode {
     std::vector<Parameter> params;
     std::unique_ptr<TypeNode> return_type;
     std::unique_ptr<BlockStmt> body;
+    AttributeList attributes;
     bool is_pub = false;
     bool is_extern = false;
     bool is_vararg = false;
@@ -238,11 +254,132 @@ struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<ProcDecl>> procs;
 };
 
+class AttributeFilter
+{
+public:
+    AttributeFilter(const std::set<std::string>& flags)
+        : m_flags(flags) {}
+
+    void FilterModule(ModuleAST& module) const
+    {
+        FilterItems(module.structs);
+        FilterItems(module.enums);
+        FilterItems(module.procs);
+    }
+
+private:
+    const std::set<std::string> &m_flags;
+
+    bool ShouldKeepAttribute(const Attribute& attr) const
+    {
+        switch (attr.type)
+        {
+            case ATTRIBUTE_TYPE_PLATFORM:
+                return std::find(attr.arguments.begin(), attr.arguments.end(), CurrentPlatformName())
+                       != attr.arguments.end();
+
+            case ATTRIBUTE_TYPE_WHEN:
+                for (const auto& flag : attr.arguments)
+                    if (std::find(m_flags.begin(), m_flags.end(), flag) == m_flags.end())
+                        return false;
+                return true;
+        }
+        return true;
+    }
+
+    bool ShouldKeepItem(const AttributeList& attributes) const
+    {
+        bool hasPlatform = false;
+        bool platformPassed = false;
+
+        for (const auto& attr : attributes)
+        {
+            if (attr.type == ATTRIBUTE_TYPE_PLATFORM)
+            {
+                hasPlatform = true;
+                if (ShouldKeepAttribute(attr))
+                    platformPassed = true;
+            }
+            else
+            {
+                if (!ShouldKeepAttribute(attr))
+                    return false;
+            }
+        }
+
+        if (hasPlatform && !platformPassed)
+            return false;
+
+        return true;
+    }
+
+    template <typename T>
+    void FilterItems(std::vector<std::unique_ptr<T>>& items) const
+    {
+        items.erase(
+            std::remove_if(items.begin(), items.end(),
+                [&](const std::unique_ptr<T>& item)
+                {
+                    return !ShouldKeepItem(item->attributes);
+                }),
+            items.end());
+    }
+
+    constexpr const char *CurrentPlatformName(void) const
+    {
+    #if defined(_WIN32)
+        return "windows";
+    #elif defined(__APPLE__)
+        return "macos";
+    #else
+        return "linux";
+    #endif
+    }
+};
+
 class Parser {
 public:
     Parser(Lexer& lex, const std::string &moduleName) : m_lexer(lex), m_moduleName(moduleName)
     {
         Advance();
+    }
+
+    AttributeType AttributeTypeFromName(const std::string &name)
+    {
+        if (name == "platform") return ATTRIBUTE_TYPE_PLATFORM;
+        if (name == "when")     return ATTRIBUTE_TYPE_WHEN;
+
+        throw std::runtime_error("Unknown attribute '" + name + "' on line " +
+            std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
+    }
+
+    AttributeList ParseAttributeList(void)
+    {
+        AttributeList attributes;
+
+        while (Match('['))
+        {
+            Expect(TokenType_Identifier, "Expected attribute name after '['");
+            Attribute attr;
+            attr.type = AttributeTypeFromName(m_last.value);
+
+            if (Match('('))
+            {
+                if (!Check(')'))
+                {
+                    do {
+                        Expect(TokenType_Identifier, "Expected attribute argument");
+                        attr.arguments.insert(m_last.value);
+                    } while (Match(','));
+                }
+                Expect(')', "Expected ')' after attribute arguments");
+            }
+
+            Expect(']', "Expected ']' after attribute");
+            attributes.push_back(std::move(attr));
+        }
+
+        return attributes;
     }
 
     std::unique_ptr<ModuleAST> ParseModule(void)
@@ -251,6 +388,7 @@ public:
         
         while (m_current.type != TokenType_EOF)
         {
+            AttributeList attributes = ParseAttributeList();
             if (Check(TokenType_Identifier))
             {
                 uint32_t declLine = CurrentLine();
@@ -263,6 +401,7 @@ public:
                     std::unique_ptr<ProcDecl> proc = ParseProcDecl(is_extern);
                     proc->is_pub = is_pub;
                     proc->line = declLine;
+                    proc->attributes = std::move(attributes);
                     module->procs.push_back(std::move(proc));
                 }
                 else if (Match("struct"))
@@ -271,6 +410,7 @@ public:
                     decl->is_pub = is_pub;
                     decl->is_packed = is_packed;
                     decl->line = declLine;
+                    decl->attributes = std::move(attributes);
                     module->structs.push_back(std::move(decl));
                 }
                 else if (Match("enum"))
@@ -278,6 +418,7 @@ public:
                     std::unique_ptr<EnumDecl> decl = ParseEnumDecl();
                     decl->is_pub = is_pub;
                     decl->line = declLine;
+                    decl->attributes = std::move(attributes);
                     module->enums.push_back(std::move(decl));
                 }
                 else if (Match("using"))
@@ -324,7 +465,7 @@ public:
                     }
                     else
                     {
-                        throw std::runtime_error("Unexpected token at top level: " + name);
+                        throw std::runtime_error("Unexpected token at top level: " + name + " on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
                     }
                 }
             }
@@ -337,7 +478,7 @@ public:
                     msg += std::string(1, (char)m_current.type);
                 else
                     msg += "token type " + std::to_string(m_current.type);
-                throw std::runtime_error(msg);
+                throw std::runtime_error(msg + " on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
             }
         }
         
