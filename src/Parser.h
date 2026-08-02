@@ -245,15 +245,21 @@ struct UsingDecl : ASTNode {
     bool is_pub = false;
 };
 
+struct AliasDecl : ASTNode {
+    std::string name;
+    std::unique_ptr<TypeNode> target;
+    bool is_pub = false;
+};
+
 struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<UsingDecl>> usings;
     std::vector<std::unique_ptr<StructDecl>> structs;
     std::vector<std::unique_ptr<EnumDecl>> enums;
+    std::vector<std::unique_ptr<AliasDecl>> aliases;
     std::vector<std::unique_ptr<GlobalVarDecl>> globals;
     std::vector<std::unique_ptr<ProcDecl>> procs;
 };
 
-// AFTER
 class AttributeFilter
 {
 public:
@@ -373,6 +379,18 @@ public:
                     Expect(';', "Expected ';' after using declaration");
                     module->usings.push_back(std::move(using_decl));
                 }
+                else if (Check(TokenType_Identifier) && m_current.value == "type" && !PeekIs(':') && Match("type"))
+                {
+                    std::unique_ptr<AliasDecl> alias = std::make_unique<AliasDecl>();
+                    alias->line = declLine;
+                    alias->is_pub = is_pub;
+                    Expect(TokenType_Identifier, "Expected alias name after '='");
+                    alias->name = m_last.value;
+                    Expect('=', "Expected '=' after type in alias declaration");
+                    alias->target = ParseType();
+                    Expect(';', "Expected ';' after type alias declaration");
+                    module->aliases.push_back(std::move(alias));
+                }
                 else
                 {
                     std::string name = m_current.value;
@@ -460,9 +478,14 @@ public:
             
             while (Match('['))
             {
-                Expect(TokenType_Number, "Expected array size");
-                type->array_dimensions.push_back(std::stoi(m_last.value));
-                Expect(']', "Expected ']'");
+                if (Match(']'))
+                    type->array_dimensions.push_back(-1);
+                else
+                {
+                    Expect(TokenType_Number, "Expected array size");
+                    type->array_dimensions.push_back(std::stoi(m_last.value));
+                    Expect(']', "Expected ']'");
+                }
             }
 
             if (Match(TokenType_Arrow))
@@ -493,9 +516,14 @@ public:
         
         while (Match('['))
         {
-            Expect(TokenType_Number, "Expected array size");
-            type->array_dimensions.push_back(std::stoi(m_last.value));
-            Expect(']', "Expected ']'");
+            if (Match(']'))
+                type->array_dimensions.push_back(-1);
+            else
+            {
+                Expect(TokenType_Number, "Expected array size");
+                type->array_dimensions.push_back(std::stoi(m_last.value));
+                Expect(']', "Expected ']'");
+            }
         }
         
         return type;

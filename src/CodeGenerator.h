@@ -115,6 +115,7 @@ public:
         m_module = std::make_unique<Module>(moduleName, ctx);
 
         ImportUsedModules(ast, moduleTable);
+        RegisterAliases(ast);
         RegisterEnums(ast);
         RegisterStructs(ast);
         DeclareUserFunctions(ast);
@@ -158,6 +159,7 @@ private:
                 ImportModuleRecursively(use->name, moduleTable);
         }
         
+        ImportModuleAliases(module);
         ImportModuleEnums(module);
         ImportModuleStructs(module);
         ImportModuleGlobals(module);
@@ -241,6 +243,19 @@ private:
                 RegisterStruct(decl.get());
     }
 
+    void RegisterAliases(const ModuleAST& ast)
+    {
+        for (const auto& decl : ast.aliases)
+            m_aliases[decl->name] = decl.get();
+    }
+
+    void ImportModuleAliases(const ModuleAST& module)
+    {
+        for (const auto& decl : module.aliases)
+            if (decl->is_pub)
+                m_aliases[decl->name] = decl.get();
+    }
+
     void RegisterEnum(const EnumDecl* decl)
     {
         EnumInfo info;
@@ -276,7 +291,8 @@ private:
     void RegisterStruct(const StructDecl* decl)
     {
         auto* structType = StructType::create(m_context, decl->name);
-        StructInfo info;
+
+        StructInfo& info = m_structs[decl->name];
         info.type = structType;
 
         std::vector<Type*> memberTypes;
@@ -292,7 +308,6 @@ private:
         }
 
         structType->setBody(memberTypes, decl->is_packed);
-        m_structs[decl->name] = info;
     }
 
     unsigned ResolveFieldIndex(const StructInfo& info, const FieldInit& fi, unsigned positionalIndex, uint32_t line)
@@ -314,7 +329,17 @@ private:
             TypeInfo type;
             Constant* initializer = nullptr;
             
-            if (decl->type)
+            if (decl->type && HasInferredDimension(decl->type.get()))
+            {
+                auto* arrInit = dynamic_cast<ArrayInit*>(decl->init.get());
+                if (!arrInit)
+                    Error("Array size can only be inferred from an array literal initializer", decl->line);
+
+                type = ResolveTypeWithInferredSize(decl->type.get(), arrInit->elements.size());
+                TypedValue initValue = EvaluateConstantExpr(decl->init.get(), &type);
+                initializer = cast<Constant>(initValue.value);
+            }
+            else if (decl->type)
             {
                 type = ResolveType(decl->type.get());
                 if (decl->init)
@@ -816,6 +841,51 @@ private:
         return false;
     }
 
+    bool HasInferredDimension(TypeNode* node)
+    {
+        for (int dim : node->array_dimensions)
+            if (dim == -1)
+                return true;
+        return false;
+    }
+
+    TypeInfo ResolveTypeWithInferredSize(TypeNode* node, size_t inferredSize)
+    {
+        if (node->array_dimensions.size() != 1)
+            Error("Array size inference only supports a single dimension", node->line);
+
+        if (node->array_dimensions[0] != -1)
+            Error("Array size inference requested but dimension is not inferred", node->line);
+
+        if (node->is_function_type)
+        {
+            TypeInfo returnType = node->return_type ?
+                ResolveType(node->return_type.get()) :
+                TypeInfo(Type::getVoidTy(m_context), false);
+
+            FunctionInfo funcInfo;
+            funcInfo.isVarArg = false;
+            funcInfo.function = nullptr;
+            funcInfo.returnType = returnType;
+
+            std::vector<Type*> paramLLVMTypes;
+            for (const auto& paramType : node->param_types)
+            {
+                TypeInfo paramInfo = ResolveType(paramType.get());
+                funcInfo.paramTypes.push_back(paramInfo);
+                paramLLVMTypes.push_back(paramInfo.llvmType);
+            }
+
+            auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, false);
+            Type* arrayType = ArrayType::get(m_builder.getPtrTy(), inferredSize);
+            return TypeInfo(arrayType, false, node->is_const, funcType, std::make_shared<FunctionInfo>(funcInfo));
+        }
+
+        TypeInfo baseType = ResolveSimpleType(node);
+        Type* arrayType = ArrayType::get(baseType.llvmType, inferredSize);
+        return TypeInfo(arrayType, baseType.isUnsigned, false, nullptr, nullptr, baseType.pointerConst);
+    }
+
     void GenerateVarDeclHosingAlloc(VarDecl *decl)
     {
         if (IsVariableAccessibleInCurrentScope(decl->name))
@@ -823,7 +893,15 @@ private:
 
         TypeInfo type;
         
-        if (decl->type)
+        if (decl->type && HasInferredDimension(decl->type.get()))
+        {
+            auto* arrInit = dynamic_cast<ArrayInit*>(decl->init.get());
+            if (!arrInit)
+                Error("Array size can only be inferred from an array literal initializer", decl->line);
+
+            type = ResolveTypeWithInferredSize(decl->type.get(), arrInit->elements.size());
+        }
+        else if (decl->type)
         {
             type = ResolveType(decl->type.get());
         }
@@ -834,7 +912,7 @@ private:
         }
         else
             Error("Variable '" + decl->name + "' must have either a type or an initializer", decl->line);
-        
+
         std::string scopedName = decl->name + '.' + std::to_string(m_currentScope);
         auto* alloca = m_builder.CreateAlloca(type.llvmType, nullptr, scopedName);
         m_locals[scopedName] = Variable(type, alloca, decl->type ? decl->type->is_const : false);
@@ -1407,6 +1485,21 @@ private:
             }
             
             Variable var = LookupVariable(id->name, id->line);
+
+            if (var.type.llvmType->isArrayTy())
+            {
+                auto* arrayType = cast<ArrayType>(var.type.llvmType);
+                Value* decayed = m_builder.CreateInBoundsGEP(
+                    arrayType, var.storage,
+                    {m_builder.getInt64(0), m_builder.getInt64(0)}
+                );
+                TypeInfo ptrType(
+                    m_builder.getPtrTy(), var.type.isUnsigned, var.type.isConst,
+                    arrayType->getElementType(), nullptr, {var.type.isConst}
+                );
+                return TypedValue(decayed, ptrType);
+            }
+
             return TypedValue(m_builder.CreateLoad(var.type.llvmType, var.storage), var.type);
         }
         
@@ -2304,6 +2397,62 @@ private:
         return ResolveSimpleType(node);
     }
 
+    TypeInfo ApplyPointerDepth(TypeInfo base, TypeNode* node)
+    {
+        if (node->pointer_depth <= 0)
+            return base;
+
+        Type* pointeeType = base.llvmType->isVoidTy() ? m_builder.getInt8Ty() : base.llvmType;
+
+        std::vector<bool> ptrConst = node->pointer_const;
+        bool topLevelConst = !ptrConst.empty() ? ptrConst.back() : false;
+
+        return TypeInfo(m_builder.getPtrTy(), false, topLevelConst, pointeeType, nullptr, ptrConst);
+    }
+
+    TypeInfo ApplyArrayDimensions(TypeInfo base, TypeNode* node)
+    {
+        if (node->array_dimensions.empty())
+            return base;
+
+        Type* type = base.llvmType;
+        for (size_t dim : node->array_dimensions)
+            type = ArrayType::get(type, dim);
+        return TypeInfo(type, base.isUnsigned, false, nullptr, nullptr, base.pointerConst);
+    }
+
+    TypeInfo ResolveAliasedType(TypeNode* useNode, AliasDecl* alias)
+    {
+        if (std::find(m_aliasResolutionStack.begin(), m_aliasResolutionStack.end(), alias->name) != m_aliasResolutionStack.end())
+        {
+            std::string cycle;
+            for (const auto& n : m_aliasResolutionStack) cycle += n + " -> ";
+            cycle += alias->name;
+            Error("Circular type alias detected: " + cycle, useNode->line);
+        }
+
+        m_aliasResolutionStack.push_back(alias->name);
+        TypeInfo resolved;
+        try
+        {
+            resolved = ResolveType(alias->target.get());
+        }
+        catch (...)
+        {
+            m_aliasResolutionStack.pop_back();
+            throw;
+        }
+        m_aliasResolutionStack.pop_back();
+
+        resolved = ApplyPointerDepth(resolved, useNode);
+        resolved = ApplyArrayDimensions(resolved, useNode);
+
+        if (useNode->is_const)
+            resolved.isConst = true;
+
+        return resolved;
+    }
+
     TypeInfo ResolveSimpleType(TypeNode* node)
     {
         Type* baseType = nullptr;
@@ -2326,6 +2475,13 @@ private:
                 baseType = enumIt->second.baseType.llvmType;
                 isUnsigned = enumIt->second.baseType.isUnsigned;
             }
+        }
+
+        if (!baseType)
+        {
+            auto aliasIt = m_aliases.find(node->name);
+            if (aliasIt != m_aliases.end())
+                return ResolveAliasedType(node, aliasIt->second);
         }
 
         if (!baseType)
@@ -2634,6 +2790,8 @@ private:
     std::unordered_map<std::string, FunctionInfo> m_functions;
     std::unordered_map<std::string, StructInfo> m_structs;
     std::unordered_map<std::string, EnumInfo> m_enums;
+    std::unordered_map<std::string, AliasDecl*> m_aliases;
+    std::vector<std::string> m_aliasResolutionStack;
     std::unordered_map<std::string, Variable> m_locals;
     std::unordered_map<std::string, Variable> m_globals;
     
