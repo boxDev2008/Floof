@@ -308,6 +308,13 @@ static void cmdBuild(const fs::path& dir, const std::set<std::string> &cliFlags 
 
     auto cfg = BuildConfig::load(dir / "build.toml");
     cfg.flags.insert(cliFlags.begin(), cliFlags.end());
+#if defined(_WIN32)
+    cfg.flags.insert("platform_windows");
+#elif defined(__APPLE__)
+    cfg.flags.insert("platform_macos");
+#else
+    cfg.flags.insert("platform_linux");
+#endif
 
     auto modules = parseSourceFiles(dir / "src", AttributeFilter(cfg.flags));
     auto tm = std::unique_ptr<llvm::TargetMachine>(makeTargetMachine());

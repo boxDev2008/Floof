@@ -3,9 +3,15 @@ workspace "Floof"
     configurations { "Debug", "Release" }
     startproject "floof"
 
-local llvm_prefix = os.getenv("LLVM_DIR")
-local llvm_libdir = llvm_prefix .. "/lib"
-local llvm_includedir = llvm_prefix .. "/include"
+local llvm_prefix
+local llvm_libdir
+local llvm_includedir
+
+if os.host() == "windows" then
+    llvm_prefix = os.getenv("LLVM_DIR")
+    llvm_libdir = path.join(llvm_prefix, "lib")
+    llvm_includedir = path.join(llvm_prefix, "include")
+end
 
 outputdir = "%{cfg.buildcfg}-%{cfg.system}-%{cfg.architecture}"
 
@@ -26,18 +32,16 @@ project "floof"
 
     includedirs {
         "src",
-        "src/vendor",
-        llvm_includedir
-    }
-
-    libdirs {
-        llvm_libdir
+        "src/vendor"
     }
 
     filter "system:windows"
+        includedirs { llvm_includedir }
+        libdirs { llvm_libdir }
+
         systemversion "latest"
         defines { "_CRT_SECURE_NO_WARNINGS" }
-        
+
         links {
             "LLVMCore",
             "LLVMSupport",
@@ -69,7 +73,7 @@ project "floof"
             "LLVMDebugInfoCodeView",
             "LLVMDebugInfoMSF",
             "LLVMDebugInfoDWARF",
-            "LLVMDebugInfoDWARFLowLevel",    -- DWARFExpression, UnwindLocation, CFIProgram extensions (split from LLVMDebugInfoDWARF in LLVM 19)
+            "LLVMDebugInfoDWARFLowLevel",
             "LLVMGlobalISel",
             "LLVMBinaryFormat",
             "LLVMRemarks",
@@ -82,14 +86,14 @@ project "floof"
             "LLVMObjCARCOpts",
             "LLVMPasses",
             "LLVMCFGuard",
-            "LLVMInstrumentation",  -- For ASan support
-            "LLVMipo",              -- Interprocedural optimizations (may contain these symbols)
-            "LLVMTargetParser",     -- Triple, SubtargetFeatures, getDefaultTargetTriple (split from LLVMSupport in LLVM 17)
-            "LLVMIRPrinter",        -- PrintFunctionPass (split out in LLVM 17)
-            "LLVMCodeGenTypes",     -- LLT constructor/print (split out in LLVM 19)
-            "LLVMCGData",           -- CodeGenData, StableFunctionMap, OutlinedHashTree (new in LLVM 19)
+            "LLVMInstrumentation",
+            "LLVMipo",
+            "LLVMTargetParser",
+            "LLVMIRPrinter",
+            "LLVMCodeGenTypes",
+            "LLVMCGData",
             "version",
-            "ntdll"  -- For RtlGetLastNtStatus
+            "ntdll"
         }
 
     filter "system:linux"
@@ -97,16 +101,11 @@ project "floof"
 
         links {
             "LLVM",
-
             "pthread",
             "dl",
             "z",
             "m",
             "tinfo"
-        }
-
-        linkoptions {
-            "-Wl,-rpath," .. llvm_libdir
         }
 
         defines {
@@ -131,3 +130,5 @@ project "floof"
         symbols "off"
         optimize "Full"
         flags { "LinkTimeOptimization" }
+
+    filter {}

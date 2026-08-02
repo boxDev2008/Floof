@@ -5,6 +5,7 @@
 #include <memory>
 #include <stdexcept>
 #include <cstdint>
+#include <algorithm>
 
 #include "Lexer.h"
 
@@ -13,14 +14,8 @@ struct ASTNode {
     uint32_t line = 0;
 };
 
-enum AttributeType : uint8_t {
-    ATTRIBUTE_TYPE_PLATFORM,
-    ATTRIBUTE_TYPE_WHEN
-};
-
 struct Attribute {
-    std::set<std::string> arguments;
-    AttributeType type;
+    std::set<std::string> flags;
 };
 
 typedef std::vector<Attribute> AttributeList;
@@ -62,6 +57,10 @@ struct StringLiteral : ExprNode {
 
 struct CharLiteral : ExprNode {
     std::string value;
+};
+
+struct BoolLiteral : ExprNode {
+    bool value;
 };
 
 struct Identifier : ExprNode {
@@ -254,6 +253,7 @@ struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<ProcDecl>> procs;
 };
 
+// AFTER
 class AttributeFilter
 {
 public:
@@ -270,45 +270,12 @@ public:
 private:
     const std::set<std::string> &m_flags;
 
-    bool ShouldKeepAttribute(const Attribute& attr) const
-    {
-        switch (attr.type)
-        {
-            case ATTRIBUTE_TYPE_PLATFORM:
-                return std::find(attr.arguments.begin(), attr.arguments.end(), CurrentPlatformName())
-                       != attr.arguments.end();
-
-            case ATTRIBUTE_TYPE_WHEN:
-                for (const auto& flag : attr.arguments)
-                    if (std::find(m_flags.begin(), m_flags.end(), flag) == m_flags.end())
-                        return false;
-                return true;
-        }
-        return true;
-    }
-
     bool ShouldKeepItem(const AttributeList& attributes) const
     {
-        bool hasPlatform = false;
-        bool platformPassed = false;
-
         for (const auto& attr : attributes)
-        {
-            if (attr.type == ATTRIBUTE_TYPE_PLATFORM)
-            {
-                hasPlatform = true;
-                if (ShouldKeepAttribute(attr))
-                    platformPassed = true;
-            }
-            else
-            {
-                if (!ShouldKeepAttribute(attr))
+            for (const auto& flag : attr.flags)
+                if (m_flags.find(flag) == m_flags.end())
                     return false;
-            }
-        }
-
-        if (hasPlatform && !platformPassed)
-            return false;
 
         return true;
     }
@@ -324,17 +291,6 @@ private:
                 }),
             items.end());
     }
-
-    constexpr const char *CurrentPlatformName(void) const
-    {
-    #if defined(_WIN32)
-        return "windows";
-    #elif defined(__APPLE__)
-        return "macos";
-    #else
-        return "linux";
-    #endif
-    }
 };
 
 class Parser {
@@ -344,38 +300,19 @@ public:
         Advance();
     }
 
-    AttributeType AttributeTypeFromName(const std::string &name)
-    {
-        if (name == "platform") return ATTRIBUTE_TYPE_PLATFORM;
-        if (name == "when")     return ATTRIBUTE_TYPE_WHEN;
-
-        throw std::runtime_error("Unknown attribute '" + name + "' on line " +
-            std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
-    }
-
     AttributeList ParseAttributeList(void)
     {
         AttributeList attributes;
 
-        while (Match('['))
+        while (Match('@'))
         {
-            Expect(TokenType_Identifier, "Expected attribute name after '['");
             Attribute attr;
-            attr.type = AttributeTypeFromName(m_last.value);
 
-            if (Match('('))
-            {
-                if (!Check(')'))
-                {
-                    do {
-                        Expect(TokenType_Identifier, "Expected attribute argument");
-                        attr.arguments.insert(m_last.value);
-                    } while (Match(','));
-                }
-                Expect(')', "Expected ')' after attribute arguments");
-            }
+            do {
+                Expect(TokenType_Identifier, "Expected flag name after '@'");
+                attr.flags.insert(m_last.value);
+            } while (Match(','));
 
-            Expect(']', "Expected ']' after attribute");
             attributes.push_back(std::move(attr));
         }
 
@@ -899,6 +836,14 @@ public:
         if (Match(TokenType_Identifier))
         {
             std::string name = m_last.value;
+
+            if (name == "true" || name == "false")
+            {
+                auto boolLit = std::make_unique<BoolLiteral>();
+                boolLit->line = primaryLine;
+                boolLit->value = (name == "true");
+                return boolLit;
+            }
 
             if (name == "sizeof" && Match('('))
             {

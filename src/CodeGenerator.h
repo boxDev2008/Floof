@@ -418,6 +418,15 @@ private:
             auto* val = m_builder.getInt8(charValue);
             return TypedValue(val, TypeInfo(m_builder.getInt8Ty(), false));
         }
+
+        if (auto* boolLit = dynamic_cast<BoolLiteral*>(node))
+        {
+            auto* val = m_builder.getInt1(boolLit->value);
+            TypedValue result(val, TypeInfo(m_builder.getInt1Ty(), false));
+            if (expectedType && result.type != *expectedType)
+                return TypedValue(ConstantCast(llvm::cast<Constant>(val), result.type, *expectedType, node->line), *expectedType);
+            return result;
+        }
         
         if (auto* cast = dynamic_cast<CastExpr*>(node))
         {
@@ -1417,6 +1426,12 @@ private:
             return TypedValue(val, TypeInfo(m_builder.getInt8Ty(), false));
         }
 
+        if (auto* boolLit = dynamic_cast<BoolLiteral*>(node))
+        {
+            auto* val = m_builder.getInt1(boolLit->value);
+            return TypedValue(val, TypeInfo(m_builder.getInt1Ty(), false));
+        }
+
         if (auto* arr = dynamic_cast<ArrayAccess*>(node))
         {
             TypedValue ptr = EvaluateLValue(arr);
@@ -2050,33 +2065,28 @@ private:
                 else
                     Error("Cannot assign to constant expression", binary->line);
             }
-
             if (lhs.type.llvmType->isArrayTy() || lhs.type.llvmType->isStructTy())
             {
-                bool isInitializer = dynamic_cast<StructInit*>(binary->right.get()) != nullptr ||
-                                    dynamic_cast<ArrayInit*>(binary->right.get()) != nullptr;
-                
-                TypedValue rhs = isInitializer 
+                bool rhsIsAggregateRValue = dynamic_cast<StructInit*>(binary->right.get()) != nullptr ||
+                                            dynamic_cast<ArrayInit*>(binary->right.get()) != nullptr ||
+                                            dynamic_cast<CallExpr*>(binary->right.get()) != nullptr ||
+                                            dynamic_cast<TernaryExpr*>(binary->right.get()) != nullptr;
+
+                TypedValue rhs = rhsIsAggregateRValue 
                     ? EvaluateRValue(binary->right.get())
                     : EvaluateLValue(binary->right.get());
                 
                 if (rhs.type != lhs.type)
                     Error("Type mismatch in aggregate assignment", binary->line);
                 
-                if (isInitializer) {
+                if (rhsIsAggregateRValue) {
                     auto* tempAlloca = m_builder.CreateAlloca(rhs.type.llvmType, nullptr, "temp_aggregate");
                     m_builder.CreateStore(rhs.value, tempAlloca);
                     rhs.value = tempAlloca;
                 }
                 
                 uint64_t size = m_module->getDataLayout().getTypeAllocSize(lhs.type.llvmType);
-                m_builder.CreateMemCpy(
-                    lhs.value,
-                    MaybeAlign(),
-                    rhs.value,
-                    MaybeAlign(),
-                    size
-                );
+                m_builder.CreateMemCpy(lhs.value, MaybeAlign(), rhs.value, MaybeAlign(), size);
                 
                 return rhs;
             }
@@ -2483,9 +2493,31 @@ private:
 
     TypedValue EnsureBooleanType(TypedValue value, uint32_t line = 0)
     {
-        if (value.type.llvmType->isIntegerTy(1))
+        Type* type = value.type.llvmType;
+
+        if (type->isIntegerTy(1))
             return value;
-        return CastValue(value, TypeInfo(m_builder.getInt1Ty(), false), line);
+
+        if (type->isIntegerTy())
+        {
+            Value* cmp = m_builder.CreateICmpNE(value.value, ConstantInt::get(type, 0));
+            return TypedValue(cmp, TypeInfo(m_builder.getInt1Ty(), false));
+        }
+
+        if (type->isFloatingPointTy())
+        {
+            Value* cmp = m_builder.CreateFCmpUNE(value.value, ConstantFP::get(type, 0.0));
+            return TypedValue(cmp, TypeInfo(m_builder.getInt1Ty(), false));
+        }
+
+        if (type->isPointerTy())
+        {
+            Value* cmp = m_builder.CreateICmpNE(
+                value.value, ConstantPointerNull::get(cast<PointerType>(type)));
+            return TypedValue(cmp, TypeInfo(m_builder.getInt1Ty(), false));
+        }
+
+        Error("Cannot convert type to boolean", line);
     }
     
     Variable LookupVariable(const std::string& name, uint32_t line = 0)

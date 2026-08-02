@@ -5,6 +5,7 @@
   "patterns": [
     { "include": "#comments" },
     { "include": "#strings" },
+    { "include": "#attributes" },
     { "include": "#keywords" },
     { "include": "#function-declaration" },
     { "include": "#types" },
@@ -42,6 +43,28 @@
         }
       ]
     },
+    "attributes": {
+      "patterns": [
+        {
+          "name": "meta.attribute.flooflang",
+          "begin": "@",
+          "beginCaptures": {
+            "0": { "name": "punctuation.definition.attribute.flooflang" }
+          },
+          "end": "$",
+          "patterns": [
+            {
+              "name": "entity.other.attribute-name.flooflang",
+              "match": "[a-zA-Z_][a-zA-Z0-9_]*"
+            },
+            {
+              "name": "punctuation.separator.comma.flooflang",
+              "match": ","
+            }
+          ]
+        }
+      ]
+    },
     "keywords": {
       "patterns": [
         {
@@ -51,6 +74,10 @@
         {
           "name": "keyword.other.flooflang",
           "match": "\\b(using|pub|proc|struct|enum|const|extern|packed)\\b"
+        },
+        {
+          "name": "constant.language.boolean.flooflang",
+          "match": "\\b(true|false)\\b"
         }
       ]
     },
