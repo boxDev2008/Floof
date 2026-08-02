@@ -162,6 +162,17 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
     return modules;
 }
 
+static std::set<std::string> collectRequiredLibraries(const std::map<std::string, std::unique_ptr<ModuleAST>>& modules)
+{
+    std::set<std::string> libs;
+
+    for (const auto& [name, module] : modules)
+        for (const auto& req : module->requires_)
+            libs.insert(req->library);
+
+    return libs;
+}
+
 static std::string compileModule(
     const std::string& name,
     const ModuleAST& ast,
@@ -253,7 +264,8 @@ static std::string compileAll(
     return objectFiles;
 }
 
-static void link(const std::string& objectFiles, const BuildConfig& cfg, const fs::path& projectDir)
+static void link(const std::string& objectFiles, const BuildConfig& cfg, const fs::path& projectDir,
+                  const std::set<std::string>& requiredLibraries)
 {
     std::string exe = cfg.projectName;
 #ifdef _WIN32
@@ -261,8 +273,9 @@ static void link(const std::string& objectFiles, const BuildConfig& cfg, const f
 #endif
     std::string cmd = "clang -o " + (projectDir / "build" / exe).string() + " " + objectFiles;
     if (cfg.isDebug) cmd += " -g -O0";
-    for (const auto& l : cfg.libraries)    cmd += " -l" + l;
-    for (const auto& p : cfg.libraryPaths) cmd += " -L" + p;
+    for (const auto& l : cfg.libraries)      cmd += " -l" + l;
+    for (const auto& l : requiredLibraries)  cmd += " -l" + l;
+    for (const auto& p : cfg.libraryPaths)   cmd += " -L" + p;
 
     std::cout << C::DIM << "  └─ " << C::RESET << "Linking...";
     auto t0 = Clock::now();
@@ -317,10 +330,11 @@ static void cmdBuild(const fs::path& dir, const std::set<std::string> &cliFlags 
 #endif
 
     auto modules = parseSourceFiles(dir / "src", AttributeFilter(cfg.flags));
+    auto requiredLibraries = collectRequiredLibraries(modules);
     auto tm = std::unique_ptr<llvm::TargetMachine>(makeTargetMachine());
     auto objectFiles = compileAll(modules, tm.get(), dir);
 
-    link(objectFiles, cfg, dir);
+    link(objectFiles, cfg, dir, requiredLibraries);
 
     double total = Seconds(Clock::now() - t0).count();
     std::cout << "\n" << C::BGREEN << "✓ " << C::BOLD << "Build completed successfully! " << C::DIM << '(' << fmtSeconds(total) << ")\n\n" << C::RESET;

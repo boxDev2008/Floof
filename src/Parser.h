@@ -245,6 +245,11 @@ struct UsingDecl : ASTNode {
     bool is_pub = false;
 };
 
+struct RequireDecl : ASTNode {
+    std::string library;
+    AttributeList attributes;
+};
+
 struct AliasDecl : ASTNode {
     std::string name;
     std::unique_ptr<TypeNode> target;
@@ -258,6 +263,7 @@ struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<AliasDecl>> aliases;
     std::vector<std::unique_ptr<GlobalVarDecl>> globals;
     std::vector<std::unique_ptr<ProcDecl>> procs;
+    std::vector<std::unique_ptr<RequireDecl>> requires_;
 };
 
 class AttributeFilter
@@ -271,6 +277,7 @@ public:
         FilterItems(module.structs);
         FilterItems(module.enums);
         FilterItems(module.procs);
+        FilterItems(module.requires_);
     }
 
 private:
@@ -378,6 +385,16 @@ public:
                     }
                     Expect(';', "Expected ';' after using declaration");
                     module->usings.push_back(std::move(using_decl));
+                }
+                else if (Match("require"))
+                {
+                    auto require_decl = std::make_unique<RequireDecl>();
+                    require_decl->line = declLine;
+                    require_decl->attributes = std::move(attributes);
+                    Expect(TokenType_String, "Expected library name string after 'require'");
+                    require_decl->library = m_last.value;
+                    Expect(';', "Expected ';' after require declaration");
+                    module->requires_.push_back(std::move(require_decl));
                 }
                 else if (Check(TokenType_Identifier) && m_current.value == "type" && !PeekIs(':') && Match("type"))
                 {
