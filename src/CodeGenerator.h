@@ -1612,70 +1612,46 @@ private:
 
     TypedValue EvaluateNumberLiteral(NumberLiteral* lit)
     {
-        const std::string &value = lit->value;
-
-        bool isHex = value.size() >= 2 && value[0] == '0' && 
-                    (value[1] == 'x' || value[1] == 'X');
-
-        bool isFloatingPoint = !isHex && (
-            value.find('.') != std::string::npos ||
-            value.find('e') != std::string::npos ||
-            value.find('E') != std::string::npos
-        );
-
-        if (!isFloatingPoint)
+        switch (lit->type)
         {
-            bool isUnsigned = false;
-            bool isLong = false;
-            
-            size_t pos = value.size();
-            while (pos > 0 && !std::isdigit(value[pos - 1]))
+            case NumberType::I32:
             {
-                char c = std::tolower(value[pos - 1]);
-                if (c == 'u') isUnsigned = true;
-                else if (c == 'l') isLong = true;
-                pos--;
-            }
-            
-            std::string numericPart = value.substr(0, pos);
-            int64_t intValue = std::stoll(numericPart, nullptr, 0);
-            
-            if (isLong || intValue > INT32_MAX || intValue < INT32_MIN)
-            {
-                auto* val = m_builder.getInt64(intValue);
-                return TypedValue(val, TypeInfo(m_builder.getInt64Ty(), isUnsigned));
-            }
-            else
-            {
+                int64_t intValue = std::stoll(lit->numeric_part, nullptr, 0);
                 auto* val = m_builder.getInt32((int32_t)intValue);
-                return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), isUnsigned));
+                return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), false));
             }
-        }
-        else
-        {
-            bool isFloat = false;
-            
-            size_t pos = value.size();
-            if (pos > 0 && std::tolower(value[pos - 1]) == 'f')
+            case NumberType::U32:
             {
-                isFloat = true;
-                pos--;
+                int64_t intValue = std::stoll(lit->numeric_part, nullptr, 0);
+                auto* val = m_builder.getInt32((int32_t)intValue);
+                return TypedValue(val, TypeInfo(m_builder.getInt32Ty(), true));
             }
-            
-            std::string numericPart = value.substr(0, pos);
-            double doubleValue = std::stod(numericPart);
-            
-            if (isFloat)
+            case NumberType::I64:
             {
+                int64_t intValue = std::stoll(lit->numeric_part, nullptr, 0);
+                auto* val = m_builder.getInt64(intValue);
+                return TypedValue(val, TypeInfo(m_builder.getInt64Ty(), false));
+            }
+            case NumberType::U64:
+            {
+                int64_t intValue = std::stoll(lit->numeric_part, nullptr, 0);
+                auto* val = m_builder.getInt64(intValue);
+                return TypedValue(val, TypeInfo(m_builder.getInt64Ty(), true));
+            }
+            case NumberType::F32:
+            {
+                double doubleValue = std::stod(lit->numeric_part);
                 auto* val = ConstantFP::get(m_builder.getFloatTy(), (float)doubleValue);
                 return TypedValue(val, TypeInfo(m_builder.getFloatTy(), false));
             }
-            else
+            case NumberType::F64:
             {
+                double doubleValue = std::stod(lit->numeric_part);
                 auto* val = ConstantFP::get(m_builder.getDoubleTy(), doubleValue);
                 return TypedValue(val, TypeInfo(m_builder.getDoubleTy(), false));
             }
         }
+        Error("Unknown number literal type", lit->line);
     }
 
     TypedValue EvaluateStringLiteral(::StringLiteral* lit)

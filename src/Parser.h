@@ -47,8 +47,19 @@ struct UnaryExpr : ExprNode {
     bool is_prefix;
 };
 
+enum class NumberType {
+    I32,
+    I64,
+    U32,
+    U64,
+    F32,
+    F64
+};
+
 struct NumberLiteral : ExprNode {
     std::string value;
+    std::string numeric_part;
+    NumberType type;
 };
 
 struct StringLiteral : ExprNode {
@@ -465,9 +476,11 @@ public:
         if (Match("const"))
             type->is_const = true;
         
-        if (Match('('))
+        if (Match("proc"))
         {
             type->is_function_type = true;
+
+            Expect('(', "Expected '(' after 'proc' in function type");
             
             if (!Check(')'))
             {
@@ -827,6 +840,57 @@ public:
         return expr;
     }
 
+    NumberType ClassifyNumberLiteral(const std::string& value, std::string& outNumericPart)
+    {
+        bool isHex = value.size() >= 2 && value[0] == '0' &&
+                    (value[1] == 'x' || value[1] == 'X');
+
+        bool isFloatingPoint = !isHex && (
+            value.find('.') != std::string::npos ||
+            value.find('e') != std::string::npos ||
+            value.find('E') != std::string::npos
+        );
+
+        if (!isFloatingPoint)
+        {
+            bool isUnsigned = false;
+            bool isLong = false;
+
+            size_t pos = value.size();
+            while (pos > 0 && !std::isdigit((unsigned char)value[pos - 1]))
+            {
+                char c = std::tolower((unsigned char)value[pos - 1]);
+                if (c == 'u') isUnsigned = true;
+                else if (c == 'l') isLong = true;
+                pos--;
+            }
+
+            outNumericPart = value.substr(0, pos);
+            int64_t intValue = std::stoll(outNumericPart, nullptr, 0);
+
+            bool needsLong = isLong || intValue > INT32_MAX || intValue < INT32_MIN;
+
+            if (needsLong)
+                return isUnsigned ? NumberType::U64 : NumberType::I64;
+            else
+                return isUnsigned ? NumberType::U32 : NumberType::I32;
+        }
+        else
+        {
+            bool isFloat = false;
+
+            size_t pos = value.size();
+            if (pos > 0 && std::tolower((unsigned char)value[pos - 1]) == 'f')
+            {
+                isFloat = true;
+                pos--;
+            }
+
+            outNumericPart = value.substr(0, pos);
+            return isFloat ? NumberType::F32 : NumberType::F64;
+        }
+    }
+
     std::unique_ptr<ExprNode> ParsePrimary(void)
     {
         uint32_t primaryLine = CurrentLine();
@@ -836,6 +900,7 @@ public:
             auto num = std::make_unique<NumberLiteral>();
             num->line = primaryLine;
             num->value = m_last.value;
+            num->type = ClassifyNumberLiteral(m_last.value, num->numeric_part);
             return num;
         }
         
