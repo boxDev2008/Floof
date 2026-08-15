@@ -396,7 +396,7 @@ public:
                     Expect(';', "Expected ';' after require declaration");
                     module->requires_.push_back(std::move(require_decl));
                 }
-                else if (Check(TokenType_Identifier) && m_current.value == "type" && !PeekIs(':') && Match("type"))
+                else if (Check(TokenType_Identifier) && m_current.value == "typename" && !PeekIs(':') && Match("typename"))
                 {
                     std::unique_ptr<AliasDecl> alias = std::make_unique<AliasDecl>();
                     alias->line = declLine;
@@ -1358,43 +1358,42 @@ public:
         proc->line = m_lexer.GetCurrentLine();
         proc->is_extern = is_extern;
 
-        if (Match('('))
+        // if (Match('('))
+        Expect('(', "Expected '(' after proc name");
+        bool hasDefault = false;
+        while (!Match(')'))
         {
-            bool hasDefault = false;
-            while (!Match(')'))
+            if ((Match('.') && Match('.') && Match('.')))
             {
-                if ((Match('.') && Match('.') && Match('.')))
+                proc->is_vararg = true;
+                Expect(')', "Expected ')' after '...'");
+                break;
+            }
+
+            if (Match(TokenType_Identifier))
+            {
+                Parameter param;
+                param.name = m_last.value;
+                Expect(':', "Expected ':'");
+                param.type = ParseType();
+
+                if (Match('='))
                 {
-                    proc->is_vararg = true;
-                    Expect(')', "Expected ')' after '...'");
-                    break;
+                    param.default_value = ParseExpr();
+                    hasDefault = true;
+                }
+                else if (hasDefault)
+                {
+                    throw std::runtime_error(
+                        "Required parameter '" + param.name + "' cannot follow a parameter"
+                        " with a default value on line " + std::to_string(m_lexer.GetCurrentLine())
+                        + " in module " + m_moduleName);
                 }
 
-                if (Match(TokenType_Identifier))
-                {
-                    Parameter param;
-                    param.name = m_last.value;
-                    Expect(':', "Expected ':'");
-                    param.type = ParseType();
+                proc->params.push_back(std::move(param));
 
-                    if (Match('='))
-                    {
-                        param.default_value = ParseExpr();
-                        hasDefault = true;
-                    }
-                    else if (hasDefault)
-                    {
-                        throw std::runtime_error(
-                            "Required parameter '" + param.name + "' cannot follow a parameter"
-                            " with a default value on line " + std::to_string(m_lexer.GetCurrentLine())
-                            + " in module " + m_moduleName);
-                    }
-
-                    proc->params.push_back(std::move(param));
-
-                    if (!Check(')'))
-                        Expect(',', "Expected ',' or ')' after parameter");
-                }
+                if (!Check(')'))
+                    Expect(',', "Expected ',' or ')' after parameter");
             }
         }
 
