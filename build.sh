@@ -10,7 +10,7 @@ case "$CONFIG" in
         OUTDIR="bin/Debug-Linux-x64"
         ;;
     Release)
-        CXXFLAGS="-O3 -DNDEBUG -flto"
+        CXXFLAGS="-O2 -DNDEBUG -flto"
         OUTDIR="bin/Release-Linux-x64"
         ;;
     *)
