@@ -95,7 +95,7 @@ struct BuildConfig
     }
 };
 
-constexpr const char* MAIN_FLOOF = R"(pub proc main -> i32 {
+constexpr const char* MAIN_FLOOF = R"(pub proc main() -> i32 {
     printf("Hello Floof!\n");
     return 0;
 })";
