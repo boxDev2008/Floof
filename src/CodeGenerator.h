@@ -347,6 +347,14 @@ private:
                     TypedValue initValue = EvaluateConstantExpr(decl->init.get(), &type);
                     initializer = cast<Constant>(initValue.value);
                 }
+                else if (type.llvmType->isStructTy() && FindStructInfo(type.llvmType))
+                {
+                    StructInit emptyInit;
+                    emptyInit.type_name = StructNameFor(type.llvmType);
+                    emptyInit.line = decl->line;
+                    TypedValue initValue = EvaluateConstantExpr(&emptyInit, &type);
+                    initializer = cast<Constant>(initValue.value);
+                }
                 else
                     initializer = Constant::getNullValue(type.llvmType);
             }
@@ -1027,7 +1035,20 @@ private:
         Variable& variable = m_locals[scopedName];
         
         if (!decl->init)
+        {
+            if (variable.type.llvmType->isStructTy())
+            {
+                const StructInfo* info = FindStructInfo(variable.type.llvmType);
+                if (info)
+                {
+                    StructInit emptyInit;
+                    emptyInit.type_name = StructNameFor(variable.type.llvmType);
+                    emptyInit.line = decl->line;
+                    InitializeStructInPlace(variable.storage, variable.type, &emptyInit);
+                }
+            }
             return;
+        }
         
         if (auto* arrInit = dynamic_cast<ArrayInit*>(decl->init.get()))
             if (variable.type.llvmType->isArrayTy())

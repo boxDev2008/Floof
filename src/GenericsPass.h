@@ -41,6 +41,7 @@ private:
     std::unordered_map<std::string, ProcDecl *> m_procTemplates;
 
     std::unordered_set<std::string> m_instantiated;
+    std::unordered_set<std::string> m_publicStructs;
 
     struct PendingInstantiation
     {
@@ -61,13 +62,23 @@ private:
         ExtractTemplates();
         ImportUsedTemplates();
 
+        for (auto &global : m_module.globals)
+            if (global->type)
+                m_originalLocalTypesStorage[global->name] = global->type->Clone();
+
         for (auto &proc : m_module.procs)
             ScanAndRewriteProc(proc.get());
 
         LocalTypes noLocals;
         for (auto &global : m_module.globals)
+        {
+            std::unique_ptr<TypeNode> expected = global->type ? global->type->Clone() : nullptr;
+
+            if (global->type)
+                RewriteType(global->type.get(), noLocals, global->is_pub);
             if (global->init)
-                RewriteExpr(global->init.get(), noLocals);
+                RewriteExpr(global->init.get(), noLocals, expected.get());
+        }
 
         while (!m_worklist.empty())
         {
@@ -348,19 +359,19 @@ private:
 
     }
 
-    void RewriteType(TypeNode *type, LocalTypes &locals)
+    void RewriteType(TypeNode *type, LocalTypes &locals, bool forcePublic = false)
     {
         if (!type) return;
 
         if (type->is_function_type)
         {
-            if (type->return_type) RewriteType(type->return_type.get(), locals);
-            for (auto &p : type->param_types) RewriteType(p.get(), locals);
+            if (type->return_type) RewriteType(type->return_type.get(), locals, forcePublic);
+            for (auto &p : type->param_types) RewriteType(p.get(), locals, forcePublic);
             return;
         }
 
         for (auto &g : type->generic_args)
-            RewriteType(g.get(), locals);
+            RewriteType(g.get(), locals, forcePublic);
 
         if (!type->generic_args.empty())
         {
@@ -379,6 +390,8 @@ private:
                     " on line " + std::to_string(type->line) + " in module " + m_moduleName);
 
             std::string mangled = MangleName(type->name, type->generic_args);
+            if (forcePublic)
+                m_publicStructs.insert(mangled);
             EnqueueStruct(type->name, CloneTypeList(type->generic_args));
 
             type->name = mangled;
@@ -668,11 +681,13 @@ private:
         StructDecl *tmpl = m_structTemplates.at(templateName);
         auto subst = BuildSubstitution(tmpl->generic_params, args);
 
+        bool isPublic = m_publicStructs.count(mangled) > 0;
+
         auto decl = std::make_unique<StructDecl>();
         decl->name = mangled;
         decl->line = tmpl->line;
         decl->is_packed = tmpl->is_packed;
-        decl->is_pub = false;
+        decl->is_pub = isPublic;
 
         for (auto &field : tmpl->fields)
         {
@@ -690,7 +705,7 @@ private:
 
         LocalTypes noLocals;
         for (auto &field : inserted->fields)
-            RewriteType(field->type.get(), noLocals);
+            RewriteType(field->type.get(), noLocals, isPublic);
     }
 
     void InstantiateProc(const std::string &templateName, const std::string &mangled,
