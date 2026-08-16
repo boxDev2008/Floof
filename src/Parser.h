@@ -30,6 +30,7 @@ struct TypeNode : ASTNode {
     int pointer_depth = 0;
     bool is_const = false;
     bool is_function_type = false;
+    bool is_reference = false;
 
     std::vector<std::unique_ptr<TypeNode>> generic_args;
 
@@ -43,6 +44,7 @@ struct TypeNode : ASTNode {
         copy->pointer_depth = pointer_depth;
         copy->is_const = is_const;
         copy->is_function_type = is_function_type;
+        copy->is_reference = is_reference;
         if (return_type) copy->return_type = return_type->Clone();
         for (const auto& p : param_types) copy->param_types.push_back(p->Clone());
         for (const auto& g : generic_args) copy->generic_args.push_back(g->Clone());
@@ -578,6 +580,17 @@ public:
                 type->pointer_const.push_back(false);
         }
 
+        if (Match('&'))
+        {
+            if (type->pointer_depth > 0)
+                throw std::runtime_error("Cannot combine '&' with '*' on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
+
+            type->is_reference = true;
+
+            if (Match('&'))
+                throw std::runtime_error("Cannot declare a reference to a reference ('&&') on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
+        }
+
         while (Match('['))
         {
             if (Match(']'))
@@ -589,6 +602,9 @@ public:
                 Expect(']', "Expected ']'");
             }
         }
+
+        if (type->is_reference && !type->array_dimensions.empty())
+            throw std::runtime_error("Reference to array type is not supported on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
 
         return type;
     }

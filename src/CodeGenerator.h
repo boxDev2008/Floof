@@ -26,13 +26,14 @@ class CodeGenerator
         bool isUnsigned;
         bool isConst;
         std::vector<bool> pointerConst;
-        
+        bool isReference;
+
         std::shared_ptr<FunctionInfo> functionInfo;
 
-        TypeInfo() : llvmType(nullptr), isUnsigned(false), isConst(false), pointeeType(nullptr) {}
+        TypeInfo() : llvmType(nullptr), isUnsigned(false), isConst(false), pointeeType(nullptr), isReference(false) {}
         TypeInfo(Type* t, bool u, bool c = false, Type* pt = nullptr, std::shared_ptr<FunctionInfo> fi = nullptr,
-                std::vector<bool> ptrConst = {}) 
-        : llvmType(t), isUnsigned(u), isConst(c), pointeeType(pt), functionInfo(fi), pointerConst(ptrConst) {}
+                std::vector<bool> ptrConst = {}, bool isRef = false)
+        : llvmType(t), isUnsigned(u), isConst(c), pointeeType(pt), functionInfo(fi), pointerConst(ptrConst), isReference(isRef) {}
 
         bool operator==(const TypeInfo& other) const {
             return llvmType == other.llvmType &&
@@ -778,7 +779,7 @@ private:
         for (const auto& param : proc->params)
         {
             TypeInfo paramType = ResolveType(param.type.get());
-            paramLLVMTypes.push_back(paramType.llvmType);
+            paramLLVMTypes.push_back(paramType.isReference ? m_builder.getPtrTy() : paramType.llvmType);
             paramTypes.push_back(paramType);
             defaultValues.push_back(param.default_value.get());
         }
@@ -787,7 +788,8 @@ private:
             ? ResolveType(proc->return_type.get())
             : TypeInfo(Type::getVoidTy(m_context), false);
 
-        auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, proc->is_vararg);
+        Type* funcReturnLLVMType = returnType.isReference ? m_builder.getPtrTy() : returnType.llvmType;
+        auto* funcType = FunctionType::get(funcReturnLLVMType, paramLLVMTypes, proc->is_vararg);
         auto* func = Function::Create(funcType, linkage, proc->name, m_module.get());
 
         unsigned idx = 0;
@@ -816,9 +818,15 @@ private:
             const Parameter &param = proc->params[idx];
             TypeInfo paramType = funcInfo.paramTypes[idx++];
             std::string name = arg.getName().str() + ".0";
-            auto* alloca = m_builder.CreateAlloca(paramType.llvmType, nullptr, name);
-            m_builder.CreateStore(&arg, alloca);
-            m_locals[name] = Variable(paramType, alloca, param.type->is_const);
+
+            if (paramType.isReference)
+                m_locals[name] = Variable(paramType, &arg, param.type->is_const);
+            else
+            {
+                auto* alloca = m_builder.CreateAlloca(paramType.llvmType, nullptr, name);
+                m_builder.CreateStore(&arg, alloca);
+                m_locals[name] = Variable(paramType, alloca, param.type->is_const);
+            }
         }
         
         GenerateHostingAllocs(proc->body.get());
@@ -898,6 +906,13 @@ private:
     {
         if (IsVariableAccessibleInCurrentScope(decl->name))
             Error("Variable already declared in this scope: " + decl->name, decl->line);
+
+        if (decl->type && decl->type->is_reference)
+        {
+            if (!decl->init)
+                Error("Reference variable '" + decl->name + "' must be initialized", decl->line);
+            return;
+        }
 
         TypeInfo type;
         
@@ -1032,6 +1047,24 @@ private:
     void GenerateVarDecl(VarDecl* decl)
     {
         std::string scopedName = decl->name + '.' + std::to_string(m_currentScope);
+
+        if (decl->type && decl->type->is_reference)
+        {
+            TypeInfo refType = ResolveType(decl->type.get());
+
+            if (auto* unary = dynamic_cast<UnaryExpr*>(decl->init.get()); unary && unary->op == '&' && unary->is_prefix)
+                Error("Reference '" + decl->name + "' binds directly to a value; "
+                      "initialize with the value itself, not '&' - the address is taken automatically", decl->line);
+
+            TypedValue initRef = EvaluateLValue(decl->init.get());
+            if (initRef.type != refType)
+                Error("Cannot bind reference '" + decl->name + "': initializer type mismatch", decl->line);
+
+            refType.isConst = initRef.type.isConst;
+            m_locals[scopedName] = Variable(refType, initRef.value, decl->type->is_const);
+            return;
+        }
+
         Variable& variable = m_locals[scopedName];
         
         if (!decl->init)
@@ -1193,6 +1226,20 @@ private:
     {
         if (stmt->value)
         {
+            if (returnType.isReference)
+            {
+                if (auto* unary = dynamic_cast<UnaryExpr*>(stmt->value.get()); unary && unary->op == '&' && unary->is_prefix)
+                    Error("Function returns a reference; return the value itself, not '&' - "
+                          "the address is taken automatically", stmt->line);
+
+                TypedValue retRef = EvaluateLValue(stmt->value.get());
+                if (retRef.type != returnType)
+                    Error("Cannot return reference: type mismatch", stmt->line);
+
+                m_builder.CreateRet(retRef.value);
+                return;
+            }
+
             TypedValue retValue = EvaluateRValue(stmt->value.get());
             if (retValue.type != returnType)
                 retValue = CastValue(retValue, returnType, stmt->line);
@@ -1772,6 +1819,28 @@ private:
             std::vector<Value*> args;
             for (size_t i = 0; i < funcInfo.paramTypes.size(); i++)
             {
+                const TypeInfo& paramType = funcInfo.paramTypes[i];
+
+                if (paramType.isReference)
+                {
+                    ExprNode* argExpr = (i < call->args.size()) ? call->args[i].get() : funcInfo.defaultValues[i];
+                    if (!argExpr)
+                        Error("Missing argument " + std::to_string(i + 1)
+                            + " and no default value available", line);
+
+                    if (auto* unary = dynamic_cast<UnaryExpr*>(argExpr); unary && unary->op == '&' && unary->is_prefix)
+                        Error("Argument " + std::to_string(i + 1) + " binds to a reference parameter; "
+                              "pass the value directly, not '&' - the address is taken automatically", line);
+
+                    TypedValue argRef = EvaluateLValue(argExpr);
+                    if (argRef.type != paramType)
+                        Error("Cannot bind argument " + std::to_string(i + 1)
+                            + " to reference parameter: type mismatch", line);
+
+                    args.push_back(argRef.value);
+                    continue;
+                }
+
                 TypedValue arg;
                 if (i < call->args.size())
                     arg = EvaluateRValue(call->args[i].get());
@@ -1832,7 +1901,7 @@ private:
                 const FunctionInfo& func = funcIt->second;
                 auto args = buildArgs(func, call->line);
                 auto* result = m_builder.CreateCall(func.function, args);
-                return TypedValue(result, func.returnType);
+                return LoadIfReferenceReturn(result, func.returnType);
             }
 
             Variable var = LookupVariable(ident->name, ident->line);
@@ -1844,7 +1913,7 @@ private:
             Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
             FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
             auto* result = m_builder.CreateCall(funcType, funcPtr, args);
-            return TypedValue(result, funcInfo.returnType);
+            return LoadIfReferenceReturn(result, funcInfo.returnType);
         }
 
         TypedValue calleeValue = EvaluateRValue(call->callee.get());
@@ -1855,7 +1924,17 @@ private:
         auto args = buildArgs(funcInfo, call->line);
         FunctionType* funcType = cast<FunctionType>(calleeValue.type.pointeeType);
         auto* result = m_builder.CreateCall(funcType, calleeValue.value, args);
-        return TypedValue(result, funcInfo.returnType);
+        return LoadIfReferenceReturn(result, funcInfo.returnType);
+    }
+
+    TypedValue LoadIfReferenceReturn(Value* result, const TypeInfo& returnType)
+    {
+        if (!returnType.isReference)
+            return TypedValue(result, returnType);
+
+        TypeInfo valueType = returnType;
+        valueType.isReference = false;
+        return TypedValue(m_builder.CreateLoad(valueType.llvmType, result), valueType);
     }
 
     TypedValue EvaluateArrayAccess(ArrayAccess* access)
@@ -2411,6 +2490,18 @@ private:
         return TypeInfo(m_builder.getPtrTy(), false, topLevelConst, pointeeType, nullptr, ptrConst);
     }
 
+    TypeInfo ApplyReference(TypeInfo base, TypeNode* node)
+    {
+        if (!node->is_reference)
+            return base;
+
+        if (base.llvmType->isVoidTy())
+            Error("Cannot form a reference to 'u0'", node->line);
+
+        base.isReference = true;
+        return base;
+    }
+
     TypeInfo ApplyArrayDimensions(TypeInfo base, TypeNode* node)
     {
         if (node->array_dimensions.empty())
@@ -2447,6 +2538,7 @@ private:
 
         resolved = ApplyPointerDepth(resolved, useNode);
         resolved = ApplyArrayDimensions(resolved, useNode);
+        resolved = ApplyReference(resolved, useNode);
 
         if (useNode->is_const)
             resolved.isConst = true;
@@ -2496,6 +2588,14 @@ private:
             bool topLevelConst = !ptrConst.empty() ? ptrConst.back() : false;
             
             return TypeInfo(m_builder.getPtrTy(), false, topLevelConst, pointeeType, nullptr, ptrConst);
+        }
+
+        if (node->is_reference)
+        {
+            if (baseType->isVoidTy())
+                Error("Cannot form a reference to 'u0'", node->line);
+
+            return TypeInfo(baseType, isUnsigned, node->is_const, nullptr, nullptr, {}, true);
         }
         
         return TypeInfo(baseType, isUnsigned, node->is_const, nullptr, nullptr, {});
