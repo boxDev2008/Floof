@@ -747,15 +747,25 @@ private:
         ProcDecl *inserted = proc.get();
         m_module.procs.push_back(std::move(proc));
 
-        LocalTypes locals;
+        std::vector<std::unique_ptr<TypeNode>> localTypeStorage;
+        LocalTypes bodyLocals;
         for (auto &param : inserted->params)
-            if (param.type) locals[param.name] = param.type.get();
+        {
+            if (!param.type) continue;
+            localTypeStorage.push_back(param.type->Clone());
+            bodyLocals[param.name] = localTypeStorage.back().get();
+        }
+
+        LocalTypes declLocals;
+        for (auto &param : inserted->params)
+            if (param.type) declLocals[param.name] = param.type.get();
+
         if (inserted->return_type)
-            RewriteType(inserted->return_type.get(), locals);
+            RewriteType(inserted->return_type.get(), declLocals);
         for (auto &param : inserted->params)
-            if (param.type) RewriteType(param.type.get(), locals);
+            if (param.type) RewriteType(param.type.get(), declLocals);
         if (inserted->body)
-            RewriteBlock(inserted->body.get(), locals);
+            RewriteBlock(inserted->body.get(), bodyLocals);
     }
 
     static void SubstituteTypesInBlock(BlockStmt *block, const std::unordered_map<std::string, const TypeNode *> &subst)
