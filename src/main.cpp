@@ -1,4 +1,5 @@
 #include "Parser.h"
+#include "GenericsPass.h"
 #include "CodeGenerator.h"
 
 #include <iostream>
@@ -66,7 +67,6 @@ struct BuildConfig
 {
     std::string projectName;
     bool isDebug = false;
-    std::vector<std::string> libraries;
     std::vector<std::string> libraryPaths;
     std::set<std::string> flags;
 
@@ -78,10 +78,6 @@ struct BuildConfig
         cfg.projectName = tbl["project"]["name"].as_string()->get();
         if (cfg.isDebug = tbl["build"]["debug"].as_boolean()->get())
             cfg.flags.insert("debug");
-
-        if (auto libs = tbl["linker"]["libraries"].as_array())
-            for (const auto& v : *libs)
-                cfg.libraries.push_back(v.as_string()->get());
 
         if (auto paths = tbl["linker"]["library_paths"].as_array())
             for (const auto& v : *paths)
@@ -109,7 +105,6 @@ debug = false
 flags = []
 
 [linker]
-libraries = []
 library_paths = [])";
 
 static void initLLVM(void)
@@ -158,6 +153,10 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
         filter.FilterModule(*module);
         modules.emplace(rel, std::move(module));
     }
+
+    GenericsPass::TemplateStore templateStore;
+    for (auto& [name, module] : modules)
+        GenericsPass::Run(*module, name, modules, templateStore);
 
     return modules;
 }
@@ -273,7 +272,6 @@ static void link(const std::string& objectFiles, const BuildConfig& cfg, const f
 #endif
     std::string cmd = "clang -o " + (projectDir / "build" / exe).string() + " " + objectFiles;
     if (cfg.isDebug) cmd += " -g -O0";
-    for (const auto& l : cfg.libraries)      cmd += " -l" + l;
     for (const auto& l : requiredLibraries)  cmd += " -l" + l;
     for (const auto& p : cfg.libraryPaths)   cmd += " -L" + p;
 
@@ -335,6 +333,8 @@ static void cmdBuild(const fs::path& dir, const std::set<std::string> &cliFlags 
     auto objectFiles = compileAll(modules, tm.get(), dir);
 
     link(objectFiles, cfg, dir, requiredLibraries);
+
+    fs::remove_all(dir / "obj");
 
     double total = Seconds(Clock::now() - t0).count();
     std::cout << "\n" << C::BGREEN << "✓ " << C::BOLD << "Build completed successfully! " << C::DIM << '(' << fmtSeconds(total) << ")\n\n" << C::RESET;

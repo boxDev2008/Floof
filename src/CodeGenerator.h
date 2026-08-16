@@ -1113,6 +1113,10 @@ private:
 
         const StructInfo& info = it->second;
 
+        if (info.type != structTypeInfo.llvmType)
+            Error("Cannot initialize variable of type '" + StructNameFor(structTypeInfo.llvmType) +
+                  "' with an initializer of type '" + init->type_name + "'", init->line);
+
         if (init->fields.size() > info.fieldIndices.size())
             Error("Too many fields in struct initializer", init->line);
 
@@ -2679,6 +2683,14 @@ private:
                 return &info;
         }
         return nullptr;
+    }
+
+    std::string StructNameFor(Type* structType) const
+    {
+        for (const auto& [name, info] : m_structs)
+            if (info.type == structType)
+                return name;
+        return "<unknown>";
     }
 
     const TypeInfo* FindFieldTypeAtIndex(const StructInfo& info, unsigned index) const
