@@ -311,11 +311,6 @@ private:
             RewriteExpr(mem->object.get(), locals);
             return;
         }
-        if (auto *pmem = dynamic_cast<PointerMemberAccess *>(node))
-        {
-            RewriteExpr(pmem->object.get(), locals);
-            return;
-        }
         if (auto *si = dynamic_cast<StructInit *>(node))
         {
             for (auto &g : si->generic_args)
@@ -838,7 +833,6 @@ private:
         }
         if (auto *arr = dynamic_cast<ArrayAccess *>(node)) { SubstituteTypesInExpr(arr->array.get(), subst); SubstituteTypesInExpr(arr->index.get(), subst); return; }
         if (auto *mem = dynamic_cast<MemberAccess *>(node)) { SubstituteTypesInExpr(mem->object.get(), subst); return; }
-        if (auto *pmem = dynamic_cast<PointerMemberAccess *>(node)) { SubstituteTypesInExpr(pmem->object.get(), subst); return; }
         if (auto *si = dynamic_cast<StructInit *>(node))
         {
             for (auto &g : si->generic_args) SubstituteType(g, subst);
@@ -922,13 +916,6 @@ inline std::unique_ptr<ExprNode> GenericsPass::CloneExpr(const ExprNode *node)
     if (auto *n = dynamic_cast<const MemberAccess *>(node))
     {
         auto c = std::make_unique<MemberAccess>();
-        c->line = n->line; c->member = n->member;
-        c->object = CloneExpr(n->object.get());
-        return c;
-    }
-    if (auto *n = dynamic_cast<const PointerMemberAccess *>(node))
-    {
-        auto c = std::make_unique<PointerMemberAccess>();
         c->line = n->line; c->member = n->member;
         c->object = CloneExpr(n->object.get());
         return c;
