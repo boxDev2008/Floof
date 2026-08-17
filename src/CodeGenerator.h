@@ -13,6 +13,7 @@
 #include <llvm/MC/TargetRegistry.h>
 #include <llvm/IR/ConstantFold.h>
 #include <unordered_set>
+#include <limits>
 
 using namespace llvm;
 
@@ -88,13 +89,16 @@ class CodeGenerator
         std::vector<ExprNode*> defaultValues;
         TypeInfo returnType;
         bool isVarArg;
+        bool isExtern = false;
+        std::string sourceName;
 
         FunctionInfo() : function(nullptr), isVarArg(false) {}
         
         FunctionInfo(Function* fn, const std::vector<TypeInfo>& params, const TypeInfo& ret,
-                    bool varArg = false, std::vector<ExprNode*> defaults = {})
+                    bool varArg = false, std::vector<ExprNode*> defaults = {}, std::string srcName = "",
+                    bool externFn = false)
             : function(fn), paramTypes(params), returnType(ret), isVarArg(varArg),
-            defaultValues(std::move(defaults)) {}
+            isExtern(externFn), defaultValues(std::move(defaults)), sourceName(std::move(srcName)) {}
     };
 
     struct LoopContext
@@ -197,8 +201,7 @@ private:
             auto linkage = (proc->is_pub || proc->is_extern) 
                 ? Function::ExternalLinkage 
                 : Function::InternalLinkage;
-            
-            DeclareFunction(proc.get(), linkage);
+            m_declaredProcInfo[proc.get()] = DeclareFunction(proc.get(), linkage);
         }
     }
 
@@ -208,8 +211,8 @@ private:
         {
             if (!proc->is_extern)
             {
-                auto it = m_functions.find(proc->name);
-                if (it == m_functions.end())
+                auto it = m_declaredProcInfo.find(proc.get());
+                if (it == m_declaredProcInfo.end())
                     Error("Function not declared: " + proc->name, proc->line);
                 
                 DefineFunctionBody(proc.get(), it->second);
@@ -380,10 +383,9 @@ private:
     {
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
-            auto funcIt = m_functions.find(id->name);
-            if (funcIt != m_functions.end())
+            if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
             {
-                Function* func = funcIt->second.function;
+                Function* func = chosen->function;
 
                 if (expectedType && expectedType->functionInfo)
                 {
@@ -398,7 +400,7 @@ private:
                         false,
                         false,
                         func->getFunctionType(),
-                        std::make_shared<FunctionInfo>(funcIt->second)
+                        std::make_shared<FunctionInfo>(*chosen)
                     )
                 );
             }
@@ -731,12 +733,12 @@ private:
             ),
             Function::ExternalLinkage, "printf", m_module.get()
         );
-        m_functions["printf"] = FunctionInfo(
+        m_functions["printf"] = { FunctionInfo(
             printfFunc,
             {TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false)},
             TypeInfo(m_builder.getInt32Ty(), false),
-            true
-        );
+            true, {}, "printf"
+        ) };
 
         auto* vaStartFunc = Function::Create(
             FunctionType::get(
@@ -746,12 +748,12 @@ private:
             ),
             Function::ExternalLinkage, "llvm.va_start", m_module.get()
         );
-        m_functions["llvm.va_start"] = FunctionInfo(
+        m_functions["llvm.va_start"] = { FunctionInfo(
             vaStartFunc,
             {TypeInfo(m_builder.getPtrTy(), false)},
             TypeInfo(m_builder.getVoidTy(), false),
-            false
-        );
+            false, {}, "llvm.va_start"
+        ) };
 
         auto* vaEndFunc = Function::Create(
             FunctionType::get(
@@ -761,12 +763,64 @@ private:
             ),
             Function::ExternalLinkage, "llvm.va_end", m_module.get()
         );
-        m_functions["llvm.va_end"] = FunctionInfo(
+        m_functions["llvm.va_end"] = { FunctionInfo(
             vaEndFunc,
             {TypeInfo(m_builder.getPtrTy(), false)},
             TypeInfo(m_builder.getVoidTy(), false),
-            false
-        );
+            false, {}, "llvm.va_end"
+        ) };
+    }
+
+    std::string MangleTypeSuffix(const TypeInfo& type) const
+    {
+        std::string base;
+        Type* t = type.llvmType;
+
+        if (t->isIntegerTy())
+        {
+            base = (type.isUnsigned ? "u" : "i") + std::to_string(t->getIntegerBitWidth());
+        }
+        else if (t->isFloatTy())      base = "f32";
+        else if (t->isDoubleTy())     base = "f64";
+        else if (t->isVoidTy())       base = "void";
+        else if (t->isPointerTy())
+        {
+            base = type.pointeeType ? "ptr_" + MangleTypeSuffix(TypeInfo(type.pointeeType, type.isUnsigned)) : "ptr";
+        }
+        else if (t->isArrayTy())
+        {
+            base = "arr" + std::to_string(t->getArrayNumElements()) + "_" +
+                   MangleTypeSuffix(TypeInfo(t->getArrayElementType(), type.isUnsigned));
+        }
+        else if (t->isStructTy())
+        {
+            std::string name = StructNameFor(t);
+            base = "s_" + (name == "<unknown>" ? t->getStructName().str() : name);
+        }
+        else
+        {
+            base = "t";
+        }
+
+        return base;
+    }
+
+    std::string MangleOverloadName(const std::string& baseName, const std::vector<TypeInfo>& paramTypes) const
+    {
+        std::string mangled = baseName;
+        for (const auto& p : paramTypes)
+            mangled += "__" + MangleTypeSuffix(p);
+        return mangled;
+    }
+
+    bool SignaturesConflict(const std::vector<TypeInfo>& a, const std::vector<TypeInfo>& b) const
+    {
+        if (a.size() != b.size())
+            return false;
+        for (size_t i = 0; i < a.size(); i++)
+            if (a[i] != b[i])
+                return false;
+        return true;
     }
 
     FunctionInfo DeclareFunction(const ProcDecl* proc, GlobalValue::LinkageTypes linkage)
@@ -787,16 +841,138 @@ private:
             ? ResolveType(proc->return_type.get())
             : TypeInfo(Type::getVoidTy(m_context), false);
 
+        auto& overloads = m_functions[proc->name];
+
+        for (const auto& existing : overloads)
+            if (SignaturesConflict(existing.paramTypes, paramTypes))
+                Error("Function '" + proc->name + "' is already declared with this exact "
+                    "parameter list; overloads must differ in parameter types", proc->line);
+
+        if (!overloads.empty())
+            for (const auto& existing : overloads)
+                if (existing.isExtern || proc->is_extern)
+                    Error("Extern function '" + proc->name + "' cannot be overloaded", proc->line);
+
+        std::string symbolName = (proc->is_extern || proc->name == "main")
+            ? proc->name
+            : MangleOverloadName(proc->name, paramTypes);
+
         auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, proc->is_vararg);
-        auto* func = Function::Create(funcType, linkage, proc->name, m_module.get());
+        auto* func = Function::Create(funcType, linkage, symbolName, m_module.get());
 
         unsigned idx = 0;
         for (auto& arg : func->args())
             arg.setName(proc->params[idx++].name);
 
-        FunctionInfo info(func, paramTypes, returnType, proc->is_vararg, std::move(defaultValues));
-        m_functions[proc->name] = info;
+        FunctionInfo info(func, paramTypes, returnType, proc->is_vararg, std::move(defaultValues), proc->name, proc->is_extern);
+        overloads.push_back(info);
         return info;
+    }
+
+    int ScoreArgMatch(const TypeInfo& argType, const TypeInfo& paramType) const
+    {
+        if (argType == paramType)
+            return 0;
+
+        Type* a = argType.llvmType;
+        Type* p = paramType.llvmType;
+
+        bool aNumeric = a->isIntegerTy() || a->isFloatingPointTy();
+        bool pNumeric = p->isIntegerTy() || p->isFloatingPointTy();
+        if (aNumeric && pNumeric)
+            return 1;
+
+        if (a->isPointerTy() && p->isPointerTy())
+            return 1;
+
+        return -1;
+    }
+
+    const FunctionInfo* PickFunctionValueOverload(
+        const std::string& name,
+        const TypeInfo* expectedType,
+        uint32_t line)
+    {
+        auto it = m_functions.find(name);
+        if (it == m_functions.end())
+            return nullptr;
+
+        const auto& candidates = it->second;
+        if (candidates.size() == 1)
+            return &candidates[0];
+
+        if (expectedType && expectedType->functionInfo)
+        {
+            const FunctionInfo& want = *expectedType->functionInfo;
+            for (const auto& cand : candidates)
+                if (SignaturesConflict(cand.paramTypes, want.paramTypes))
+                    return &cand;
+            Error("No overload of '" + name + "' matches the expected function type", line);
+        }
+
+        Error("'" + name + "' is overloaded; an explicit target type is needed to select "
+            "which overload to use as a value", line);
+    }
+
+    const FunctionInfo* ResolveOverload(
+        const std::string& name,
+        const std::vector<TypeInfo>& argTypes,
+        uint32_t line)
+    {
+        auto it = m_functions.find(name);
+        if (it == m_functions.end())
+            return nullptr;
+
+        const auto& candidates = it->second;
+
+        if (candidates.size() == 1)
+            return &candidates[0];
+
+        const FunctionInfo* best = nullptr;
+        int bestScore = std::numeric_limits<int>::max();
+        bool ambiguous = false;
+
+        for (const auto& cand : candidates)
+        {
+            size_t minRequired = cand.paramTypes.size();
+            for (size_t i = 0; i < cand.defaultValues.size(); i++)
+                if (cand.defaultValues[i]) { minRequired = i; break; }
+
+            bool arityOk = cand.isVarArg
+                ? argTypes.size() >= cand.paramTypes.size()
+                : (argTypes.size() >= minRequired && argTypes.size() <= cand.paramTypes.size());
+            if (!arityOk)
+                continue;
+
+            int totalScore = 0;
+            bool viable = true;
+            for (size_t i = 0; i < argTypes.size() && i < cand.paramTypes.size(); i++)
+            {
+                int s = ScoreArgMatch(argTypes[i], cand.paramTypes[i]);
+                if (s < 0) { viable = false; break; }
+                totalScore += s;
+            }
+            if (!viable)
+                continue;
+
+            if (totalScore < bestScore)
+            {
+                bestScore = totalScore;
+                best = &cand;
+                ambiguous = false;
+            }
+            else if (totalScore == bestScore)
+            {
+                ambiguous = true;
+            }
+        }
+
+        if (!best)
+            Error("No matching overload for function '" + name + "' with the given argument types", line);
+        if (ambiguous)
+            Error("Ambiguous call to overloaded function '" + name + "'", line);
+
+        return best;
     }
 
     void DefineFunctionBody(const ProcDecl* proc, const FunctionInfo& funcInfo)
@@ -1487,10 +1663,9 @@ private:
     {
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
-            auto funcIt = m_functions.find(id->name);
-            if (funcIt != m_functions.end())
+            if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
             {
-                Function* func = funcIt->second.function;
+                Function* func = chosen->function;
                 if (expectedType && expectedType->functionInfo)
                 {
                     TypeInfo type = *expectedType;
@@ -1504,7 +1679,7 @@ private:
                         false,
                         false,
                         func->getFunctionType(),
-                        std::make_shared<FunctionInfo>(funcIt->second)
+                        std::make_shared<FunctionInfo>(*chosen)
                     )
                 );
             }
@@ -1746,11 +1921,20 @@ private:
 
     TypedValue EvaluateFunctionCall(CallExpr *call)
     {
-        auto buildArgs = [&](const FunctionInfo& funcInfo, uint32_t line) -> std::vector<Value*>
+        auto evaluateArgs = [&]() -> std::vector<TypedValue>
+        {
+            std::vector<TypedValue> vals;
+            vals.reserve(call->args.size());
+            for (auto& a : call->args)
+                vals.push_back(EvaluateRValue(a.get()));
+            return vals;
+        };
+
+        auto buildArgs = [&](const FunctionInfo& funcInfo, const std::vector<TypedValue>& evaluated, uint32_t line) -> std::vector<Value*>
         {
             if (funcInfo.isVarArg)
             {
-                if (call->args.size() < funcInfo.paramTypes.size())
+                if (evaluated.size() < funcInfo.paramTypes.size())
                     Error("Too few arguments in call", line);
             }
             else
@@ -1759,22 +1943,22 @@ private:
                 for (size_t i = 0; i < funcInfo.defaultValues.size(); i++)
                     if (funcInfo.defaultValues[i]) { required = i; break; }
 
-                if (call->args.size() < required)
+                if (evaluated.size() < required)
                     Error("Too few arguments: expected at least "
                         + std::to_string(required) + ", got "
-                        + std::to_string(call->args.size()), line);
-                if (call->args.size() > funcInfo.paramTypes.size())
+                        + std::to_string(evaluated.size()), line);
+                if (evaluated.size() > funcInfo.paramTypes.size())
                     Error("Too many arguments: expected "
                         + std::to_string(funcInfo.paramTypes.size()) + ", got "
-                        + std::to_string(call->args.size()), line);
+                        + std::to_string(evaluated.size()), line);
             }
 
             std::vector<Value*> args;
             for (size_t i = 0; i < funcInfo.paramTypes.size(); i++)
             {
                 TypedValue arg;
-                if (i < call->args.size())
-                    arg = EvaluateRValue(call->args[i].get());
+                if (i < evaluated.size())
+                    arg = evaluated[i];
                 else
                 {
                     if (!funcInfo.defaultValues[i])
@@ -1786,8 +1970,8 @@ private:
                     arg = CastValue(arg, funcInfo.paramTypes[i], line);
                 args.push_back(arg.value);
             }
-            for (size_t i = funcInfo.paramTypes.size(); i < call->args.size(); i++)
-                args.push_back(EvaluateRValue(call->args[i].get()).value);
+            for (size_t i = funcInfo.paramTypes.size(); i < evaluated.size(); i++)
+                args.push_back(evaluated[i].value);
 
             return args;
         };
@@ -1801,12 +1985,10 @@ private:
 
                 TypedValue vaListArg = EvaluateLValue(call->args[0].get());
 
-                auto funcIt = m_functions.find("llvm.va_start");
-                if (funcIt == m_functions.end())
-                    Error("llvm.va_start intrinsic not found", call->line);
+                const FunctionInfo& vaStart = m_functions.at("llvm.va_start").front();
 
                 Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-                m_builder.CreateCall(funcIt->second.function, {vaListPtr});
+                m_builder.CreateCall(vaStart.function, {vaListPtr});
                 return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
             }
 
@@ -1817,22 +1999,24 @@ private:
 
                 TypedValue vaListArg = EvaluateLValue(call->args[0].get());
 
-                auto funcIt = m_functions.find("llvm.va_end");
-                if (funcIt == m_functions.end())
-                    Error("llvm.va_end intrinsic not found", call->line);
+                const FunctionInfo& vaEnd = m_functions.at("llvm.va_end").front();
 
                 Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-                m_builder.CreateCall(funcIt->second.function, {vaListPtr});
+                m_builder.CreateCall(vaEnd.function, {vaListPtr});
                 return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
             }
 
-            auto funcIt = m_functions.find(ident->name);
-            if (funcIt != m_functions.end())
+            if (m_functions.find(ident->name) != m_functions.end())
             {
-                const FunctionInfo& func = funcIt->second;
-                auto args = buildArgs(func, call->line);
-                auto* result = m_builder.CreateCall(func.function, args);
-                return TypedValue(result, func.returnType);
+                auto evaluated = evaluateArgs();
+                std::vector<TypeInfo> argTypes;
+                argTypes.reserve(evaluated.size());
+                for (auto& v : evaluated) argTypes.push_back(v.type);
+
+                const FunctionInfo* func = ResolveOverload(ident->name, argTypes, call->line);
+                auto args = buildArgs(*func, evaluated, call->line);
+                auto* result = m_builder.CreateCall(func->function, args);
+                return TypedValue(result, func->returnType);
             }
 
             Variable var = LookupVariable(ident->name, ident->line);
@@ -1840,7 +2024,8 @@ private:
                 Error("Variable '" + ident->name + "' is not callable", call->line);
 
             const FunctionInfo& funcInfo = *var.type.functionInfo;
-            auto args = buildArgs(funcInfo, call->line);
+            auto evaluated = evaluateArgs();
+            auto args = buildArgs(funcInfo, evaluated, call->line);
             Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
             FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
             auto* result = m_builder.CreateCall(funcType, funcPtr, args);
@@ -1852,7 +2037,8 @@ private:
             Error("Expression is not callable", call->line);
 
         const FunctionInfo& funcInfo = *calleeValue.type.functionInfo;
-        auto args = buildArgs(funcInfo, call->line);
+        auto evaluated = evaluateArgs();
+        auto args = buildArgs(funcInfo, evaluated, call->line);
         FunctionType* funcType = cast<FunctionType>(calleeValue.type.pointeeType);
         auto* result = m_builder.CreateCall(funcType, calleeValue.value, args);
         return TypedValue(result, funcInfo.returnType);
@@ -2003,16 +2189,15 @@ private:
             
             if (auto* firstIdent = dynamic_cast<Identifier*>(init->elements[0].get()))
             {
-                auto funcIt = m_functions.find(firstIdent->name);
-                if (funcIt != m_functions.end())
+                if (const FunctionInfo* chosen = PickFunctionValueOverload(firstIdent->name, nullptr, firstIdent->line))
                 {
-                    Function* func = funcIt->second.function;
+                    Function* func = chosen->function;
                     elementType = TypeInfo(
                         func->getType(),
                         false,
                         false,
                         func->getFunctionType(),
-                        std::make_shared<FunctionInfo>(funcIt->second)
+                        std::make_shared<FunctionInfo>(*chosen)
                     );
                 }
             }
@@ -2023,16 +2208,15 @@ private:
                 
                 if (auto* ident = dynamic_cast<Identifier*>(init->elements[i].get()))
                 {
-                    auto funcIt = m_functions.find(ident->name);
-                    if (funcIt != m_functions.end())
+                    if (const FunctionInfo* chosen = PickFunctionValueOverload(ident->name, nullptr, ident->line))
                     {
-                        Function* func = funcIt->second.function;
+                        Function* func = chosen->function;
                         elemType = TypeInfo(
                             func->getType(),
                             false,
                             false,
                             func->getFunctionType(),
-                            std::make_shared<FunctionInfo>(funcIt->second)
+                            std::make_shared<FunctionInfo>(*chosen)
                         );
                     }
                 }
@@ -2786,7 +2970,6 @@ private:
             : m_builder.CreateICmp(signedPred, lhs, rhs);
     }
 
-    // line = 0 means "no specific source location known"
     [[noreturn]] void Error(const std::string& msg, uint32_t line = 0)
     {
         std::string location = " in module '" + m_module->getName().str() + "'";
@@ -2796,7 +2979,8 @@ private:
     }
     
     std::vector<Scope> m_scopes;
-    std::unordered_map<std::string, FunctionInfo> m_functions;
+    std::unordered_map<std::string, std::vector<FunctionInfo>> m_functions;
+    std::unordered_map<const ProcDecl*, FunctionInfo> m_declaredProcInfo;
     std::unordered_map<std::string, StructInfo> m_structs;
     std::unordered_map<std::string, EnumInfo> m_enums;
     std::unordered_map<std::string, AliasDecl*> m_aliases;
