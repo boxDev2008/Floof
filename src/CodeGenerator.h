@@ -26,12 +26,12 @@ class CodeGenerator
         bool isUnsigned;
         bool isConst;
         std::vector<bool> pointerConst;
-
+        
         std::shared_ptr<FunctionInfo> functionInfo;
 
         TypeInfo() : llvmType(nullptr), isUnsigned(false), isConst(false), pointeeType(nullptr) {}
         TypeInfo(Type* t, bool u, bool c = false, Type* pt = nullptr, std::shared_ptr<FunctionInfo> fi = nullptr,
-                std::vector<bool> ptrConst = {})
+                std::vector<bool> ptrConst = {}) 
         : llvmType(t), isUnsigned(u), isConst(c), pointeeType(pt), functionInfo(fi), pointerConst(ptrConst) {}
 
         bool operator==(const TypeInfo& other) const {
@@ -816,7 +816,6 @@ private:
             const Parameter &param = proc->params[idx];
             TypeInfo paramType = funcInfo.paramTypes[idx++];
             std::string name = arg.getName().str() + ".0";
-
             auto* alloca = m_builder.CreateAlloca(paramType.llvmType, nullptr, name);
             m_builder.CreateStore(&arg, alloca);
             m_locals[name] = Variable(paramType, alloca, param.type->is_const);
@@ -1033,7 +1032,6 @@ private:
     void GenerateVarDecl(VarDecl* decl)
     {
         std::string scopedName = decl->name + '.' + std::to_string(m_currentScope);
-
         Variable& variable = m_locals[scopedName];
         
         if (!decl->init)
@@ -1472,6 +1470,9 @@ private:
         if (auto* member = dynamic_cast<MemberAccess*>(node))
             return EvaluateMemberAccess(member);
 
+        if (auto* member = dynamic_cast<PointerMemberAccess*>(node))
+            return EvaluatePointerMemberAccess(member);
+
         if (auto* cast = dynamic_cast<CastExpr*>(node))
         {
             TypedValue operand = EvaluateLValue(cast->operand.get());
@@ -1556,6 +1557,12 @@ private:
         }
         
         if (auto* member = dynamic_cast<MemberAccess*>(node))
+        {
+            TypedValue ptr = EvaluateLValue(member);
+            return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
+        }
+
+        if (auto* member = dynamic_cast<PointerMemberAccess*>(node))
         {
             TypedValue ptr = EvaluateLValue(member);
             return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
@@ -1916,24 +1923,9 @@ private:
 
     TypedValue EvaluateMemberAccess(MemberAccess* access)
     {
-        TypedValue base = EvaluateLValue(access->object.get());
-
-        Type* structType = base.type.llvmType;
-        Value* structPtrValue = base.value;
-        bool baseIsConst = base.type.isConst;
-
-        if (structType->isPointerTy())
-        {
-            if (!base.type.pointeeType)
-                Error("Cannot access member on non-struct pointer", access->line);
-
-            TypedValue ptr(m_builder.CreateLoad(structType, structPtrValue), base.type);
-
-            structType = ptr.type.pointeeType;
-            structPtrValue = ptr.value;
-            baseIsConst = ptr.type.isConst;
-        }
-
+        TypedValue structPtr = EvaluateLValue(access->object.get());
+        
+        Type* structType = structPtr.type.llvmType;
         if (!structType->isStructTy())
             Error("Member access on non-struct type", access->line);
         
@@ -1947,9 +1939,37 @@ private:
         
         unsigned fieldIndex = it->second;
         TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
-        fieldType.isConst = baseIsConst || fieldType.isConst;
+        fieldType.isConst = structPtr.type.isConst || fieldType.isConst;
 
-        auto* fieldPtr = m_builder.CreateStructGEP(structType, structPtrValue, fieldIndex);
+        auto* fieldPtr = m_builder.CreateStructGEP(structType, structPtr.value, fieldIndex);
+        return TypedValue(fieldPtr, fieldType);
+    }
+
+    TypedValue EvaluatePointerMemberAccess(PointerMemberAccess* access)
+    {
+        TypedValue ptr = EvaluateRValue(access->object.get());
+        
+        if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
+            Error("Cannot use -> on non-pointer type", access->line);
+        
+        Type* pointeeType = ptr.type.pointeeType;
+        if (!pointeeType->isStructTy())
+            Error("Cannot access member on non-struct pointer", access->line);
+        
+        const StructInfo* structInfo = FindStructInfo(pointeeType);
+        if (!structInfo)
+            Error("Unknown struct type", access->line);
+        
+        auto it = structInfo->fieldIndices.find(access->member);
+        if (it == structInfo->fieldIndices.end())
+            Error("Unknown member: " + access->member, access->line);
+        
+        unsigned fieldIndex = it->second;
+    
+        TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
+        fieldType.isConst = ptr.type.isConst || fieldType.isConst;
+
+        auto* fieldPtr = m_builder.CreateStructGEP(pointeeType, ptr.value, fieldIndex);
         return TypedValue(fieldPtr, fieldType);
     }
 
@@ -2477,7 +2497,7 @@ private:
             
             return TypeInfo(m_builder.getPtrTy(), false, topLevelConst, pointeeType, nullptr, ptrConst);
         }
-
+        
         return TypeInfo(baseType, isUnsigned, node->is_const, nullptr, nullptr, {});
     }
 

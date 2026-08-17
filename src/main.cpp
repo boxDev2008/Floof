@@ -1,5 +1,4 @@
 #include "Parser.h"
-#include "GenericsPass.h"
 #include "CodeGenerator.h"
 
 #include <iostream>
@@ -153,10 +152,6 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
         filter.FilterModule(*module);
         modules.emplace(rel, std::move(module));
     }
-
-    GenericsPass::TemplateStore templateStore;
-    for (auto& [name, module] : modules)
-        GenericsPass::Run(*module, name, modules, templateStore);
 
     return modules;
 }
@@ -333,8 +328,6 @@ static void cmdBuild(const fs::path& dir, const std::set<std::string> &cliFlags 
     auto objectFiles = compileAll(modules, tm.get(), dir);
 
     link(objectFiles, cfg, dir, requiredLibraries);
-
-    fs::remove_all(dir / "obj");
 
     double total = Seconds(Clock::now() - t0).count();
     std::cout << "\n" << C::BGREEN << "✓ " << C::BOLD << "Build completed successfully! " << C::DIM << '(' << fmtSeconds(total) << ")\n\n" << C::RESET;

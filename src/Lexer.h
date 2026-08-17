@@ -46,7 +46,7 @@ private:
     {
         if (current == '\n')
             line++;
-
+        
         pos++;
         current = (pos < code.length()) ? code[pos] : '\0';
     }
@@ -65,7 +65,7 @@ private:
 
     void skipLineComment()
     {
-
+        // Skip //
         advance();
         advance();
         while (current && current != '\n')
@@ -74,15 +74,15 @@ private:
 
     void skipBlockComment()
     {
-
+        // Skip /*
         advance();
         advance();
         while (current)
         {
             if (current == '*' && peek() == '/')
             {
-                advance();
-                advance();
+                advance(); // skip *
+                advance(); // skip /
                 break;
             }
             advance();
@@ -93,14 +93,14 @@ private:
     {
         int token_line = line;
         std::string value;
-        value.reserve(32);
-
+        value.reserve(32); // Reserve space to reduce allocations
+        
         while (current && (std::isalnum(current) || current == '_'))
         {
             value += current;
             advance();
         }
-
+        
         return {TokenType_Identifier, value, token_line};
     }
 
@@ -109,15 +109,15 @@ private:
         int token_line = line;
         std::string value;
         value.reserve(16);
-
+        
         if (current == '0' && (peek() == 'x' || peek() == 'X'))
         {
-
+            // Hexadecimal
             value += current;
             advance();
             value += current;
             advance();
-
+            
             while (current && std::isxdigit(current))
             {
                 value += current;
@@ -126,10 +126,10 @@ private:
         }
         else if (current == '0' && std::isdigit(peek()))
         {
-
+            // Octal
             value += current;
             advance();
-
+            
             while (current && (current >= '0' && current <= '7'))
             {
                 value += current;
@@ -138,36 +138,38 @@ private:
         }
         else
         {
-
+            // Decimal or floating point
             while (current && std::isdigit(current))
             {
                 value += current;
                 advance();
             }
-
+            
+            // Check for decimal point
             if (current == '.')
             {
                 value += current;
                 advance();
-
+                
                 while (current && std::isdigit(current))
                 {
                     value += current;
                     advance();
                 }
             }
-
+            
+            // Check for exponent (e.g., 1e10, 3.14e-5)
             if (current && (current == 'e' || current == 'E'))
             {
                 value += current;
                 advance();
-
+                
                 if (current && (current == '+' || current == '-'))
                 {
                     value += current;
                     advance();
                 }
-
+                
                 while (current && std::isdigit(current))
                 {
                     value += current;
@@ -175,15 +177,16 @@ private:
                 }
             }
         }
-
-        while (current && (std::tolower(current) == 'u' ||
-                        std::tolower(current) == 'l' ||
+        
+        // Read suffixes
+        while (current && (std::tolower(current) == 'u' || 
+                        std::tolower(current) == 'l' || 
                         std::tolower(current) == 'f'))
         {
             value += current;
             advance();
         }
-
+        
         return {TokenType_Number, value, token_line};
     }
 
@@ -192,8 +195,8 @@ private:
         int token_line = line;
         char quote = current;
         std::string value;
-        value.reserve(64);
-        advance();
+        value.reserve(64); // Reserve space
+        advance(); // skip opening quote
 
         while (current && current != quote)
         {
@@ -219,7 +222,7 @@ private:
         }
 
         if (current == quote)
-            advance();
+            advance(); // skip closing quote
 
         return {TokenType_String, value, token_line};
     }
@@ -228,7 +231,7 @@ private:
     {
         int token_line = line;
         std::string value;
-        advance();
+        advance(); // skip opening '
 
         if (current == '\\' && peek())
         {
@@ -253,7 +256,7 @@ private:
         }
 
         if (current == '\'')
-            advance();
+            advance(); // skip closing '
 
         return {TokenType_Char, value, token_line};
     }
@@ -268,13 +271,14 @@ public:
     {
         while (current)
         {
-
+            // Skip whitespace
             if (std::isspace(current))
             {
                 skipWhitespace();
                 continue;
             }
 
+            // Skip comments
             if (current == '/' && peek() == '/')
             {
                 skipLineComment();
@@ -286,24 +290,30 @@ public:
                 continue;
             }
 
+            // Save current line for token
             int token_line = line;
 
+            // Identifiers and keywords
             if (std::isalpha(current) || current == '_')
                 return readIdentifier();
 
+            // Numbers
             if (std::isdigit(current))
                 return readNumber();
 
+            // Strings (double quotes)
             if (current == '"')
                 return readString();
 
+            // Character literals (single quotes)
             if (current == '\'')
                 return readChar();
 
+            // Check for two-character operators using map
             std::string two_char;
             two_char += current;
             two_char += peek();
-
+            
             auto it = two_char_ops.find(two_char);
             if (it != two_char_ops.end())
             {
@@ -312,6 +322,7 @@ public:
                 return {it->second, two_char, token_line};
             }
 
+            // Single character tokens
             char ch = current;
             advance();
             return {(TokenType)ch, std::string(1, ch), token_line};
@@ -321,18 +332,9 @@ public:
     }
 
     int GetCurrentLine(void) const { return line; }
-
-    struct State
-    {
-        size_t pos;
-        char current;
-        int line;
-    };
-
-    State SaveState(void) const { return {pos, current, line}; }
-    void RestoreState(const State &s) { pos = s.pos; current = s.current; line = s.line; }
 };
 
+// Initialize static maps
 const std::unordered_map<std::string, TokenType> Lexer::two_char_ops = {
     {"->", TokenType_Arrow},
     {"==", TokenType_EqualEqual},

@@ -23,31 +23,13 @@ typedef std::vector<Attribute> AttributeList;
 struct TypeNode : ASTNode {
     std::string name;
     std::vector<int> array_dimensions;
-
+    
     std::unique_ptr<TypeNode> return_type;
     std::vector<std::unique_ptr<TypeNode>> param_types;
     std::vector<bool> pointer_const;
     int pointer_depth = 0;
     bool is_const = false;
     bool is_function_type = false;
-
-    std::vector<std::unique_ptr<TypeNode>> generic_args;
-
-    std::unique_ptr<TypeNode> Clone() const
-    {
-        auto copy = std::make_unique<TypeNode>();
-        copy->line = line;
-        copy->name = name;
-        copy->array_dimensions = array_dimensions;
-        copy->pointer_const = pointer_const;
-        copy->pointer_depth = pointer_depth;
-        copy->is_const = is_const;
-        copy->is_function_type = is_function_type;
-        if (return_type) copy->return_type = return_type->Clone();
-        for (const auto& p : param_types) copy->param_types.push_back(p->Clone());
-        for (const auto& g : generic_args) copy->generic_args.push_back(g->Clone());
-        return copy;
-    }
 };
 
 struct ExprNode : ASTNode {
@@ -99,7 +81,6 @@ struct Identifier : ExprNode {
 struct CallExpr : ExprNode {
     std::unique_ptr<ExprNode> callee;
     std::vector<std::unique_ptr<ExprNode>> args;
-    std::vector<std::unique_ptr<TypeNode>> generic_args;
 };
 
 struct ArrayAccess : ExprNode {
@@ -112,6 +93,11 @@ struct MemberAccess : ExprNode {
     std::string member;
 };
 
+struct PointerMemberAccess : ExprNode {
+    std::unique_ptr<ExprNode> object;
+    std::string member;
+};
+
 struct FieldInit {
     std::string name;
     std::unique_ptr<ExprNode> value;
@@ -120,7 +106,6 @@ struct FieldInit {
 struct StructInit : ExprNode {
     std::string type_name;
     std::vector<FieldInit> fields;
-    std::vector<std::unique_ptr<TypeNode>> generic_args;
 };
 
 struct ArrayInit : ExprNode {
@@ -215,9 +200,6 @@ struct StructDecl : ASTNode {
     AttributeList attributes;
     bool is_packed = false;
     bool is_pub = false;
-    std::vector<std::string> generic_params;
-
-    bool IsGeneric() const { return !generic_params.empty(); }
 };
 
 struct EnumValue
@@ -267,9 +249,6 @@ struct ProcDecl : ASTNode {
     bool is_pub = false;
     bool is_extern = false;
     bool is_vararg = false;
-    std::vector<std::string> generic_params;
-
-    bool IsGeneric() const { return !generic_params.empty(); }
 };
 
 struct UsingDecl : ASTNode {
@@ -367,7 +346,7 @@ public:
     std::unique_ptr<ModuleAST> ParseModule(void)
     {
         std::unique_ptr<ModuleAST> module = std::make_unique<ModuleAST>();
-
+        
         while (m_current.type != TokenType_EOF)
         {
             AttributeList attributes = ParseAttributeList();
@@ -445,25 +424,25 @@ public:
                     std::string name = m_current.value;
                     uint32_t varLine = CurrentLine();
                     Advance();
-
+                    
                     if (Check(':'))
                     {
                         auto var = std::make_unique<GlobalVarDecl>();
                         var->name = name;
                         var->line = varLine;
-
+                        
                         Expect(':', "Expected ':'");
-
+                        
                         var->is_pub = is_pub;
 
                         if (Check(TokenType_Identifier) || Check('('))
                             var->type = ParseType();
-
+                        
                         if (Match('='))
                         {
                             var->init = ParseExpr();
                         }
-
+                        
                         Expect(';', "Expected ';'");
                         module->globals.push_back(std::move(var));
                     }
@@ -485,7 +464,7 @@ public:
                 throw std::runtime_error(msg + " on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
             }
         }
-
+        
         return module;
     }
 
@@ -493,16 +472,16 @@ public:
     {
         std::unique_ptr<TypeNode> type = std::make_unique<TypeNode>();
         type->line = CurrentLine();
-
+        
         if (Match("const"))
             type->is_const = true;
-
+        
         if (Match("proc"))
         {
             type->is_function_type = true;
 
             Expect('(', "Expected '(' after 'proc' in function type");
-
+            
             if (!Check(')'))
             {
                 do {
@@ -526,7 +505,7 @@ public:
             }
 
             Expect(')', "Expected ')'");
-
+            
             while (Match('['))
             {
                 if (Match(']'))
@@ -541,10 +520,10 @@ public:
 
             if (Match(TokenType_Arrow))
                 type->return_type = ParseType();
-
+            
             return type;
         }
-
+        
         if (Check(TokenType_Identifier))
         {
             type->name = m_current.value;
@@ -555,15 +534,7 @@ public:
             Expect(TokenType_Identifier, "Expected type name");
             type->name = m_last.value;
         }
-
-        if (Match('<'))
-        {
-            do {
-                type->generic_args.push_back(ParseType());
-            } while (Match(','));
-            Expect('>', "Expected '>' after generic type arguments");
-        }
-
+        
         while (Match('*'))
         {
             type->pointer_depth++;
@@ -572,7 +543,7 @@ public:
             else
                 type->pointer_const.push_back(false);
         }
-
+        
         while (Match('['))
         {
             if (Match(']'))
@@ -584,7 +555,7 @@ public:
                 Expect(']', "Expected ']'");
             }
         }
-
+        
         return type;
     }
 
@@ -596,7 +567,7 @@ public:
     std::unique_ptr<ExprNode> ParseAssignment(void)
     {
         auto expr = ParseTernary();
-
+        
         uint32_t opLine = CurrentLine();
 
         if (Match('='))
@@ -609,8 +580,8 @@ public:
             return binary;
         }
 
-        if (Match(TokenType_PlusEqual) || Match(TokenType_MinusEqual) ||
-            Match(TokenType_StarEqual) || Match(TokenType_SlashEqual) ||
+        if (Match(TokenType_PlusEqual) || Match(TokenType_MinusEqual) || 
+            Match(TokenType_StarEqual) || Match(TokenType_SlashEqual) || 
             Match(TokenType_PercentEqual))
         {
             auto binary = std::make_unique<BinaryExpr>();
@@ -620,7 +591,7 @@ public:
             binary->right = ParseAssignment();
             return binary;
         }
-
+        
         return expr;
     }
 
@@ -646,7 +617,7 @@ public:
     std::unique_ptr<ExprNode> ParseBitwiseOr(void)
     {
         auto expr = ParseBitwiseXor();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -659,14 +630,14 @@ public:
             binary->right = ParseBitwiseXor();
             expr = std::move(binary);
         }
-
+        
         return expr;
     }
 
     std::unique_ptr<ExprNode> ParseBitwiseXor(void)
     {
         auto expr = ParseBitwiseAnd();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -679,14 +650,14 @@ public:
             binary->right = ParseBitwiseAnd();
             expr = std::move(binary);
         }
-
+        
         return expr;
     }
 
     std::unique_ptr<ExprNode> ParseBitwiseAnd(void)
     {
         auto expr = ParseComparison();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -699,14 +670,14 @@ public:
             binary->right = ParseComparison();
             expr = std::move(binary);
         }
-
+        
         return expr;
     }
 
     std::unique_ptr<ExprNode> ParseComparison(void)
     {
         auto expr = ParseShift();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -718,7 +689,7 @@ public:
             auto binary = std::make_unique<BinaryExpr>();
             binary->line = opLine;
             binary->left = std::move(expr);
-
+            
             if (m_last.type == TokenType_EqualEqual)
                 binary->op = TokenType_EqualEqual;
             else if (m_last.type == TokenType_NotEqual)
@@ -729,18 +700,18 @@ public:
                 binary->op = TokenType_GreaterEqual;
             else
                 binary->op = m_last.value[0];
-
+            
             binary->right = ParseShift();
             expr = std::move(binary);
         }
-
+        
         return expr;
     }
 
     std::unique_ptr<ExprNode> ParseShift(void)
     {
         auto expr = ParseAdditive();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -753,14 +724,14 @@ public:
             binary->right = ParseAdditive();
             expr = std::move(binary);
         }
-
+        
         return expr;
     }
 
     std::unique_ptr<ExprNode> ParseAdditive(void)
     {
         auto expr = ParseMultiplicative();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -773,14 +744,14 @@ public:
             binary->right = ParseMultiplicative();
             expr = std::move(binary);
         }
-
+        
         return expr;
     }
 
     std::unique_ptr<ExprNode> ParseMultiplicative(void)
     {
         auto expr = ParseUnary();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -793,7 +764,7 @@ public:
             binary->right = ParseUnary();
             expr = std::move(binary);
         }
-
+        
         return expr;
     }
 
@@ -809,14 +780,14 @@ public:
             unary->operand = ParseUnary();
             return unary;
         }
-
+        
         return ParsePostfix();
     }
 
     std::unique_ptr<ExprNode> ParsePostfix(void)
     {
         auto expr = ParsePrimary();
-
+        
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -838,34 +809,34 @@ public:
                 member->member = m_last.value;
                 expr = std::move(member);
             }
-            else if (Check('(') || (Check('<') && dynamic_cast<Identifier*>(expr.get())))
+            else if (Match(TokenType_Arrow))
             {
-                std::vector<std::unique_ptr<TypeNode>> genericArgs;
-                bool isCall = Match('(');
-                if (!isCall)
-                    isCall = TryParseGenericCallArgs(genericArgs);
-
-                if (!isCall)
-                    break;
-
+                auto member = std::make_unique<PointerMemberAccess>();
+                member->line = opLine;
+                member->object = std::move(expr);
+                Expect(TokenType_Identifier, "Expected member name");
+                member->member = m_last.value;
+                expr = std::move(member);
+            }
+            else if (Match('('))
+            {
                 auto call = std::make_unique<CallExpr>();
                 call->line = opLine;
                 call->callee = std::move(expr);
-                call->generic_args = std::move(genericArgs);
-
+                
                 if (!Check(')'))
                 {
                     do {
                         call->args.push_back(ParseExpr());
                     } while (Match(','));
                 }
-
+                
                 Expect(')', "Expected ')'");
                 expr = std::move(call);
             }
             else break;
         }
-
+        
         return expr;
     }
 
@@ -932,7 +903,7 @@ public:
             num->type = ClassifyNumberLiteral(m_last.value, num->numeric_part);
             return num;
         }
-
+        
         if (Match(TokenType_String))
         {
             auto str = std::make_unique<::StringLiteral>();
@@ -948,30 +919,30 @@ public:
             chr->value = m_last.value;
             return chr;
         }
-
+        
         if (Match('('))
         {
             auto expr = ParseExpr();
             Expect(')', "Expected ')'");
             return expr;
         }
-
+        
         if (Match('['))
         {
             auto arr = std::make_unique<ArrayInit>();
             arr->line = primaryLine;
-
+            
             if (!Check(']'))
             {
                 do {
                     arr->elements.push_back(ParseExpr());
                 } while (Match(','));
             }
-
+            
             Expect(']', "Expected ']'");
             return arr;
         }
-
+        
         if (Match(TokenType_Identifier))
         {
             std::string name = m_last.value;
@@ -992,7 +963,7 @@ public:
                 Expect(')', "Expected ')' after sizeof type");
                 return sizeofExpr;
             }
-
+            
             if (name == "cast" && Match('('))
             {
                 auto cast = std::make_unique<CastExpr>();
@@ -1025,38 +996,12 @@ public:
                 return enumAccess;
             }
 
-            std::vector<std::unique_ptr<TypeNode>> structInitGenericArgs;
-            if (Check('<'))
-            {
-
-                ParserState saved = SaveParserState();
-                bool looksLikeGeneric = false;
-                if (Match('<'))
-                {
-                    try
-                    {
-                        do {
-                            if (!Check(TokenType_Identifier)) throw std::runtime_error("");
-                            structInitGenericArgs.push_back(ParseType());
-                        } while (Match(','));
-                        looksLikeGeneric = Match('>') && !m_parsingStatement && Check('{');
-                    }
-                    catch (...) { looksLikeGeneric = false; }
-                }
-                if (!looksLikeGeneric)
-                {
-                    structInitGenericArgs.clear();
-                    RestoreParserState(saved);
-                }
-            }
-
             if (!m_parsingStatement && Match('{'))
             {
                 auto init = std::make_unique<StructInit>();
                 init->line = primaryLine;
                 init->type_name = name;
-                init->generic_args = std::move(structInitGenericArgs);
-
+                
                 if (!Check('}'))
                 {
                     do {
@@ -1072,40 +1017,40 @@ public:
                         init->fields.push_back(std::move(fi));
                     } while (Match(','));
                 }
-
+                
                 Expect('}', "Expected '}'");
                 return init;
             }
-
+            
             auto ident = std::make_unique<Identifier>();
             ident->line = primaryLine;
             ident->name = name;
             return ident;
         }
-
+        
         throw std::runtime_error("Expected expression on line " + std::to_string(primaryLine) + " in module " + m_moduleName);
     }
 
     std::unique_ptr<VarDecl> ParseVarDecl(void)
     {
         auto var = std::make_unique<VarDecl>();
-
+        
         Expect(TokenType_Identifier, "Expected variable name");
         var->name = m_last.value;
         var->line = m_lexer.GetCurrentLine();
-
+        
         Expect(':', "Expected ':' after variable name");
-
+        
         if (Check(TokenType_Identifier) || Check('('))
             var->type = ParseType();
-
+        
         if (Match('='))
         {
             var->init = ParseExpr();
         }
-
+        
         Expect(';', "Expected ';' after variable declaration");
-
+        
         return var;
     }
 
@@ -1153,7 +1098,7 @@ public:
                 statement->else_branch = ParseBlock();
             return statement;
         }
-
+        
         if (Match("while"))
         {
             auto statement = std::make_unique<WhileStmt>();
@@ -1164,7 +1109,7 @@ public:
             statement->then_branch = ParseBlock();
             return statement;
         }
-
+        
         if (Match("do"))
         {
             auto statement = std::make_unique<DoWhileStmt>();
@@ -1178,7 +1123,7 @@ public:
             Expect(';', "Expected ';' after do-while condition");
             return statement;
         }
-
+        
         if (Match("for"))
         {
             auto stmt = ParseForStmt();
@@ -1192,36 +1137,36 @@ public:
             stmt->line = stmtLine;
             return stmt;
         }
-
+        
         if (Check('{'))
         {
             return ParseBlock();
         }
-
+        
         if (Check(TokenType_Identifier))
         {
             std::string ident_name = m_current.value;
             uint32_t identLine = CurrentLine();
             Advance();
-
+            
             if (Check(':'))
             {
                 auto var = std::make_unique<VarDecl>();
                 var->name = ident_name;
                 var->line = identLine;
-
+                
                 Expect(':', "Expected ':'");
-
+                
                 if (Check(TokenType_Identifier) || Check('('))
                     var->type = ParseType();
-
+                
                 if (Match('='))
                 {
                     var->init = ParseExpr();
                 }
-
+                
                 Expect(';', "Expected ';'");
-
+                
                 return var;
             }
             else
@@ -1229,9 +1174,9 @@ public:
                 auto ident = std::make_unique<Identifier>();
                 ident->name = ident_name;
                 ident->line = identLine;
-
+                
                 std::unique_ptr<ExprNode> expr = std::move(ident);
-
+                
                 while (true)
                 {
                     uint32_t postfixLine = CurrentLine();
@@ -1253,28 +1198,28 @@ public:
                         member->member = m_last.value;
                         expr = std::move(member);
                     }
-                    else if (Check('(') || (Check('<') && dynamic_cast<Identifier*>(expr.get())))
+                    else if (Match(TokenType_Arrow))
                     {
-                        std::vector<std::unique_ptr<TypeNode>> genericArgs;
-                        bool isCall = Match('(');
-                        if (!isCall)
-                            isCall = TryParseGenericCallArgs(genericArgs);
-
-                        if (!isCall)
-                            break;
-
+                        auto member = std::make_unique<PointerMemberAccess>();
+                        member->line = postfixLine;
+                        member->object = std::move(expr);
+                        Expect(TokenType_Identifier, "Expected member name");
+                        member->member = m_last.value;
+                        expr = std::move(member);
+                    }
+                    else if (Match('('))
+                    {
                         auto call = std::make_unique<CallExpr>();
                         call->line = postfixLine;
                         call->callee = std::move(expr);
-                        call->generic_args = std::move(genericArgs);
-
+                        
                         if (!Check(')'))
                         {
                             do {
                                 call->args.push_back(ParseExpr());
                             } while (Match(','));
                         }
-
+                        
                         Expect(')', "Expected ')'");
                         expr = std::move(call);
                     }
@@ -1283,7 +1228,7 @@ public:
                         break;
                     }
                 }
-
+                
                 uint32_t assignLine = CurrentLine();
                 if (Match('=') || Match(TokenType_PlusEqual) || Match(TokenType_MinusEqual) ||
                     Match(TokenType_StarEqual) || Match(TokenType_SlashEqual) || Match(TokenType_PercentEqual))
@@ -1295,7 +1240,7 @@ public:
                     binary->right = ParseAssignment();
                     expr = std::move(binary);
                 }
-
+                
                 auto stmt = std::make_unique<ExprStmt>();
                 stmt->line = stmtLine;
                 stmt->expr = std::move(expr);
@@ -1303,7 +1248,7 @@ public:
                 return stmt;
             }
         }
-
+        
         auto stmt = std::make_unique<ExprStmt>();
         stmt->line = stmtLine;
         stmt->expr = ParseExpr();
@@ -1315,15 +1260,15 @@ public:
     {
         uint32_t blockLine = CurrentLine();
         Expect('{', "Expected '{'");
-
+        
         auto block = std::make_unique<BlockStmt>();
         block->line = blockLine;
-
+        
         while (!Check('}') && !Check(TokenType_EOF))
         {
             block->statements.push_back(ParseStmt());
         }
-
+        
         Expect('}', "Expected '}'");
         return block;
     }
@@ -1331,7 +1276,7 @@ public:
     std::unique_ptr<EnumDecl> ParseEnumDecl(void)
     {
         auto enum_decl = std::make_unique<EnumDecl>();
-
+        
         Expect(TokenType_Identifier, "Expected enum name");
         enum_decl->name = m_last.value;
         enum_decl->line = m_lexer.GetCurrentLine();
@@ -1340,22 +1285,22 @@ public:
             enum_decl->base_type = ParseType();
 
         Expect('{', "Expected '{'");
-
+        
         while (!Check('}'))
         {
             Expect(TokenType_Identifier, "Expected enum value name");
             EnumValue val;
             val.name = m_last.value;
-
+            
             if (Match('='))
                 val.expr = ParseExpr();
-
+            
             enum_decl->values.push_back(std::move(val));
-
+            
             if (!Check('}'))
                 Match(',');
         }
-
+        
         Expect('}', "Expected '}'");
         return enum_decl;
     }
@@ -1403,29 +1348,29 @@ public:
     {
         auto match = std::make_unique<MatchStmt>();
         match->line = CurrentLine();
-
+        
         m_parsingStatement = true;
         match->value = ParseExpr();
         m_parsingStatement = false;
-
+        
         Expect('{', "Expected '{'");
 
         while (!Check('}'))
         {
             auto case_stmt = std::make_unique<MatchCase>();
-
+            
             if (Match("else"))
                 case_stmt->is_else = true;
             else
                 case_stmt->value = ParseExpr();
-
+            
             case_stmt->body = ParseBlock();
             match->cases.push_back(std::move(case_stmt));
-
+            
             if (!Check('}'))
                 Match(',');
         }
-
+        
         Expect('}', "Expected '}'");
         return match;
     }
@@ -1437,19 +1382,7 @@ public:
         Expect(TokenType_Identifier, "Expected struct name");
         struct_decl->name = m_last.value;
         struct_decl->line = m_lexer.GetCurrentLine();
-
-        if (Match('<'))
-        {
-            do {
-                Expect(TokenType_Identifier, "Expected generic parameter name");
-                if (std::find(struct_decl->generic_params.begin(), struct_decl->generic_params.end(), m_last.value) != struct_decl->generic_params.end())
-                    throw std::runtime_error("Duplicate generic parameter '" + m_last.value +
-                        "' on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
-                struct_decl->generic_params.push_back(m_last.value);
-            } while (Match(','));
-            Expect('>', "Expected '>' after generic parameter list");
-        }
-
+            
         Expect('{', "Expected '{'");
 
         while (!Check('}'))
@@ -1490,18 +1423,7 @@ public:
         proc->line = m_lexer.GetCurrentLine();
         proc->is_extern = is_extern;
 
-        if (Match('<'))
-        {
-            do {
-                Expect(TokenType_Identifier, "Expected generic parameter name");
-                if (std::find(proc->generic_params.begin(), proc->generic_params.end(), m_last.value) != proc->generic_params.end())
-                    throw std::runtime_error("Duplicate generic parameter '" + m_last.value +
-                        "' on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
-                proc->generic_params.push_back(m_last.value);
-            } while (Match(','));
-            Expect('>', "Expected '>' after generic parameter list");
-        }
-
+        // if (Match('('))
         Expect('(', "Expected '(' after proc name");
         bool hasDefault = false;
         while (!Match(')'))
@@ -1610,64 +1532,6 @@ private:
     {
         if (!Match(type))
             throw std::runtime_error(msg + " on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
-    }
-
-    struct ParserState
-    {
-        Lexer::State lexState;
-        Token current, last, next;
-        bool hasNext;
-    };
-
-    ParserState SaveParserState(void) const
-    {
-        return {m_lexer.SaveState(), m_current, m_last, m_next, m_hasNext};
-    }
-
-    void RestoreParserState(const ParserState &s)
-    {
-        m_lexer.RestoreState(s.lexState);
-        m_current = s.current;
-        m_last = s.last;
-        m_next = s.next;
-        m_hasNext = s.hasNext;
-    }
-
-    bool TryParseGenericCallArgs(std::vector<std::unique_ptr<TypeNode>>& outArgs)
-    {
-        ParserState saved = SaveParserState();
-
-        if (!Match('<'))
-            return false;
-
-        bool valid = true;
-        std::vector<std::unique_ptr<TypeNode>> args;
-
-        try
-        {
-            do {
-                if (!Check(TokenType_Identifier))
-                {
-                    valid = false;
-                    break;
-                }
-                args.push_back(ParseType());
-            } while (Match(','));
-        }
-        catch (...)
-        {
-            valid = false;
-        }
-
-        if (valid && Match('>') && Check('('))
-        {
-            Advance();
-            outArgs = std::move(args);
-            return true;
-        }
-
-        RestoreParserState(saved);
-        return false;
     }
 
     const std::string &m_moduleName;
