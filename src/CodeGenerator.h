@@ -73,6 +73,10 @@ class CodeGenerator
         std::unordered_map<std::string, unsigned> fieldIndices;
         std::unordered_map<std::string, TypeInfo> fieldTypes;
         std::unordered_map<std::string, ExprNode*> fieldDefaults;
+
+        // Set for instances of generic structs, used to infer type arguments from struct args
+        const StructDecl* genericDecl = nullptr;
+        std::vector<TypeInfo> genericArgs;
     };
 
     struct EnumInfo
@@ -101,6 +105,20 @@ class CodeGenerator
             isExtern(externFn), defaultValues(std::move(defaults)), sourceName(std::move(srcName)) {}
     };
 
+    struct OverloadCandidate
+    {
+        FunctionInfo info;
+        const ProcDecl* genericDecl = nullptr;   // non-null: info is a signature, instantiate if chosen
+        std::vector<TypeInfo> typeArgs;
+    };
+
+    struct PendingInstance
+    {
+        const ProcDecl* decl;
+        std::vector<TypeInfo> typeArgs;
+        FunctionInfo info;
+    };
+
     struct LoopContext
     {
         BasicBlock* continueTarget;
@@ -126,6 +144,7 @@ public:
         DeclareGlobalVariables(ast);
         RegisterBuiltinFunctions();
         DefineUserFunctionBodies(ast);
+        DefineGenericInstanceBodies();
     }
 
     std::unique_ptr<Module> GetModule() { return std::move(m_module); }
@@ -187,17 +206,37 @@ private:
 
     void ImportModuleFunctions(const ModuleAST& module)
     {
+        bool exportsGenerics = false;
         for (const auto& proc : module.procs)
         {
             if (!proc->is_pub) continue;
-            DeclareFunction(proc.get(), GlobalValue::ExternalLinkage);
+            if (!proc->generic_params.empty())
+            {
+                m_genericProcs[proc->name].push_back(proc.get());
+                exportsGenerics = true;
+            }
+            else
+                DeclareFunction(proc.get(), GlobalValue::ExternalLinkage);
         }
+
+        // Generic bodies are instantiated in the importing module, so they need the
+        // defining module's extern declarations to be visible here as well
+        if (exportsGenerics)
+            for (const auto& proc : module.procs)
+                if (!proc->is_pub && proc->is_extern)
+                    DeclareFunction(proc.get(), GlobalValue::ExternalLinkage);
     }
 
     void DeclareUserFunctions(const ModuleAST& ast)
     {
         for (const auto& proc : ast.procs)
         {
+            if (!proc->generic_params.empty())
+            {
+                m_genericProcs[proc->name].push_back(proc.get());
+                continue;
+            }
+
             auto linkage = (proc->is_pub || proc->is_extern) 
                 ? Function::ExternalLinkage 
                 : Function::InternalLinkage;
@@ -209,7 +248,7 @@ private:
     {
         for (const auto& proc : ast.procs)
         {
-            if (!proc->is_extern)
+            if (!proc->is_extern && proc->generic_params.empty())
             {
                 auto it = m_declaredProcInfo.find(proc.get());
                 if (it == m_declaredProcInfo.end())
@@ -236,14 +275,23 @@ private:
     void RegisterStructs(const ModuleAST& ast)
     {
         for (const auto& decl : ast.structs)
-            RegisterStruct(decl.get());
+            if (!decl->generic_params.empty())
+                m_genericStructs[decl->name] = decl.get();
+
+        for (const auto& decl : ast.structs)
+            if (decl->generic_params.empty())
+                RegisterStruct(decl.get(), decl->name);
     }
 
     void ImportModuleStructs(const ModuleAST& ast)
     {
         for (const auto& decl : ast.structs)
-            if (decl->is_pub)
-                RegisterStruct(decl.get());
+            if (decl->is_pub && !decl->generic_params.empty())
+                m_genericStructs[decl->name] = decl.get();
+
+        for (const auto& decl : ast.structs)
+            if (decl->is_pub && decl->generic_params.empty())
+                RegisterStruct(decl.get(), decl->name);
     }
 
     void RegisterAliases(const ModuleAST& ast)
@@ -291,11 +339,11 @@ private:
         m_enums[decl->name] = info;
     }
 
-    void RegisterStruct(const StructDecl* decl)
+    void RegisterStruct(const StructDecl* decl, const std::string& name)
     {
-        auto* structType = StructType::create(m_context, decl->name);
+        auto* structType = StructType::create(m_context, name);
 
-        StructInfo& info = m_structs[decl->name];
+        StructInfo& info = m_structs[name];
         info.type = structType;
 
         std::vector<Type*> memberTypes;
@@ -383,27 +431,11 @@ private:
     {
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
-            if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
-            {
-                Function* func = chosen->function;
+            if (!id->generic_args.empty())
+                return MakeFunctionValue(InstantiateGenericFunctionValue(id, expectedType), expectedType);
 
-                if (expectedType && expectedType->functionInfo)
-                {
-                    TypeInfo type = *expectedType;
-                    type.functionInfo->function = func;
-                    return TypedValue(func, type);
-                }
-                return TypedValue(
-                    func,
-                    TypeInfo(
-                        func->getType(),
-                        false,
-                        false,
-                        func->getFunctionType(),
-                        std::make_shared<FunctionInfo>(*chosen)
-                    )
-                );
-            }
+            if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
+                return MakeFunctionValue(*chosen, expectedType);
 
             auto globalIt = m_globals.find(id->name);
             if (globalIt != m_globals.end())
@@ -558,9 +590,10 @@ private:
         
         if (auto* structInit = dynamic_cast<StructInit*>(node))
         {
-            auto it = m_structs.find(structInit->type_name);
+            std::string structName = ResolveStructInitName(structInit);
+            auto it = m_structs.find(structName);
             if (it == m_structs.end())
-                Error("Unknown struct: " + structInit->type_name, structInit->line);
+                Error("Unknown struct: " + structName, structInit->line);
 
             const StructInfo& info = it->second;
             std::vector<Constant*> fieldValues(info.fieldIndices.size(), nullptr);
@@ -776,7 +809,14 @@ private:
         std::string base;
         Type* t = type.llvmType;
 
-        if (t->isIntegerTy())
+        if (t->isPointerTy() && type.functionInfo)
+        {
+            base = "fn";
+            for (const auto& p : type.functionInfo->paramTypes)
+                base += "_" + MangleTypeSuffix(p);
+            base += "_r" + MangleTypeSuffix(type.functionInfo->returnType);
+        }
+        else if (t->isIntegerTy())
         {
             base = (type.isUnsigned ? "u" : "i") + std::to_string(t->getIntegerBitWidth());
         }
@@ -842,6 +882,11 @@ private:
             : TypeInfo(Type::getVoidTy(m_context), false);
 
         auto& overloads = m_functions[proc->name];
+
+        if (proc->is_extern)
+            for (const auto& existing : overloads)
+                if (existing.isExtern && SignaturesConflict(existing.paramTypes, paramTypes))
+                    return existing;
 
         for (const auto& existing : overloads)
             if (SignaturesConflict(existing.paramTypes, paramTypes))
@@ -914,65 +959,395 @@ private:
             "which overload to use as a value", line);
     }
 
-    const FunctionInfo* ResolveOverload(
-        const std::string& name,
-        const std::vector<TypeInfo>& argTypes,
-        uint32_t line)
+    int ScoreCandidate(const FunctionInfo& cand, const std::vector<TypeInfo>& argTypes) const
     {
-        auto it = m_functions.find(name);
-        if (it == m_functions.end())
-            return nullptr;
+        size_t minRequired = cand.paramTypes.size();
+        for (size_t i = 0; i < cand.defaultValues.size(); i++)
+            if (cand.defaultValues[i]) { minRequired = i; break; }
 
-        const auto& candidates = it->second;
+        bool arityOk = cand.isVarArg
+            ? argTypes.size() >= cand.paramTypes.size()
+            : (argTypes.size() >= minRequired && argTypes.size() <= cand.paramTypes.size());
+        if (!arityOk)
+            return -1;
 
-        if (candidates.size() == 1)
-            return &candidates[0];
-
-        const FunctionInfo* best = nullptr;
-        int bestScore = std::numeric_limits<int>::max();
-        bool ambiguous = false;
-
-        for (const auto& cand : candidates)
+        int totalScore = 0;
+        for (size_t i = 0; i < argTypes.size() && i < cand.paramTypes.size(); i++)
         {
-            size_t minRequired = cand.paramTypes.size();
-            for (size_t i = 0; i < cand.defaultValues.size(); i++)
-                if (cand.defaultValues[i]) { minRequired = i; break; }
+            int s = ScoreArgMatch(argTypes[i], cand.paramTypes[i]);
+            if (s < 0)
+                return -1;
+            totalScore += s;
+        }
+        return totalScore;
+    }
 
-            bool arityOk = cand.isVarArg
-                ? argTypes.size() >= cand.paramTypes.size()
-                : (argTypes.size() >= minRequired && argTypes.size() <= cand.paramTypes.size());
-            if (!arityOk)
-                continue;
+    // Collects the plain overloads and generic templates named by the callee and picks the best
+    // match. On a tie, a non-generic overload beats a generic instantiation (as in C#).
+    FunctionInfo ResolveCall(Identifier* callee, const std::vector<TypeInfo>& argTypes, uint32_t line)
+    {
+        const std::string& name = callee->name;
+        std::vector<OverloadCandidate> candidates;
 
-            int totalScore = 0;
-            bool viable = true;
-            for (size_t i = 0; i < argTypes.size() && i < cand.paramTypes.size(); i++)
-            {
-                int s = ScoreArgMatch(argTypes[i], cand.paramTypes[i]);
-                if (s < 0) { viable = false; break; }
-                totalScore += s;
-            }
-            if (!viable)
-                continue;
+        if (callee->generic_args.empty())
+        {
+            auto it = m_functions.find(name);
+            if (it != m_functions.end())
+                for (const auto& f : it->second)
+                    candidates.push_back({f});
+        }
 
-            if (totalScore < bestScore)
+        auto genIt = m_genericProcs.find(name);
+        if (genIt == m_genericProcs.end() && !callee->generic_args.empty())
+            Error("'" + name + "' is not a generic function", line);
+
+        if (genIt != m_genericProcs.end())
+        {
+            std::vector<TypeInfo> explicitArgs;
+            for (const auto& arg : callee->generic_args)
+                explicitArgs.push_back(ResolveType(arg.get()));
+
+            for (const ProcDecl* tmpl : genIt->second)
             {
-                bestScore = totalScore;
-                best = &cand;
-                ambiguous = false;
-            }
-            else if (totalScore == bestScore)
-            {
-                ambiguous = true;
+                std::vector<TypeInfo> typeArgs;
+                if (!callee->generic_args.empty())
+                {
+                    if (explicitArgs.size() != tmpl->generic_params.size())
+                        continue;
+                    typeArgs = explicitArgs;
+                }
+                else if (!InferTypeArguments(tmpl, argTypes, typeArgs))
+                    continue;
+
+                candidates.push_back({ResolveGenericSignature(tmpl, typeArgs), tmpl, std::move(typeArgs)});
             }
         }
 
-        if (!best)
-            Error("No matching overload for function '" + name + "' with the given argument types", line);
-        if (ambiguous)
-            Error("Ambiguous call to overloaded function '" + name + "'", line);
+        if (candidates.empty())
+        {
+            if (!callee->generic_args.empty())
+                Error("No overload of generic function '" + name + "' takes "
+                    + std::to_string(callee->generic_args.size()) + " type argument(s)", line);
+            Error("Cannot infer type arguments for generic function '" + name
+                + "'; specify them explicitly, e.g. " + name + "<i32>(...)", line);
+        }
 
-        return best;
+        const OverloadCandidate* best = &candidates[0];
+        if (candidates.size() > 1)
+        {
+            best = nullptr;
+            int bestScore = std::numeric_limits<int>::max();
+            bool ambiguous = false;
+
+            for (const auto& cand : candidates)
+            {
+                int score = ScoreCandidate(cand.info, argTypes);
+                if (score < 0)
+                    continue;
+                score = score * 2 + (cand.genericDecl ? 1 : 0);
+
+                if (score < bestScore)
+                {
+                    bestScore = score;
+                    best = &cand;
+                    ambiguous = false;
+                }
+                else if (score == bestScore)
+                    ambiguous = true;
+            }
+
+            if (!best)
+                Error("No matching overload for function '" + name + "' with the given argument types", line);
+            if (ambiguous)
+                Error("Ambiguous call to overloaded function '" + name + "'", line);
+        }
+
+        if (best->genericDecl)
+            return InstantiateGenericProc(best->genericDecl, best->typeArgs);
+        return best->info;
+    }
+
+    TypedValue MakeFunctionValue(const FunctionInfo& info, const TypeInfo* expectedType)
+    {
+        Function* func = info.function;
+        if (expectedType && expectedType->functionInfo)
+        {
+            TypeInfo type = *expectedType;
+            type.functionInfo->function = func;
+            return TypedValue(func, type);
+        }
+        return TypedValue(
+            func,
+            TypeInfo(
+                func->getType(),
+                false,
+                false,
+                func->getFunctionType(),
+                std::make_shared<FunctionInfo>(info)
+            )
+        );
+    }
+
+    // ---- Generics ----------------------------------------------------------------------------
+    // Generic structs and procs are monomorphized: each distinct set of type arguments produces
+    // its own LLVM struct type / internal function. Type parameters are resolved through
+    // m_typeBindings, which is swapped in while a template's types or body are being resolved.
+
+    std::string MangleTypeArgs(const std::vector<TypeInfo>& typeArgs) const
+    {
+        std::string mangled;
+        for (size_t i = 0; i < typeArgs.size(); i++)
+            mangled += (i ? "," : "") + MangleTypeSuffix(typeArgs[i]);
+        return mangled;
+    }
+
+    std::unordered_map<std::string, TypeInfo> BindTypeParams(
+        const std::vector<std::string>& params,
+        const std::vector<TypeInfo>& typeArgs) const
+    {
+        std::unordered_map<std::string, TypeInfo> bindings;
+        for (size_t i = 0; i < params.size(); i++)
+        {
+            TypeInfo bound = typeArgs[i];
+            bound.isConst = false;
+            bindings[params[i]] = bound;
+        }
+        return bindings;
+    }
+
+    std::string InstantiateGenericStruct(
+        const std::string& name,
+        const std::vector<std::unique_ptr<TypeNode>>& argNodes,
+        uint32_t line)
+    {
+        auto it = m_genericStructs.find(name);
+        if (it == m_genericStructs.end())
+            Error("Type '" + name + "' is not a generic struct", line);
+
+        const StructDecl* decl = it->second;
+        if (argNodes.size() != decl->generic_params.size())
+            Error("Generic struct '" + name + "' expects " + std::to_string(decl->generic_params.size())
+                + " type argument(s), got " + std::to_string(argNodes.size()), line);
+
+        std::vector<TypeInfo> typeArgs;
+        for (const auto& arg : argNodes)
+            typeArgs.push_back(ResolveType(arg.get()));
+
+        std::string instanceName = name + "<" + MangleTypeArgs(typeArgs) + ">";
+        if (m_structs.find(instanceName) != m_structs.end())
+            return instanceName;
+
+        auto savedBindings = std::move(m_typeBindings);
+        m_typeBindings = BindTypeParams(decl->generic_params, typeArgs);
+
+        RegisterStruct(decl, instanceName);
+        StructInfo& info = m_structs[instanceName];
+        info.genericDecl = decl;
+        info.genericArgs = typeArgs;
+
+        m_typeBindings = std::move(savedBindings);
+        return instanceName;
+    }
+
+    std::string ResolveStructInitName(StructInit* init)
+    {
+        if (!init->type_args.empty())
+            return InstantiateGenericStruct(init->type_name, init->type_args, init->line);
+
+        // Allows `T{ ... }` inside a generic body when T is bound to a struct
+        auto bindingIt = m_typeBindings.find(init->type_name);
+        if (bindingIt != m_typeBindings.end() && bindingIt->second.llvmType->isStructTy())
+            return StructNameFor(bindingIt->second.llvmType);
+
+        // Allows `Alias{ ... }` where Alias names a struct (e.g. typename IntList = List<i32>)
+        auto aliasIt = m_aliases.find(init->type_name);
+        if (m_structs.find(init->type_name) == m_structs.end() && aliasIt != m_aliases.end())
+        {
+            TypeInfo aliased = ResolveType(aliasIt->second->target.get());
+            if (aliased.llvmType->isStructTy())
+                return StructNameFor(aliased.llvmType);
+        }
+
+        return init->type_name;
+    }
+
+    bool UnifyTypeParam(
+        const TypeNode* param,
+        TypeInfo arg,
+        const std::vector<std::string>& typeParams,
+        std::unordered_map<std::string, TypeInfo>& inferred)
+    {
+        if (param->is_function_type || !param->array_dimensions.empty() || param->pointer_depth > 1)
+            return true;
+
+        if (param->pointer_depth == 1)
+        {
+            if (!arg.llvmType->isPointerTy() || !arg.pointeeType)
+                return true;
+            arg = TypeInfo(arg.pointeeType, arg.isUnsigned);
+        }
+
+        if (!param->generic_args.empty())
+        {
+            const StructInfo* info = arg.llvmType->isStructTy() ? FindStructInfo(arg.llvmType) : nullptr;
+            if (!info || !info->genericDecl || info->genericDecl->name != param->name ||
+                info->genericArgs.size() != param->generic_args.size())
+                return true;
+
+            for (size_t i = 0; i < param->generic_args.size(); i++)
+                if (!UnifyTypeParam(param->generic_args[i].get(), info->genericArgs[i], typeParams, inferred))
+                    return false;
+            return true;
+        }
+
+        if (std::find(typeParams.begin(), typeParams.end(), param->name) == typeParams.end())
+            return true;
+
+        arg.isConst = false;
+        auto it = inferred.find(param->name);
+        if (it == inferred.end())
+        {
+            inferred[param->name] = arg;
+            return true;
+        }
+
+        if (it->second == arg)
+            return true;
+
+        // Mixed numeric arguments (e.g. max(x_i64, 1)) widen to their common type
+        Type* a = it->second.llvmType;
+        Type* b = arg.llvmType;
+        if ((a->isIntegerTy() || a->isFloatingPointTy()) && (b->isIntegerTy() || b->isFloatingPointTy()))
+        {
+            it->second = PromoteToCommonType(it->second, arg);
+            return true;
+        }
+
+        return false;
+    }
+
+    bool InferTypeArguments(
+        const ProcDecl* proc,
+        const std::vector<TypeInfo>& argTypes,
+        std::vector<TypeInfo>& outTypeArgs)
+    {
+        std::unordered_map<std::string, TypeInfo> inferred;
+        for (size_t i = 0; i < proc->params.size() && i < argTypes.size(); i++)
+            if (!UnifyTypeParam(proc->params[i].type.get(), argTypes[i], proc->generic_params, inferred))
+                return false;
+
+        for (const auto& name : proc->generic_params)
+        {
+            auto it = inferred.find(name);
+            if (it == inferred.end())
+                return false;
+            outTypeArgs.push_back(it->second);
+        }
+        return true;
+    }
+
+    FunctionInfo ResolveGenericSignature(const ProcDecl* proc, const std::vector<TypeInfo>& typeArgs)
+    {
+        auto savedBindings = std::move(m_typeBindings);
+        m_typeBindings = BindTypeParams(proc->generic_params, typeArgs);
+
+        FunctionInfo info;
+        info.isVarArg = proc->is_vararg;
+        info.sourceName = proc->name;
+        for (const auto& param : proc->params)
+        {
+            info.paramTypes.push_back(ResolveType(param.type.get()));
+            info.defaultValues.push_back(param.default_value.get());
+        }
+        info.returnType = proc->return_type
+            ? ResolveType(proc->return_type.get())
+            : TypeInfo(Type::getVoidTy(m_context), false);
+
+        m_typeBindings = std::move(savedBindings);
+        return info;
+    }
+
+    FunctionInfo InstantiateGenericProc(const ProcDecl* proc, const std::vector<TypeInfo>& typeArgs)
+    {
+        std::string argKey = MangleTypeArgs(typeArgs);
+        auto key = std::make_pair(proc, argKey);
+
+        auto it = m_genericInstances.find(key);
+        if (it != m_genericInstances.end())
+            return it->second;
+
+        FunctionInfo info = ResolveGenericSignature(proc, typeArgs);
+
+        std::vector<Type*> paramLLVMTypes;
+        for (const auto& p : info.paramTypes)
+            paramLLVMTypes.push_back(p.llvmType);
+
+        // Instances are emitted into every module that uses them, so keep them internal
+        auto* funcType = FunctionType::get(info.returnType.llvmType, paramLLVMTypes, proc->is_vararg);
+        std::string symbolName = MangleOverloadName(proc->name + "<" + argKey + ">", info.paramTypes);
+        info.function = Function::Create(funcType, Function::InternalLinkage, symbolName, m_module.get());
+
+        unsigned idx = 0;
+        for (auto& arg : info.function->args())
+            arg.setName(proc->params[idx++].name);
+
+        m_genericInstances.emplace(key, info);
+        m_pendingInstances.push_back({proc, typeArgs, info});
+        return info;
+    }
+
+    FunctionInfo InstantiateGenericFunctionValue(Identifier* id, const TypeInfo* expectedType)
+    {
+        auto genIt = m_genericProcs.find(id->name);
+        if (genIt == m_genericProcs.end())
+            Error("'" + id->name + "' is not a generic function", id->line);
+
+        std::vector<TypeInfo> typeArgs;
+        for (const auto& arg : id->generic_args)
+            typeArgs.push_back(ResolveType(arg.get()));
+
+        const ProcDecl* chosen = nullptr;
+        for (const ProcDecl* tmpl : genIt->second)
+        {
+            if (tmpl->generic_params.size() != typeArgs.size())
+                continue;
+
+            if (expectedType && expectedType->functionInfo &&
+                !SignaturesConflict(ResolveGenericSignature(tmpl, typeArgs).paramTypes,
+                                    expectedType->functionInfo->paramTypes))
+                continue;
+
+            if (chosen)
+                Error("'" + id->name + "' is overloaded; an explicit target type is needed to select "
+                    "which overload to use as a value", id->line);
+            chosen = tmpl;
+        }
+
+        if (!chosen)
+            Error("No overload of generic function '" + id->name + "' matches the given type arguments", id->line);
+
+        return InstantiateGenericProc(chosen, typeArgs);
+    }
+
+    void DefineGenericInstanceBodies(void)
+    {
+        while (!m_pendingInstances.empty())
+        {
+            PendingInstance inst = std::move(m_pendingInstances.back());
+            m_pendingInstances.pop_back();
+
+            m_typeBindings = BindTypeParams(inst.decl->generic_params, inst.typeArgs);
+            try
+            {
+                DefineFunctionBody(inst.decl, inst.info);
+            }
+            catch (const std::runtime_error& e)
+            {
+                throw std::runtime_error(std::string(e.what()) + "\n  (while instantiating '"
+                    + inst.decl->name + "<" + MangleTypeArgs(inst.typeArgs) + ">')");
+            }
+            m_typeBindings.clear();
+        }
     }
 
     void DefineFunctionBody(const ProcDecl* proc, const FunctionInfo& funcInfo)
@@ -1003,7 +1378,7 @@ private:
         m_scopeCount = 0;
         GenerateBlock(proc->body.get(), funcInfo.returnType);
         
-        if (!m_builder.GetInsertBlock()->getTerminator())
+        if (!m_builder.GetInsertBlock()->hasTerminator())
         {
             if (funcInfo.returnType.llvmType->isVoidTy())
                 m_builder.CreateRetVoid();
@@ -1304,15 +1679,16 @@ private:
 
     void InitializeStructInPlace(Value* structPtr, const TypeInfo& structTypeInfo, StructInit* init)
     {
-        auto it = m_structs.find(init->type_name);
+        std::string structName = ResolveStructInitName(init);
+        auto it = m_structs.find(structName);
         if (it == m_structs.end())
-            Error("Unknown struct: " + init->type_name, init->line);
+            Error("Unknown struct: " + structName, init->line);
 
         const StructInfo& info = it->second;
 
         if (info.type != structTypeInfo.llvmType)
             Error("Cannot initialize variable of type '" + StructNameFor(structTypeInfo.llvmType) +
-                  "' with an initializer of type '" + init->type_name + "'", init->line);
+                  "' with an initializer of type '" + structName + "'", init->line);
 
         if (init->fields.size() > info.fieldIndices.size())
             Error("Too many fields in struct initializer", init->line);
@@ -1394,7 +1770,7 @@ private:
         
         m_builder.SetInsertPoint(thenBB);
         GenerateBlock(stmt->then_branch.get(), returnType);
-        if (!m_builder.GetInsertBlock()->getTerminator())
+        if (!m_builder.GetInsertBlock()->hasTerminator())
             m_builder.CreateBr(mergeBB);
         
         if (elseBB)
@@ -1402,7 +1778,7 @@ private:
             m_builder.SetInsertPoint(elseBB);
             m_currentScope = ++m_scopeCount;
             GenerateBlock(stmt->else_branch.get(), returnType);
-            if (!m_builder.GetInsertBlock()->getTerminator())
+            if (!m_builder.GetInsertBlock()->hasTerminator())
                 m_builder.CreateBr(mergeBB);
         }
         
@@ -1427,7 +1803,7 @@ private:
         
         m_builder.SetInsertPoint(bodyBB);
         GenerateBlock(stmt->then_branch.get(), returnType);
-        if (!m_builder.GetInsertBlock()->getTerminator())
+        if (!m_builder.GetInsertBlock()->hasTerminator())
             m_builder.CreateBr(condBB);
         
         PopLoop(loopCtx);
@@ -1447,7 +1823,7 @@ private:
 
         m_builder.SetInsertPoint(bodyBB);
         GenerateBlock(stmt->then_branch.get(), returnType);
-        if (!m_builder.GetInsertBlock()->getTerminator())
+        if (!m_builder.GetInsertBlock()->hasTerminator())
             m_builder.CreateBr(condBB);
 
         m_builder.SetInsertPoint(condBB);
@@ -1496,7 +1872,7 @@ private:
 
         m_builder.SetInsertPoint(bodyBB);
         GenerateBlock(stmt->body.get(), returnType);
-        if (!m_builder.GetInsertBlock()->getTerminator())
+        if (!m_builder.GetInsertBlock()->hasTerminator())
             m_builder.CreateBr(incBB);
 
         m_builder.SetInsertPoint(incBB);
@@ -1566,7 +1942,7 @@ private:
             {
                 m_builder.SetInsertPoint(elseBB);
                 GenerateBlock(case_stmt->body.get(), returnType);
-                if (!m_builder.GetInsertBlock()->getTerminator())
+                if (!m_builder.GetInsertBlock()->hasTerminator())
                     m_builder.CreateBr(endBB);
                 continue;
             }
@@ -1588,7 +1964,7 @@ private:
             
             m_builder.SetInsertPoint(caseBB);
             GenerateBlock(case_stmt->body.get(), returnType);
-            if (!m_builder.GetInsertBlock()->getTerminator())
+            if (!m_builder.GetInsertBlock()->hasTerminator())
                 m_builder.CreateBr(endBB);
         }
         
@@ -1663,26 +2039,11 @@ private:
     {
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
+            if (!id->generic_args.empty())
+                return MakeFunctionValue(InstantiateGenericFunctionValue(id, expectedType), expectedType);
+
             if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
-            {
-                Function* func = chosen->function;
-                if (expectedType && expectedType->functionInfo)
-                {
-                    TypeInfo type = *expectedType;
-                    type.functionInfo->function = func;
-                    return TypedValue(func, type);
-                }
-                return TypedValue(
-                    func,
-                    TypeInfo(
-                        func->getType(),
-                        false,
-                        false,
-                        func->getFunctionType(),
-                        std::make_shared<FunctionInfo>(*chosen)
-                    )
-                );
-            }
+                return MakeFunctionValue(*chosen, expectedType);
             
             Variable var = LookupVariable(id->name, id->line);
 
@@ -2006,17 +2367,19 @@ private:
                 return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
             }
 
-            if (m_functions.find(ident->name) != m_functions.end())
+            if (!ident->generic_args.empty() ||
+                m_functions.find(ident->name) != m_functions.end() ||
+                m_genericProcs.find(ident->name) != m_genericProcs.end())
             {
                 auto evaluated = evaluateArgs();
                 std::vector<TypeInfo> argTypes;
                 argTypes.reserve(evaluated.size());
                 for (auto& v : evaluated) argTypes.push_back(v.type);
 
-                const FunctionInfo* func = ResolveOverload(ident->name, argTypes, call->line);
-                auto args = buildArgs(*func, evaluated, call->line);
-                auto* result = m_builder.CreateCall(func->function, args);
-                return TypedValue(result, func->returnType);
+                FunctionInfo func = ResolveCall(ident, argTypes, call->line);
+                auto args = buildArgs(func, evaluated, call->line);
+                auto* result = m_builder.CreateCall(func.function, args);
+                return TypedValue(result, func.returnType);
             }
 
             Variable var = LookupVariable(ident->name, ident->line);
@@ -2240,9 +2603,10 @@ private:
 
     TypedValue EvaluateStructInit(StructInit* init)
     {
-        auto it = m_structs.find(init->type_name);
+        std::string structName = ResolveStructInitName(init);
+        auto it = m_structs.find(structName);
         if (it == m_structs.end())
-            Error("Unknown struct: " + init->type_name, init->line);
+            Error("Unknown struct: " + structName, init->line);
         
         const StructInfo& info = it->second;
         auto* alloca = m_builder.CreateAlloca(info.type, nullptr, "struct_tmp");
@@ -2642,8 +3006,22 @@ private:
     {
         Type* baseType = nullptr;
         bool isUnsigned = false;
-        
-        baseType = GetBuiltinType(node->name, isUnsigned);
+
+        if (node->generic_args.empty())
+        {
+            auto bindingIt = m_typeBindings.find(node->name);
+            if (bindingIt != m_typeBindings.end())
+            {
+                TypeInfo bound = ApplyPointerDepth(bindingIt->second, node);
+                if (node->is_const)
+                    bound.isConst = true;
+                return bound;
+            }
+
+            baseType = GetBuiltinType(node->name, isUnsigned);
+        }
+        else
+            baseType = m_structs[InstantiateGenericStruct(node->name, node->generic_args, node->line)].type;
         
         if (!baseType)
         {
@@ -2668,6 +3046,9 @@ private:
             if (aliasIt != m_aliases.end())
                 return ResolveAliasedType(node, aliasIt->second);
         }
+
+        if (!baseType && m_genericStructs.find(node->name) != m_genericStructs.end())
+            Error("Generic struct '" + node->name + "' requires type arguments", node->line);
 
         if (!baseType)
             Error("Unknown type: " + node->name, node->line);
@@ -2982,6 +3363,11 @@ private:
     std::unordered_map<std::string, std::vector<FunctionInfo>> m_functions;
     std::unordered_map<const ProcDecl*, FunctionInfo> m_declaredProcInfo;
     std::unordered_map<std::string, StructInfo> m_structs;
+    std::unordered_map<std::string, std::vector<const ProcDecl*>> m_genericProcs;
+    std::unordered_map<std::string, const StructDecl*> m_genericStructs;
+    std::map<std::pair<const ProcDecl*, std::string>, FunctionInfo> m_genericInstances;
+    std::vector<PendingInstance> m_pendingInstances;
+    std::unordered_map<std::string, TypeInfo> m_typeBindings;
     std::unordered_map<std::string, EnumInfo> m_enums;
     std::unordered_map<std::string, AliasDecl*> m_aliases;
     std::vector<std::string> m_aliasResolutionStack;

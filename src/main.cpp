@@ -75,7 +75,7 @@ struct BuildConfig
         auto tbl = toml::parse_file(path.string());
 
         cfg.projectName = tbl["project"]["name"].as_string()->get();
-        if (cfg.isDebug = tbl["build"]["debug"].as_boolean()->get())
+        if ((cfg.isDebug = tbl["build"]["debug"].as_boolean()->get()))
             cfg.flags.insert("debug");
 
         if (auto paths = tbl["linker"]["library_paths"].as_array())
@@ -119,7 +119,7 @@ static llvm::TargetMachine* makeTargetMachine(void)
 {
     std::string triple = llvm::sys::getDefaultTargetTriple();
     std::string error;
-    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(triple, error);
+    const llvm::Target* target = llvm::TargetRegistry::lookupTarget(llvm::Triple(triple), error);
     if (!target)
         throw std::runtime_error("Target lookup failed: " + error);
 

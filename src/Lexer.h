@@ -30,6 +30,7 @@ struct Token
     TokenType type;
     std::string value;
     int line;
+    bool space_before = false;   // whitespace or a comment directly precedes this token
 };
 
 class Lexer
@@ -269,12 +270,24 @@ public:
 
     Token Next(void)
     {
+        bool skipped = false;
+        Token token = NextToken(skipped);
+        token.space_before = skipped;
+        return token;
+    }
+
+    int GetCurrentLine(void) const { return line; }
+
+private:
+    Token NextToken(bool& skipped)
+    {
         while (current)
         {
             // Skip whitespace
             if (std::isspace(current))
             {
                 skipWhitespace();
+                skipped = true;
                 continue;
             }
 
@@ -282,11 +295,13 @@ public:
             if (current == '/' && peek() == '/')
             {
                 skipLineComment();
+                skipped = true;
                 continue;
             }
             if (current == '/' && peek() == '*')
             {
                 skipBlockComment();
+                skipped = true;
                 continue;
             }
 
@@ -331,7 +346,23 @@ public:
         return {TokenType_EOF, "", line};
     }
 
-    int GetCurrentLine(void) const { return line; }
+public:
+
+    struct State
+    {
+        size_t pos;
+        char current;
+        int line;
+    };
+
+    State SaveState(void) const { return {pos, current, line}; }
+
+    void RestoreState(const State& state)
+    {
+        pos = state.pos;
+        current = state.current;
+        line = state.line;
+    }
 };
 
 // Initialize static maps
