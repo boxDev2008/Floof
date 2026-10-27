@@ -362,7 +362,7 @@ public:
                 const bool is_extern = Match("extern");
                 const bool is_packed = Match("packed");
 
-                if (Match("proc"))
+                if (Check(TokenType_Identifier) && (PeekIs('(') || PeekIs('<')))
                 {
                     std::unique_ptr<ProcDecl> proc = ParseProcDecl(is_extern);
                     proc->is_pub = is_pub;
@@ -481,31 +481,20 @@ public:
         if (Match("const"))
             type->is_const = true;
         
-        if (Match("proc"))
+        if (Match('('))
         {
             type->is_function_type = true;
 
-            Expect('(', "Expected '(' after 'proc' in function type");
-            
             if (!Check(')'))
             {
                 do {
-                    if (Check(TokenType_Identifier))
+                    // Parameter names are optional: (x: i32) and (i32) are equivalent
+                    if (Check(TokenType_Identifier) && PeekIs(':'))
                     {
                         Advance();
-                        if (Match(':'))
-                        {
-                            type->param_types.push_back(ParseType());
-                        }
-                        else
-                        {
-                            throw std::runtime_error("Expected ':' after parameter name in function type on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
-                        }
+                        Advance();
                     }
-                    else
-                    {
-                        type->param_types.push_back(ParseType());
-                    }
+                    type->param_types.push_back(ParseType());
                 } while (Match(','));
             }
 

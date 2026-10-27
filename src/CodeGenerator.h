@@ -1445,6 +1445,33 @@ private:
         return TypeInfo(arrayType, baseType.isUnsigned, false, nullptr, nullptr, baseType.pointerConst);
     }
 
+    // Hoisting runs at function entry, so the initializer must only be evaluated for its type:
+    // emit it into a scratch block and discard everything it generated
+    TypeInfo InferExprType(ExprNode* expr)
+    {
+        Function* func = m_builder.GetInsertBlock()->getParent();
+        auto savedIP = m_builder.saveIP();
+        size_t blockCount = func->size();
+
+        BasicBlock* scratch = BasicBlock::Create(m_context, "infer", func);
+        m_builder.SetInsertPoint(scratch);
+        TypeInfo type = EvaluateRValue(expr).type;
+        m_builder.restoreIP(savedIP);
+
+        std::vector<BasicBlock*> generated;
+        auto it = func->begin();
+        std::advance(it, blockCount);
+        for (; it != func->end(); ++it)
+            generated.push_back(&*it);
+
+        for (BasicBlock* bb : generated)
+            bb->dropAllReferences();
+        for (BasicBlock* bb : generated)
+            bb->eraseFromParent();
+
+        return type;
+    }
+
     void GenerateVarDeclHosingAlloc(VarDecl *decl)
     {
         if (IsVariableAccessibleInCurrentScope(decl->name))
@@ -1465,10 +1492,7 @@ private:
             type = ResolveType(decl->type.get());
         }
         else if (decl->init)
-        {
-            TypedValue initValue = EvaluateRValue(decl->init.get());
-            type = initValue.type;
-        }
+            type = InferExprType(decl->init.get());
         else
             Error("Variable '" + decl->name + "' must have either a type or an initializer", decl->line);
 
@@ -2228,6 +2252,21 @@ private:
         return CastValue(operand, targetType, cast->line);
     }
 
+    // C default argument promotions for variadic arguments: float -> double, small ints -> int
+    Value* PromoteVarArg(const TypedValue& arg)
+    {
+        Type* type = arg.value->getType();
+        if (type->isFloatTy())
+            return m_builder.CreateFPExt(arg.value, m_builder.getDoubleTy());
+        if (type->isIntegerTy() && type->getIntegerBitWidth() < 32)
+        {
+            if (arg.type.isUnsigned || type->isIntegerTy(1))
+                return m_builder.CreateZExt(arg.value, m_builder.getInt32Ty());
+            return m_builder.CreateSExt(arg.value, m_builder.getInt32Ty());
+        }
+        return arg.value;
+    }
+
     std::vector<Value*> BuildCallArgs(
         const FunctionInfo& funcInfo,
         const std::vector<std::unique_ptr<ExprNode>>& callArgs,
@@ -2275,7 +2314,7 @@ private:
         }
 
         for (size_t i = funcInfo.paramTypes.size(); i < callArgs.size(); i++)
-            args.push_back(EvaluateRValue(callArgs[i].get()).value);
+            args.push_back(PromoteVarArg(EvaluateRValue(callArgs[i].get())));
 
         return args;
     }
@@ -2332,7 +2371,7 @@ private:
                 args.push_back(arg.value);
             }
             for (size_t i = funcInfo.paramTypes.size(); i < evaluated.size(); i++)
-                args.push_back(evaluated[i].value);
+                args.push_back(PromoteVarArg(evaluated[i]));
 
             return args;
         };
