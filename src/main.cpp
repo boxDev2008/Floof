@@ -244,6 +244,9 @@ static std::string compileAll(
             catch (...) { std::lock_guard lk(errorMx); if (!firstErr) firstErr = std::current_exception(); }
             double elapsed = Seconds(Clock::now() - t0).count();
 
+            if (*tasks[i].first == BUILTIN_MODULE_NAME)
+                continue;
+
             std::lock_guard lk(printMx);
             step("Compiled " + std::string(C::CYAN) + *tasks[i].first + ".floof" +
                  C::RESET + C::DIM + " (" + fmtSeconds(elapsed) + ")" + C::RESET);
@@ -259,8 +262,10 @@ static std::string compileAll(
 
     if (firstErr) std::rethrow_exception(firstErr);
 
-    step(std::string("Compiled ") + C::BGREEN + std::to_string(tasks.size()) + C::RESET +
-         " module(s) across " + C::BYELLOW + std::to_string(threadCount) + C::RESET +
+    // __builtin is an implementation detail, so it's left out of the reported counts
+    const size_t userModuleCount = tasks.size() - modules.count(BUILTIN_MODULE_NAME);
+    step(std::string("Compiled ") + C::BGREEN + std::to_string(userModuleCount) + C::RESET +
+         " module(s) across " + C::BYELLOW + std::to_string(std::min(threadCount, userModuleCount)) + C::RESET +
          " thread(s)" + C::DIM + " (" + fmtSeconds(elapsed) + ")" + C::RESET);
 
     std::string objectFiles;

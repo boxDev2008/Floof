@@ -95,11 +95,6 @@ struct MemberAccess : ExprNode {
     std::string member;
 };
 
-struct PointerMemberAccess : ExprNode {
-    std::unique_ptr<ExprNode> object;
-    std::string member;
-};
-
 struct FieldInit {
     std::string name;
     std::unique_ptr<ExprNode> value;
@@ -117,6 +112,11 @@ struct ArrayInit : ExprNode {
 
 struct SizeofExpr : ExprNode {
     std::unique_ptr<TypeNode> type;
+};
+
+struct NewExpr : ExprNode {
+    std::unique_ptr<TypeNode> type;
+    std::unique_ptr<ExprNode> count;
 };
 
 struct StmtNode : ASTNode {
@@ -162,6 +162,10 @@ struct TernaryExpr : ExprNode {
     std::unique_ptr<ExprNode> condition;
     std::unique_ptr<ExprNode> then_expr;
     std::unique_ptr<ExprNode> else_expr;
+};
+
+struct FreeStmt : StmtNode {
+    std::unique_ptr<ExprNode> value;
 };
 
 struct BreakStmt : StmtNode { };
@@ -479,7 +483,7 @@ public:
         return module;
     }
 
-    std::unique_ptr<TypeNode> ParseType(void)
+    std::unique_ptr<TypeNode> ParseType(bool allowArrayDims = true)
     {
         std::unique_ptr<TypeNode> type = std::make_unique<TypeNode>();
         type->line = CurrentLine();
@@ -552,7 +556,7 @@ public:
                 type->pointer_const.push_back(false);
         }
         
-        while (Match('['))
+        while (allowArrayDims && Match('['))
         {
             if (Match(']'))
                 type->array_dimensions.push_back(-1);
@@ -817,15 +821,6 @@ public:
                 member->member = m_last.value;
                 expr = std::move(member);
             }
-            else if (Match(TokenType_Arrow))
-            {
-                auto member = std::make_unique<PointerMemberAccess>();
-                member->line = opLine;
-                member->object = std::move(expr);
-                Expect(TokenType_Identifier, "Expected member name");
-                member->member = m_last.value;
-                expr = std::move(member);
-            }
             else if (Match('('))
             {
                 auto call = std::make_unique<CallExpr>();
@@ -973,6 +968,19 @@ public:
                 Expect(')', "Expected ')' after cast type");
                 cast->operand = ParseUnary();
                 return cast;
+            }
+
+            if (name == "new" && Check(TokenType_Identifier))
+            {
+                auto newExpr = std::make_unique<NewExpr>();
+                newExpr->line = primaryLine;
+                newExpr->type = ParseType(false);
+                if (Match('['))
+                {
+                    newExpr->count = ParseExpr();
+                    Expect(']', "Expected ']' after 'new' array size");
+                }
+                return newExpr;
             }
 
             if (name == "typeof" && Match('('))
@@ -1123,6 +1131,15 @@ public:
             return stmt;
         }
 
+        if (Check(TokenType_Identifier) && m_current.value == "free" && !PeekIs(':') && !PeekIs('=') && Match("free"))
+        {
+            auto freeStmt = std::make_unique<FreeStmt>();
+            freeStmt->line = stmtLine;
+            freeStmt->value = ParseExpr();
+            Expect(';', "Expected ';' after 'free'");
+            return freeStmt;
+        }
+
         if (Match("match"))
         {
             auto stmt = ParseMatchStmt();
@@ -1185,15 +1202,6 @@ public:
                     else if (Match('.'))
                     {
                         auto member = std::make_unique<MemberAccess>();
-                        member->line = postfixLine;
-                        member->object = std::move(expr);
-                        Expect(TokenType_Identifier, "Expected member name");
-                        member->member = m_last.value;
-                        expr = std::move(member);
-                    }
-                    else if (Match(TokenType_Arrow))
-                    {
-                        auto member = std::make_unique<PointerMemberAccess>();
                         member->line = postfixLine;
                         member->object = std::move(expr);
                         Expect(TokenType_Identifier, "Expected member name");

@@ -1713,7 +1713,7 @@ private:
 
         TypeInfo baseType = ResolveSimpleType(node);
         Type* arrayType = ArrayType::get(baseType.llvmType, inferredSize);
-        return TypeInfo(arrayType, baseType.isUnsigned, false, nullptr, nullptr, baseType.pointerConst);
+        return TypeInfo(arrayType, baseType.isUnsigned, false, baseType.pointeeType, nullptr, baseType.pointerConst);
     }
 
     TypeInfo InferExprType(ExprNode* expr)
@@ -1865,6 +1865,8 @@ private:
                 GenerateBreak(s);
             else if (auto* s = dynamic_cast<ContinueStmt*>(stmt.get()))
                 GenerateContinue(s);
+            else if (auto* s = dynamic_cast<FreeStmt*>(stmt.get()))
+                GenerateFree(s);
             else if (auto* s = dynamic_cast<MatchStmt*>(stmt.get()))
             {
                 GenerateMatch(s, returnType);
@@ -2027,6 +2029,99 @@ private:
             }
             else m_builder.CreateStore(CreateZeroValue(fieldType->llvmType), fieldPtr);
         }
+    }
+
+    FunctionCallee GetCRuntimeFunction(const char* name, Type* returnType, ArrayRef<Type*> paramTypes)
+    {
+        return m_module->getOrInsertFunction(name, FunctionType::get(returnType, paramTypes, false));
+    }
+
+    // Resolves 'T*' for the type node 'T'
+    TypeInfo PointerToType(TypeNode* node)
+    {
+        node->pointer_depth++;
+        node->pointer_const.push_back(false);
+        TypeInfo type = ResolveType(node);
+        node->pointer_depth--;
+        node->pointer_const.pop_back();
+        return type;
+    }
+
+    // 'new T' / 'new T[count]': malloc'd, zeroed, and struct field defaults applied
+    // the same way an uninitialized stack struct is
+    TypedValue EvaluateNew(NewExpr* expr)
+    {
+        if (expr->type->is_function_type)
+            Error("'new' cannot allocate a function type", expr->line);
+
+        TypeInfo elemType = ResolveType(expr->type.get());
+        if (elemType.llvmType->isVoidTy())
+            Error("'new' cannot allocate u0", expr->line);
+
+        TypeInfo ptrType = PointerToType(expr->type.get());
+        uint64_t elemSize = m_module->getDataLayout().getTypeAllocSize(elemType.llvmType);
+
+        Value* count = nullptr;
+        Value* bytes = m_builder.getInt64(elemSize);
+        if (expr->count)
+        {
+            TypedValue countValue = EvaluateRValue(expr->count.get());
+            if (!countValue.type.llvmType->isIntegerTy())
+                Error("Array size in 'new' must be an integer", expr->count->line);
+            count = m_builder.CreateIntCast(countValue.value, m_builder.getInt64Ty(), !countValue.type.isUnsigned);
+            bytes = m_builder.CreateMul(count, bytes);
+        }
+
+        FunctionCallee malloc = GetCRuntimeFunction("malloc", m_builder.getPtrTy(), {m_builder.getInt64Ty()});
+        Value* memory = m_builder.CreateCall(malloc, {bytes});
+        m_builder.CreateMemSet(memory, m_builder.getInt8(0), bytes, MaybeAlign());
+
+        const StructInfo* info = elemType.llvmType->isStructTy() ? FindStructInfo(elemType.llvmType) : nullptr;
+        bool hasDefaults = info && std::any_of(info->fieldDefaults.begin(), info->fieldDefaults.end(),
+            [](const auto& entry) { return entry.second != nullptr; });
+        if (!hasDefaults)
+            return TypedValue(memory, ptrType);
+
+        StructInit emptyInit;
+        emptyInit.type_name = StructNameFor(elemType.llvmType);
+        emptyInit.line = expr->line;
+
+        if (!count)
+        {
+            InitializeStructInPlace(memory, elemType, &emptyInit);
+            return TypedValue(memory, ptrType);
+        }
+
+        Function* func = m_builder.GetInsertBlock()->getParent();
+        BasicBlock* entryBB = m_builder.GetInsertBlock();
+        BasicBlock* condBB = BasicBlock::Create(m_context, "new.cond", func);
+        BasicBlock* bodyBB = BasicBlock::Create(m_context, "new.body", func);
+        BasicBlock* endBB = BasicBlock::Create(m_context, "new.end", func);
+
+        m_builder.CreateBr(condBB);
+        m_builder.SetInsertPoint(condBB);
+        PHINode* index = m_builder.CreatePHI(m_builder.getInt64Ty(), 2, "new.i");
+        index->addIncoming(m_builder.getInt64(0), entryBB);
+        m_builder.CreateCondBr(m_builder.CreateICmpULT(index, count), bodyBB, endBB);
+
+        m_builder.SetInsertPoint(bodyBB);
+        Value* elemPtr = m_builder.CreateInBoundsGEP(elemType.llvmType, memory, index);
+        InitializeStructInPlace(elemPtr, elemType, &emptyInit);
+        index->addIncoming(m_builder.CreateAdd(index, m_builder.getInt64(1)), m_builder.GetInsertBlock());
+        m_builder.CreateBr(condBB);
+
+        m_builder.SetInsertPoint(endBB);
+        return TypedValue(memory, ptrType);
+    }
+
+    void GenerateFree(FreeStmt* stmt)
+    {
+        TypedValue value = EvaluateRValue(stmt->value.get());
+        if (!value.type.llvmType->isPointerTy())
+            Error("'free' expects a pointer", stmt->line);
+
+        FunctionCallee free = GetCRuntimeFunction("free", m_builder.getVoidTy(), {m_builder.getPtrTy()});
+        m_builder.CreateCall(free, {value.value});
     }
 
     void GenerateExprStmt(ExprStmt* stmt)
@@ -2315,9 +2410,6 @@ private:
         if (auto* member = dynamic_cast<MemberAccess*>(node))
             return EvaluateMemberAccess(member);
 
-        if (auto* member = dynamic_cast<PointerMemberAccess*>(node))
-            return EvaluatePointerMemberAccess(member);
-
         if (auto* cast = dynamic_cast<CastExpr*>(node))
         {
             TypedValue operand = EvaluateLValue(cast->operand.get());
@@ -2396,12 +2488,6 @@ private:
             return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
         }
 
-        if (auto* member = dynamic_cast<PointerMemberAccess*>(node))
-        {
-            TypedValue ptr = EvaluateLValue(member);
-            return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
-        }
-
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
         {
             TypeInfo type = ResolveType(sizeofExpr->type.get());
@@ -2433,6 +2519,9 @@ private:
 
         if (auto* typeofExpr = dynamic_cast<TypeofExpr*>(node))
             return EvaluateTypeof(typeofExpr);
+
+        if (auto* newExpr = dynamic_cast<NewExpr*>(node))
+            return EvaluateNew(newExpr);
 
         if (dynamic_cast<SpreadExpr*>(node))
             Error("'..' can only be used on the last argument of a call", node->line);
@@ -2687,15 +2776,12 @@ private:
             
             TypeInfo elemTypeInfo(elementType, base.type.isUnsigned, base.type.isConst);
             
-            if (elementType->isArrayTy() && base.type.functionInfo)
+            // Arrays of pointers (and nested arrays of them) carry the pointee down to the element
+            if (elementType->isArrayTy() || elementType->isPointerTy())
             {
                 elemTypeInfo.pointeeType = base.type.pointeeType;
                 elemTypeInfo.functionInfo = base.type.functionInfo;
-            }
-            else if (elementType->isPointerTy() && base.type.functionInfo)
-            {
-                elemTypeInfo.pointeeType = base.type.pointeeType;
-                elemTypeInfo.functionInfo = base.type.functionInfo;
+                elemTypeInfo.pointerConst = base.type.pointerConst;
             }
             
             return TypedValue(gep, elemTypeInfo);
@@ -2754,53 +2840,53 @@ private:
         if (TryEnumValue(access))
             Error("Cannot assign to or take the address of enum value " + access->member, access->line);
 
-        TypedValue structPtr = EvaluateLValue(access->object.get());
-        
-        Type* structType = structPtr.type.llvmType;
-        if (!structType->isStructTy())
-            Error("Member access on non-struct type", access->line);
-        
-        const StructInfo* structInfo = FindStructInfo(structType);
-        if (!structInfo)
-            Error("Unknown struct type", access->line);
-        
-        auto it = structInfo->fieldIndices.find(access->member);
-        if (it == structInfo->fieldIndices.end())
-            Error("Unknown member: " + access->member, access->line);
-        
-        unsigned fieldIndex = it->second;
-        TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
-        fieldType.isConst = structPtr.type.isConst || fieldType.isConst;
+        // Struct values are accessed in place; pointers to structs are dereferenced implicitly
+        TypedValue object = IsLValueNode(access->object.get())
+            ? EvaluateLValue(access->object.get())
+            : EvaluateRValue(access->object.get());
 
-        auto* fieldPtr = m_builder.CreateStructGEP(structType, structPtr.value, fieldIndex);
-        return TypedValue(fieldPtr, fieldType);
+        if (object.type.llvmType->isStructTy())
+            return StructFieldPointer(object.value, object.type.llvmType, object.type.isConst, access->member, access->line);
+
+        if (IsStructPointer(object.type))
+        {
+            if (IsLValueNode(access->object.get()))
+                object.value = m_builder.CreateLoad(object.type.llvmType, object.value);
+            return StructFieldPointer(object.value, object.type.pointeeType, object.type.isConst, access->member, access->line);
+        }
+
+        Error("Member access on non-struct type", access->line);
     }
 
-    TypedValue EvaluatePointerMemberAccess(PointerMemberAccess* access)
+    bool IsLValueNode(ExprNode* node) const
     {
-        TypedValue ptr = EvaluateRValue(access->object.get());
-        
-        if (!ptr.type.llvmType->isPointerTy() || !ptr.type.pointeeType)
-            Error("Cannot use -> on non-pointer type", access->line);
-        
-        Type* pointeeType = ptr.type.pointeeType;
-        if (!pointeeType->isStructTy())
-            Error("Cannot access member on non-struct pointer", access->line);
-        
-        const StructInfo* structInfo = FindStructInfo(pointeeType);
-        if (!structInfo)
-            Error("Unknown struct type", access->line);
-        
-        auto it = structInfo->fieldIndices.find(access->member);
-        if (it == structInfo->fieldIndices.end())
-            Error("Unknown member: " + access->member, access->line);
-        
-        unsigned fieldIndex = it->second;
-    
-        TypeInfo fieldType = structInfo->fieldTypes.at(access->member);
-        fieldType.isConst = ptr.type.isConst || fieldType.isConst;
+        if (auto* unary = dynamic_cast<UnaryExpr*>(node))
+            return unary->op == '*';
+        return dynamic_cast<Identifier*>(node) || dynamic_cast<ArrayAccess*>(node) ||
+               dynamic_cast<MemberAccess*>(node) || dynamic_cast<CastExpr*>(node);
+    }
 
-        auto* fieldPtr = m_builder.CreateStructGEP(pointeeType, ptr.value, fieldIndex);
+    // Single-level pointer to a struct ('T*', not 'T**')
+    bool IsStructPointer(const TypeInfo& type) const
+    {
+        return type.llvmType->isPointerTy() && type.pointeeType && type.pointeeType->isStructTy() &&
+               type.pointerConst.size() <= 1 && !type.functionInfo;
+    }
+
+    TypedValue StructFieldPointer(Value* structPtr, Type* structType, bool isConst, const std::string& member, uint32_t line)
+    {
+        const StructInfo* structInfo = FindStructInfo(structType);
+        if (!structInfo)
+            Error("Unknown struct type", line);
+        
+        auto it = structInfo->fieldIndices.find(member);
+        if (it == structInfo->fieldIndices.end())
+            Error("Unknown member: " + member, line);
+        
+        TypeInfo fieldType = structInfo->fieldTypes.at(member);
+        fieldType.isConst = isConst || fieldType.isConst;
+
+        auto* fieldPtr = m_builder.CreateStructGEP(structType, structPtr, it->second);
         return TypedValue(fieldPtr, fieldType);
     }
 
@@ -3222,7 +3308,7 @@ private:
             Type* type = baseType.llvmType;
             for (size_t dim : node->array_dimensions)
                 type = ArrayType::get(type, dim);
-            return TypeInfo(type, baseType.isUnsigned, false, nullptr, nullptr, baseType.pointerConst);
+            return TypeInfo(type, baseType.isUnsigned, false, baseType.pointeeType, nullptr, baseType.pointerConst);
         }
         
         return ResolveSimpleType(node);
@@ -3249,7 +3335,7 @@ private:
         Type* type = base.llvmType;
         for (size_t dim : node->array_dimensions)
             type = ArrayType::get(type, dim);
-        return TypeInfo(type, base.isUnsigned, false, nullptr, nullptr, base.pointerConst);
+        return TypeInfo(type, base.isUnsigned, false, base.pointeeType, nullptr, base.pointerConst);
     }
 
     TypeInfo ResolveAliasedType(TypeNode* useNode, AliasDecl* alias)

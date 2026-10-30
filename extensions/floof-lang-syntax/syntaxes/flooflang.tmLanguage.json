@@ -73,7 +73,7 @@
         },
         {
           "name": "keyword.other.flooflang",
-          "match": "\\b(using|require|pub|struct|enum|const|extern|packed|typename)\\b"
+          "match": "\\b(using|require|pub|struct|enum|const|extern|packed|typename|new|free)\\b"
         },
         {
           "name": "constant.language.boolean.flooflang",
@@ -136,7 +136,7 @@
           }
         },
         {
-          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|typeof)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(<)([^>]*)(>)?\\s*(?=\\()",
+          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|typeof|new|free)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(<)([^>]*)(>)?\\s*(?=\\()",
           "captures": {
             "1": { "name": "keyword.other.flooflang" },
             "2": { "name": "entity.name.function.flooflang" },
@@ -148,7 +148,7 @@
           }
         },
         {
-          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|typeof)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|typeof|new|free)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
           "captures": {
             "1": { "name": "keyword.other.flooflang" },
             "2": { "name": "entity.name.function.flooflang" }

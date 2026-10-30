@@ -59,7 +59,6 @@ write_value(arg: any)
         typeof(char*) { printf("%s", cast(char*) arg); }
         else
         {
-            // The top bit of a typeid marks pointer types
             if typeof(arg) >> 63 == 1 { printf("%p", cast(u0*) arg); }
             else { printf("{?}"); }
         }
