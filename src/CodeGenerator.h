@@ -15,6 +15,8 @@
 #include <unordered_set>
 #include <limits>
 
+#include "Builtin.h"
+
 using namespace llvm;
 
 class CodeGenerator
@@ -77,6 +79,10 @@ class CodeGenerator
         // Set for instances of generic structs, used to infer type arguments from struct args
         const StructDecl* genericDecl = nullptr;
         std::vector<TypeInfo> genericArgs;
+
+        // Set for the pack type of a variadic parameter ({ data: T*, len: usize })
+        bool isPack = false;
+        TypeInfo packElem;
     };
 
     struct EnumInfo
@@ -92,8 +98,10 @@ class CodeGenerator
         std::vector<TypeInfo> paramTypes;
         std::vector<ExprNode*> defaultValues;
         TypeInfo returnType;
-        bool isVarArg;
+        bool isVarArg;              // C-style '...'
         bool isExtern = false;
+        bool hasPack = false;       // last entry of paramTypes is a variadic pack of packElem
+        TypeInfo packElem;
         std::string sourceName;
 
         FunctionInfo() : function(nullptr), isVarArg(false) {}
@@ -136,13 +144,13 @@ public:
     {
         m_module = std::make_unique<Module>(moduleName, ctx);
 
+        RegisterBuiltinTypes();
         ImportUsedModules(ast, moduleTable);
         RegisterAliases(ast);
         RegisterEnums(ast);
         RegisterStructs(ast);
         DeclareUserFunctions(ast);
         DeclareGlobalVariables(ast);
-        RegisterBuiltinFunctions();
         DefineUserFunctionBodies(ast);
         DefineGenericInstanceBodies();
     }
@@ -158,6 +166,9 @@ private:
 
     void ImportUsedModules(const ModuleAST& ast, std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable)
     {
+        if (m_module->getName() != BUILTIN_MODULE_NAME && moduleTable.count(BUILTIN_MODULE_NAME))
+            ImportModuleRecursively(BUILTIN_MODULE_NAME, moduleTable);
+
         for (const auto& use : ast.usings)
             ImportModuleRecursively(use->name, moduleTable);
     }
@@ -446,8 +457,19 @@ private:
                 else
                     return TypedValue(globalVar, globalIt->second.type);
             }
+
+            if (auto typeId = TryTypeNameAsValue(id))
+                return *typeId;
             
             Error("Cannot use variable in constant expression: " + id->name, id->line);
+        }
+
+        if (auto* typeofExpr = dynamic_cast<TypeofExpr*>(node))
+        {
+            if (!TypeofNamesType(typeofExpr))
+                Error("typeof in a constant expression must name a type", typeofExpr->line);
+            TypeInfo type = ResolveType(typeofExpr->type.get());
+            return TypedValue(m_builder.getInt64(TypeIdOf(type)), TypeIdType());
         }
     
         if (auto* num = dynamic_cast<NumberLiteral*>(node))
@@ -473,7 +495,7 @@ private:
                 strGlobal,
                 indices
             );
-            return TypedValue(strPtr, TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false, m_builder.getInt8Ty()));
+            return TypedValue(strPtr, TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false, true, m_builder.getInt8Ty()));
         }
 
         if (auto* ch = dynamic_cast<CharLiteral*>(node))
@@ -632,19 +654,11 @@ private:
             return TypedValue(ConstantStruct::get(info.type, fieldValues), TypeInfo(info.type, false));
         }
 
-        if (auto* enumAccess = dynamic_cast<EnumAccess*>(node))
+        if (auto* member = dynamic_cast<MemberAccess*>(node))
         {
-            auto it = m_enums.find(enumAccess->enum_name);
-            if (it == m_enums.end())
-                Error("Unknown enum: " + enumAccess->enum_name, enumAccess->line);
-            
-            auto valueIt = it->second.values.find(enumAccess->value_name);
-            if (valueIt == it->second.values.end())
-                Error("Unknown enum value: " + enumAccess->value_name, enumAccess->line);
-            
-            const TypeInfo& baseType = it->second.baseType;
-            auto* val = llvm::ConstantInt::get(baseType.llvmType, valueIt->second, !baseType.isUnsigned);
-            return TypedValue(val, baseType);
+            if (auto enumValue = TryEnumValue(member))
+                return *enumValue;
+            Error("Expected constant expression", member->line);
         }
 
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
@@ -756,52 +770,159 @@ private:
         Error("Cannot cast between incompatible types in constant expression", line);
     }
     
-    void RegisterBuiltinFunctions(void)
+    // `any` holds a pointer to a value together with the value's typeid
+    void RegisterBuiltinTypes(void)
     {
-        auto* printfFunc = Function::Create(
-            FunctionType::get(
-                m_builder.getInt32Ty(),
-                {llvm::PointerType::getUnqual(m_builder.getContext())},
-                true
-            ),
-            Function::ExternalLinkage, "printf", m_module.get()
-        );
-        m_functions["printf"] = { FunctionInfo(
-            printfFunc,
-            {TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false)},
-            TypeInfo(m_builder.getInt32Ty(), false),
-            true, {}, "printf"
-        ) };
+        m_anyType = StructType::create(m_context, {m_builder.getInt64Ty(), m_builder.getPtrTy()}, "any");
 
-        auto* vaStartFunc = Function::Create(
-            FunctionType::get(
-                m_builder.getVoidTy(),
-                {m_builder.getPtrTy()},
-                false
-            ),
-            Function::ExternalLinkage, "llvm.va_start", m_module.get()
-        );
-        m_functions["llvm.va_start"] = { FunctionInfo(
-            vaStartFunc,
-            {TypeInfo(m_builder.getPtrTy(), false)},
-            TypeInfo(m_builder.getVoidTy(), false),
-            false, {}, "llvm.va_start"
-        ) };
+        StructInfo& info = m_structs["any"];
+        info.type = m_anyType;
+        info.fieldIndices = {{"type", 0}, {"data", 1}};
+        info.fieldTypes = {
+            {"type", TypeIdType()},
+            {"data", TypeInfo(m_builder.getPtrTy(), false, false, m_builder.getInt8Ty(), nullptr, {false})}
+        };
+    }
 
-        auto* vaEndFunc = Function::Create(
-            FunctionType::get(
-                m_builder.getVoidTy(),
-                {m_builder.getPtrTy()},
-                false
-            ),
-            Function::ExternalLinkage, "llvm.va_end", m_module.get()
-        );
-        m_functions["llvm.va_end"] = { FunctionInfo(
-            vaEndFunc,
-            {TypeInfo(m_builder.getPtrTy(), false)},
-            TypeInfo(m_builder.getVoidTy(), false),
-            false, {}, "llvm.va_end"
-        ) };
+    TypeInfo TypeIdType(void) { return TypeInfo(m_builder.getInt64Ty(), true); }
+
+    bool IsAnyType(const TypeInfo& type) const { return type.llvmType == m_anyType; }
+
+    const StructInfo* FindPackInfo(const TypeInfo& type) const
+    {
+        if (!type.llvmType->isStructTy())
+            return nullptr;
+        const StructInfo* info = FindStructInfo(type.llvmType);
+        return info && info->isPack ? info : nullptr;
+    }
+
+    TypeInfo GetPackType(const TypeInfo& elem)
+    {
+        std::string name = ".." + MangleTypeSuffix(elem);
+        auto it = m_structs.find(name);
+        if (it != m_structs.end())
+            return TypeInfo(it->second.type, false);
+
+        StructInfo& info = m_structs[name];
+        info.type = StructType::create(m_context, {m_builder.getPtrTy(), m_builder.getInt64Ty()}, name);
+        info.fieldIndices = {{"data", 0}, {"len", 1}};
+        info.fieldTypes = {
+            {"data", TypeInfo(m_builder.getPtrTy(), false, false, elem.llvmType, nullptr, {false})},
+            {"len", TypeInfo(m_builder.getInt64Ty(), true)}
+        };
+        info.isPack = true;
+        info.packElem = elem;
+        info.packElem.isConst = false;
+        return TypeInfo(info.type, false);
+    }
+
+    // Type ids are a hash of the mangled type name, so every module computes the same id for a
+    // type without sharing a table. The top bit marks pointer types
+    uint64_t TypeIdOf(const TypeInfo& type) const
+    {
+        uint64_t hash = 14695981039346656037ull;
+        for (char c : MangleTypeSuffix(type))
+        {
+            hash ^= (uint8_t)c;
+            hash *= 1099511628211ull;
+        }
+        hash &= ~(1ull << 63);
+        if (type.llvmType->isPointerTy())
+            hash |= 1ull << 63;
+        return hash;
+    }
+
+    bool IsValueName(const std::string& name)
+    {
+        return (!m_scopes.empty() && IsVariableAccessibleInCurrentScope(name)) ||
+            m_globals.count(name) || m_functions.count(name) || m_genericProcs.count(name);
+    }
+
+    bool IsTypeName(const std::string& name)
+    {
+        bool isUnsigned;
+        return GetBuiltinType(name, isUnsigned) || m_typeBindings.count(name) || m_structs.count(name) ||
+            m_enums.count(name) || m_aliases.count(name) || m_genericStructs.count(name);
+    }
+
+    // A bare type name used as a value, as in `typeof(x) == i32`
+    std::optional<TypedValue> TryTypeNameAsValue(Identifier* id)
+    {
+        if (!id->generic_args.empty() || IsValueName(id->name) || !IsTypeName(id->name))
+            return std::nullopt;
+
+        TypeNode node;
+        node.name = id->name;
+        node.line = id->line;
+        return TypedValue(m_builder.getInt64(TypeIdOf(ResolveType(&node))), TypeIdType());
+    }
+
+    // typeof(T) when the operand reads as a type and its name is not shadowed by a value
+    bool TypeofNamesType(TypeofExpr* expr)
+    {
+        if (!expr->type)
+            return false;
+        return !expr->operand || (!IsValueName(expr->type->name) && IsTypeName(expr->type->name));
+    }
+
+    TypedValue EvaluateTypeof(TypeofExpr* expr)
+    {
+        if (TypeofNamesType(expr))
+            return TypedValue(m_builder.getInt64(TypeIdOf(ResolveType(expr->type.get()))), TypeIdType());
+
+        // Only an `any` needs evaluating: its typeid is only known at runtime
+        TypeInfo staticType = InferExprType(expr->operand.get());
+        if (IsAnyType(staticType))
+        {
+            TypedValue boxed = EvaluateRValue(expr->operand.get());
+            return TypedValue(m_builder.CreateExtractValue(boxed.value, 0), TypeIdType());
+        }
+        return TypedValue(m_builder.getInt64(TypeIdOf(staticType)), TypeIdType());
+    }
+
+    Value* CreateEntryAlloca(Type* type, const std::string& name)
+    {
+        Function* func = m_builder.GetInsertBlock()->getParent();
+        IRBuilder<> entry(&func->getEntryBlock(), func->getEntryBlock().begin());
+        return entry.CreateAlloca(type, nullptr, name);
+    }
+
+    // The boxed value lives in a slot in the function's entry block, so it stays valid until
+    // the function returns or the same expression is evaluated again
+    TypedValue BoxAny(const TypedValue& value, uint32_t line)
+    {
+        if (value.type.llvmType->isVoidTy())
+            Error("Cannot convert a value of type u0 to 'any'", line);
+
+        Value* slot = CreateEntryAlloca(value.type.llvmType, "any.value");
+        m_builder.CreateStore(value.value, slot);
+
+        Value* boxed = PoisonValue::get(m_anyType);
+        boxed = m_builder.CreateInsertValue(boxed, m_builder.getInt64(TypeIdOf(value.type)), 0);
+        boxed = m_builder.CreateInsertValue(boxed, slot, 1);
+        return TypedValue(boxed, TypeInfo(m_anyType, false));
+    }
+
+    TypedValue BuildPack(const FunctionInfo& funcInfo, const std::vector<TypedValue>& values, uint32_t line)
+    {
+        const TypeInfo& packType = funcInfo.paramTypes.back();
+        Value* data = ConstantPointerNull::get(m_builder.getPtrTy());
+
+        if (!values.empty())
+        {
+            auto* arrayType = ArrayType::get(funcInfo.packElem.llvmType, values.size());
+            data = CreateEntryAlloca(arrayType, "pack");
+            for (size_t i = 0; i < values.size(); i++)
+            {
+                TypedValue elem = CastIfNeeded(values[i], funcInfo.packElem, line);
+                m_builder.CreateStore(elem.value, m_builder.CreateConstInBoundsGEP2_64(arrayType, data, 0, i));
+            }
+        }
+
+        Value* pack = PoisonValue::get(packType.llvmType);
+        pack = m_builder.CreateInsertValue(pack, data, 0);
+        pack = m_builder.CreateInsertValue(pack, m_builder.getInt64(values.size()), 1);
+        return TypedValue(pack, packType);
     }
 
     std::string MangleTypeSuffix(const TypeInfo& type) const
@@ -871,7 +992,7 @@ private:
 
         for (const auto& param : proc->params)
         {
-            TypeInfo paramType = ResolveType(param.type.get());
+            TypeInfo paramType = ResolveParamType(param);
             paramLLVMTypes.push_back(paramType.llvmType);
             paramTypes.push_back(paramType);
             defaultValues.push_back(param.default_value.get());
@@ -910,14 +1031,31 @@ private:
             arg.setName(proc->params[idx++].name);
 
         FunctionInfo info(func, paramTypes, returnType, proc->is_vararg, std::move(defaultValues), proc->name, proc->is_extern);
+        SetPackInfo(info, proc);
         overloads.push_back(info);
         return info;
+    }
+
+    TypeInfo ResolveParamType(const Parameter& param)
+    {
+        TypeInfo type = ResolveType(param.type.get());
+        return param.is_variadic ? GetPackType(type) : type;
+    }
+
+    void SetPackInfo(FunctionInfo& info, const ProcDecl* proc)
+    {
+        info.hasPack = proc->HasVariadicParam();
+        if (info.hasPack)
+            info.packElem = FindPackInfo(info.paramTypes.back())->packElem;
     }
 
     int ScoreArgMatch(const TypeInfo& argType, const TypeInfo& paramType) const
     {
         if (argType == paramType)
             return 0;
+
+        if (IsAnyType(paramType))
+            return IsAnyType(argType) ? 0 : 2;
 
         Type* a = argType.llvmType;
         Type* p = paramType.llvmType;
@@ -959,32 +1097,41 @@ private:
             "which overload to use as a value", line);
     }
 
-    int ScoreCandidate(const FunctionInfo& cand, const std::vector<TypeInfo>& argTypes) const
+    int ScoreCandidate(const FunctionInfo& cand, const std::vector<TypeInfo>& argTypes, int spreadIndex) const
     {
-        size_t minRequired = cand.paramTypes.size();
-        for (size_t i = 0; i < cand.defaultValues.size(); i++)
+        size_t fixedCount = cand.paramTypes.size() - (cand.hasPack ? 1 : 0);
+        size_t positional = spreadIndex >= 0 ? (size_t)spreadIndex : argTypes.size();
+
+        size_t minRequired = fixedCount;
+        for (size_t i = 0; i < fixedCount && i < cand.defaultValues.size(); i++)
             if (cand.defaultValues[i]) { minRequired = i; break; }
 
-        bool arityOk = cand.isVarArg
-            ? argTypes.size() >= cand.paramTypes.size()
-            : (argTypes.size() >= minRequired && argTypes.size() <= cand.paramTypes.size());
+        if (spreadIndex >= 0 && (!cand.hasPack || positional > fixedCount))
+            return -1;
+
+        bool arityOk = (cand.isVarArg || cand.hasPack)
+            ? positional >= minRequired
+            : (positional >= minRequired && positional <= fixedCount);
         if (!arityOk)
             return -1;
 
         int totalScore = 0;
-        for (size_t i = 0; i < argTypes.size() && i < cand.paramTypes.size(); i++)
+        for (size_t i = 0; i < positional; i++)
         {
-            int s = ScoreArgMatch(argTypes[i], cand.paramTypes[i]);
+            if (i >= fixedCount && !cand.hasPack)
+                break;
+            int s = ScoreArgMatch(argTypes[i], i < fixedCount ? cand.paramTypes[i] : cand.packElem);
             if (s < 0)
                 return -1;
             totalScore += s;
         }
+
+        if (spreadIndex >= 0 && argTypes[spreadIndex] != cand.paramTypes.back())
+            return -1;
         return totalScore;
     }
 
-    // Collects the plain overloads and generic templates named by the callee and picks the best
-    // match. On a tie, a non-generic overload beats a generic instantiation (as in C#).
-    FunctionInfo ResolveCall(Identifier* callee, const std::vector<TypeInfo>& argTypes, uint32_t line)
+    FunctionInfo ResolveCall(Identifier* callee, const std::vector<TypeInfo>& argTypes, int spreadIndex, uint32_t line)
     {
         const std::string& name = callee->name;
         std::vector<OverloadCandidate> candidates;
@@ -1001,6 +1148,8 @@ private:
         if (genIt == m_genericProcs.end() && !callee->generic_args.empty())
             Error("'" + name + "' is not a generic function", line);
 
+        std::string constraintNotes;
+
         if (genIt != m_genericProcs.end())
         {
             std::vector<TypeInfo> explicitArgs;
@@ -1016,8 +1165,15 @@ private:
                         continue;
                     typeArgs = explicitArgs;
                 }
-                else if (!InferTypeArguments(tmpl, argTypes, typeArgs))
+                else if (!InferTypeArguments(tmpl, argTypes, spreadIndex, typeArgs))
                     continue;
+
+                std::string failure = CheckGenericConstraints(name, tmpl->generic_params, tmpl->generic_constraints, typeArgs);
+                if (!failure.empty())
+                {
+                    constraintNotes += "\n  note: " + failure;
+                    continue;
+                }
 
                 candidates.push_back({ResolveGenericSignature(tmpl, typeArgs), tmpl, std::move(typeArgs)});
             }
@@ -1025,6 +1181,8 @@ private:
 
         if (candidates.empty())
         {
+            if (!constraintNotes.empty())
+                Error("No overload of '" + name + "' accepts these type arguments" + constraintNotes, line);
             if (!callee->generic_args.empty())
                 Error("No overload of generic function '" + name + "' takes "
                     + std::to_string(callee->generic_args.size()) + " type argument(s)", line);
@@ -1033,6 +1191,8 @@ private:
         }
 
         const OverloadCandidate* best = &candidates[0];
+        if (candidates.size() == 1 && !constraintNotes.empty() && ScoreCandidate(best->info, argTypes, spreadIndex) < 0)
+            Error("No matching overload for function '" + name + "' with the given argument types" + constraintNotes, line);
         if (candidates.size() > 1)
         {
             best = nullptr;
@@ -1041,7 +1201,7 @@ private:
 
             for (const auto& cand : candidates)
             {
-                int score = ScoreCandidate(cand.info, argTypes);
+                int score = ScoreCandidate(cand.info, argTypes, spreadIndex);
                 if (score < 0)
                     continue;
                 score = score * 2 + (cand.genericDecl ? 1 : 0);
@@ -1057,7 +1217,7 @@ private:
             }
 
             if (!best)
-                Error("No matching overload for function '" + name + "' with the given argument types", line);
+                Error("No matching overload for function '" + name + "' with the given argument types" + constraintNotes, line);
             if (ambiguous)
                 Error("Ambiguous call to overloaded function '" + name + "'", line);
         }
@@ -1087,11 +1247,6 @@ private:
             )
         );
     }
-
-    // ---- Generics ----------------------------------------------------------------------------
-    // Generic structs and procs are monomorphized: each distinct set of type arguments produces
-    // its own LLVM struct type / internal function. Type parameters are resolved through
-    // m_typeBindings, which is swapped in while a template's types or body are being resolved.
 
     std::string MangleTypeArgs(const std::vector<TypeInfo>& typeArgs) const
     {
@@ -1137,6 +1292,10 @@ private:
         if (m_structs.find(instanceName) != m_structs.end())
             return instanceName;
 
+        std::string failure = CheckGenericConstraints(name, decl->generic_params, decl->generic_constraints, typeArgs);
+        if (!failure.empty())
+            Error(failure, line);
+
         auto savedBindings = std::move(m_typeBindings);
         m_typeBindings = BindTypeParams(decl->generic_params, typeArgs);
 
@@ -1147,6 +1306,95 @@ private:
 
         m_typeBindings = std::move(savedBindings);
         return instanceName;
+    }
+
+    std::string TypeDisplayName(const TypeInfo& type) const
+    {
+        if (type.llvmType->isStructTy())
+            return StructNameFor(type.llvmType);
+        if (type.llvmType->isPointerTy() && type.pointeeType && !type.functionInfo)
+            return type.pointeeType->isIntegerTy(8)
+                ? "char*"
+                : TypeDisplayName(TypeInfo(type.pointeeType, type.isUnsigned)) + "*";
+        if (type.llvmType->isIntegerTy(1))
+            return "bool";
+        return MangleTypeSuffix(type);
+    }
+
+    std::string TypeNodeText(const TypeNode* node) const
+    {
+        if (node->is_function_type)
+            return "function type";
+
+        std::string text = (node->is_const ? "const " : "") + node->name;
+        if (!node->generic_args.empty())
+        {
+            text += "<";
+            for (size_t i = 0; i < node->generic_args.size(); i++)
+                text += (i ? ", " : "") + TypeNodeText(node->generic_args[i].get());
+            text += ">";
+        }
+        text += std::string(node->pointer_depth, '*');
+        for (int dim : node->array_dimensions)
+            text += dim < 0 ? "[]" : "[" + std::to_string(dim) + "]";
+        return text;
+    }
+
+    bool MatchesConstraintOption(const TypeNode* option, const TypeInfo& arg)
+    {
+        bool plainName = !option->is_function_type && option->pointer_depth == 0 &&
+            option->array_dimensions.empty() && option->generic_args.empty();
+
+        if (plainName && !IsTypeName(option->name))
+        {
+            Type* t = arg.llvmType;
+            bool integer = t->isIntegerTy() && !t->isIntegerTy(1);
+            const std::string& group = option->name;
+
+            if (group == "integer")  return integer;
+            if (group == "signed")   return integer && !arg.isUnsigned;
+            if (group == "unsigned") return integer && arg.isUnsigned;
+            if (group == "float")    return t->isFloatingPointTy();
+            if (group == "numeric")  return integer || t->isFloatingPointTy();
+            if (group == "pointer")  return t->isPointerTy();
+            Error("Unknown type or constraint '" + group + "' (constraint groups are integer, signed, "
+                "unsigned, float, numeric and pointer)", option->line);
+        }
+
+        return TypeIdOf(ResolveType(const_cast<TypeNode*>(option))) == TypeIdOf(arg);
+    }
+
+    std::string CheckGenericConstraints(
+        const std::string& name,
+        const std::vector<std::string>& params,
+        const std::vector<GenericConstraint>& constraints,
+        const std::vector<TypeInfo>& typeArgs)
+    {
+        auto savedBindings = std::move(m_typeBindings);
+        m_typeBindings = BindTypeParams(params, typeArgs);
+
+        std::string failure;
+        for (size_t i = 0; i < constraints.size() && failure.empty(); i++)
+        {
+            const GenericConstraint& constraint = constraints[i];
+            if (constraint.empty())
+                continue;
+
+            bool satisfied = false;
+            std::string allowed;
+            for (const auto& option : constraint)
+            {
+                satisfied = satisfied || MatchesConstraintOption(option.get(), typeArgs[i]);
+                allowed += (allowed.empty() ? "" : " | ") + TypeNodeText(option.get());
+            }
+
+            if (!satisfied)
+                failure = "'" + name + "' requires " + params[i] + ": " + allowed + ", but "
+                    + params[i] + " = " + TypeDisplayName(typeArgs[i]);
+        }
+
+        m_typeBindings = std::move(savedBindings);
+        return failure;
     }
 
     std::string ResolveStructInitName(StructInit* init)
@@ -1214,7 +1462,6 @@ private:
         if (it->second == arg)
             return true;
 
-        // Mixed numeric arguments (e.g. max(x_i64, 1)) widen to their common type
         Type* a = it->second.llvmType;
         Type* b = arg.llvmType;
         if ((a->isIntegerTy() || a->isFloatingPointTy()) && (b->isIntegerTy() || b->isFloatingPointTy()))
@@ -1229,12 +1476,31 @@ private:
     bool InferTypeArguments(
         const ProcDecl* proc,
         const std::vector<TypeInfo>& argTypes,
+        int spreadIndex,
         std::vector<TypeInfo>& outTypeArgs)
     {
         std::unordered_map<std::string, TypeInfo> inferred;
-        for (size_t i = 0; i < proc->params.size() && i < argTypes.size(); i++)
+        const bool hasPack = proc->HasVariadicParam();
+        size_t fixedCount = proc->params.size() - (hasPack ? 1 : 0);
+        size_t positional = spreadIndex >= 0 ? (size_t)spreadIndex : argTypes.size();
+
+        for (size_t i = 0; i < fixedCount && i < positional; i++)
             if (!UnifyTypeParam(proc->params[i].type.get(), argTypes[i], proc->generic_params, inferred))
                 return false;
+
+        if (hasPack)
+        {
+            const TypeNode* elemNode = proc->params.back().type.get();
+            if (spreadIndex >= 0)
+            {
+                const StructInfo* pack = FindPackInfo(argTypes[spreadIndex]);
+                if (!pack || !UnifyTypeParam(elemNode, pack->packElem, proc->generic_params, inferred))
+                    return false;
+            }
+            for (size_t i = fixedCount; i < positional; i++)
+                if (!UnifyTypeParam(elemNode, argTypes[i], proc->generic_params, inferred))
+                    return false;
+        }
 
         for (const auto& name : proc->generic_params)
         {
@@ -1256,12 +1522,13 @@ private:
         info.sourceName = proc->name;
         for (const auto& param : proc->params)
         {
-            info.paramTypes.push_back(ResolveType(param.type.get()));
+            info.paramTypes.push_back(ResolveParamType(param));
             info.defaultValues.push_back(param.default_value.get());
         }
         info.returnType = proc->return_type
             ? ResolveType(proc->return_type.get())
             : TypeInfo(Type::getVoidTy(m_context), false);
+        SetPackInfo(info, proc);
 
         m_typeBindings = std::move(savedBindings);
         return info;
@@ -1325,6 +1592,10 @@ private:
 
         if (!chosen)
             Error("No overload of generic function '" + id->name + "' matches the given type arguments", id->line);
+
+        std::string failure = CheckGenericConstraints(id->name, chosen->generic_params, chosen->generic_constraints, typeArgs);
+        if (!failure.empty())
+            Error(failure, id->line);
 
         return InstantiateGenericProc(chosen, typeArgs);
     }
@@ -1445,8 +1716,6 @@ private:
         return TypeInfo(arrayType, baseType.isUnsigned, false, nullptr, nullptr, baseType.pointerConst);
     }
 
-    // Hoisting runs at function entry, so the initializer must only be evaluated for its type:
-    // emit it into a scratch block and discard everything it generated
     TypeInfo InferExprType(ExprNode* expr)
     {
         Function* func = m_builder.GetInsertBlock()->getParent();
@@ -2068,6 +2337,9 @@ private:
 
             if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
                 return MakeFunctionValue(*chosen, expectedType);
+
+            if (auto typeId = TryTypeNameAsValue(id))
+                return *typeId;
             
             Variable var = LookupVariable(id->name, id->line);
 
@@ -2118,6 +2390,8 @@ private:
         
         if (auto* member = dynamic_cast<MemberAccess*>(node))
         {
+            if (auto enumValue = TryEnumValue(member))
+                return *enumValue;
             TypedValue ptr = EvaluateLValue(member);
             return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
         }
@@ -2126,21 +2400,6 @@ private:
         {
             TypedValue ptr = EvaluateLValue(member);
             return TypedValue(m_builder.CreateLoad(ptr.type.llvmType, ptr.value), ptr.type);
-        }
-
-        if (auto* enumAccess = dynamic_cast<EnumAccess*>(node))
-        {
-            auto it = m_enums.find(enumAccess->enum_name);
-            if (it == m_enums.end())
-                Error("Unknown enum: " + enumAccess->enum_name, enumAccess->line);
-            
-            auto valueIt = it->second.values.find(enumAccess->value_name);
-            if (valueIt == it->second.values.end())
-                Error("Unknown enum value: " + enumAccess->value_name, enumAccess->line);
-            
-            const TypeInfo& baseType = it->second.baseType;
-            auto* val = llvm::ConstantInt::get(baseType.llvmType, valueIt->second, !baseType.isUnsigned);
-            return TypedValue(val, baseType);
         }
 
         if (auto* sizeofExpr = dynamic_cast<SizeofExpr*>(node))
@@ -2172,25 +2431,11 @@ private:
         if (auto* ternary = dynamic_cast<TernaryExpr*>(node))
             return EvaluateTernary(ternary);
 
-        if (auto* vaArg = dynamic_cast<VaArgExpr*>(node))
-        {
-            TypedValue vaList = EvaluateLValue(vaArg->va_list.get());
-            TypeInfo targetType = ResolveType(vaArg->type.get());
-            
-            Value* vaListPtr = vaList.value;
-            
-            if (vaList.type.llvmType->isArrayTy())
-            {
-                vaListPtr = m_builder.CreateInBoundsGEP(
-                    vaList.type.llvmType,
-                    vaList.value,
-                    {m_builder.getInt64(0), m_builder.getInt64(0)}
-                );
-            }
-            
-            auto* result = m_builder.CreateVAArg(vaListPtr, targetType.llvmType);
-            return TypedValue(result, targetType);
-        }
+        if (auto* typeofExpr = dynamic_cast<TypeofExpr*>(node))
+            return EvaluateTypeof(typeofExpr);
+
+        if (dynamic_cast<SpreadExpr*>(node))
+            Error("'..' can only be used on the last argument of a call", node->line);
 
         Error("Invalid rvalue expression", node->line);
     }
@@ -2242,17 +2487,25 @@ private:
     TypedValue EvaluateStringLiteral(::StringLiteral* lit)
     {
         auto* str = m_builder.CreateGlobalString(lit->value, ".str");
-        return TypedValue(str, TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false, m_builder.getInt8Ty()));
+        return TypedValue(str, TypeInfo(llvm::PointerType::getUnqual(m_builder.getContext()), false, true, m_builder.getInt8Ty()));
     }
 
     TypedValue EvaluateCast(CastExpr *cast)
     {
         TypedValue operand = EvaluateRValue(cast->operand.get());
         TypeInfo targetType = ResolveType(cast->target_type.get());
+
+        if (IsAnyType(operand.type) && !IsAnyType(targetType))
+        {
+            if (targetType.llvmType->isVoidTy())
+                Error("Cannot cast 'any' to u0", cast->line);
+            Value* data = m_builder.CreateExtractValue(operand.value, 1);
+            return TypedValue(m_builder.CreateLoad(targetType.llvmType, data), targetType);
+        }
+
         return CastValue(operand, targetType, cast->line);
     }
 
-    // C default argument promotions for variadic arguments: float -> double, small ints -> int
     Value* PromoteVarArg(const TypedValue& arg)
     {
         Type* type = arg.value->getType();
@@ -2269,143 +2522,104 @@ private:
 
     std::vector<Value*> BuildCallArgs(
         const FunctionInfo& funcInfo,
-        const std::vector<std::unique_ptr<ExprNode>>& callArgs,
+        const std::vector<TypedValue>& evaluated,
+        int spreadIndex,
         uint32_t line)
     {
-        if (funcInfo.isVarArg)
-        {
-            if (callArgs.size() < funcInfo.paramTypes.size())
-                Error("Too few arguments in call", line);
-        }
-        else
-        {
-            size_t required = funcInfo.paramTypes.size();
-            for (size_t i = 0; i < funcInfo.defaultValues.size(); i++)
-                if (funcInfo.defaultValues[i]) { required = i; break; }
+        size_t fixedCount = funcInfo.paramTypes.size() - (funcInfo.hasPack ? 1 : 0);
+        size_t positional = spreadIndex >= 0 ? (size_t)spreadIndex : evaluated.size();
 
-            if (callArgs.size() < required)
-                Error("Too few arguments: expected at least "
-                    + std::to_string(required) + ", got "
-                    + std::to_string(callArgs.size()), line);
-            if (callArgs.size() > funcInfo.paramTypes.size())
-                Error("Too many arguments: expected "
-                    + std::to_string(funcInfo.paramTypes.size()) + ", got "
-                    + std::to_string(callArgs.size()), line);
-        }
+        if (spreadIndex >= 0 && !funcInfo.hasPack)
+            Error("'..' can only spread into a variadic parameter", line);
+
+        size_t required = fixedCount;
+        for (size_t i = 0; i < fixedCount && i < funcInfo.defaultValues.size(); i++)
+            if (funcInfo.defaultValues[i]) { required = i; break; }
+
+        if (positional < required)
+            Error("Too few arguments: expected at least "
+                + std::to_string(required) + ", got "
+                + std::to_string(positional), line);
+        if (positional > fixedCount && !funcInfo.isVarArg && !funcInfo.hasPack)
+            Error("Too many arguments: expected "
+                + std::to_string(fixedCount) + ", got "
+                + std::to_string(positional), line);
+        if (spreadIndex >= 0 && positional > fixedCount)
+            Error("Too many arguments before '..': expected at most "
+                + std::to_string(fixedCount), line);
 
         std::vector<Value*> args;
-
-        for (size_t i = 0; i < funcInfo.paramTypes.size(); i++)
+        for (size_t i = 0; i < fixedCount; i++)
         {
             TypedValue arg;
-            if (i < callArgs.size())
-                arg = EvaluateRValue(callArgs[i].get());
+            if (i < positional)
+                arg = evaluated[i];
             else
             {
-                if (!funcInfo.defaultValues[i])
+                if (i >= funcInfo.defaultValues.size() || !funcInfo.defaultValues[i])
                     Error("Missing argument " + std::to_string(i + 1)
                         + " and no default value available", line);
                 arg = EvaluateRValue(funcInfo.defaultValues[i]);
             }
-
             if (arg.type != funcInfo.paramTypes[i])
                 arg = CastValue(arg, funcInfo.paramTypes[i], line);
             args.push_back(arg.value);
         }
 
-        for (size_t i = funcInfo.paramTypes.size(); i < callArgs.size(); i++)
-            args.push_back(PromoteVarArg(EvaluateRValue(callArgs[i].get())));
+        if (funcInfo.hasPack)
+        {
+            if (spreadIndex >= 0)
+            {
+                const TypedValue& spread = evaluated[spreadIndex];
+                if (spread.type != funcInfo.paramTypes.back())
+                    Error("Cannot spread a pack of '" + MangleTypeSuffix(FindPackInfo(spread.type)->packElem)
+                        + "' into a parameter of '.." + MangleTypeSuffix(funcInfo.packElem) + "'", line);
+                args.push_back(spread.value);
+            }
+            else
+            {
+                std::vector<TypedValue> rest(evaluated.begin() + std::min(fixedCount, positional), evaluated.end());
+                args.push_back(BuildPack(funcInfo, rest, line).value);
+            }
+        }
+        else
+        {
+            for (size_t i = fixedCount; i < positional; i++)
+                args.push_back(PromoteVarArg(evaluated[i]));
+        }
 
         return args;
     }
 
     TypedValue EvaluateFunctionCall(CallExpr *call)
     {
+        int spreadIndex = -1;
         auto evaluateArgs = [&]() -> std::vector<TypedValue>
         {
             std::vector<TypedValue> vals;
             vals.reserve(call->args.size());
-            for (auto& a : call->args)
-                vals.push_back(EvaluateRValue(a.get()));
-            return vals;
-        };
-
-        auto buildArgs = [&](const FunctionInfo& funcInfo, const std::vector<TypedValue>& evaluated, uint32_t line) -> std::vector<Value*>
-        {
-            if (funcInfo.isVarArg)
+            for (size_t i = 0; i < call->args.size(); i++)
             {
-                if (evaluated.size() < funcInfo.paramTypes.size())
-                    Error("Too few arguments in call", line);
-            }
-            else
-            {
-                size_t required = funcInfo.paramTypes.size();
-                for (size_t i = 0; i < funcInfo.defaultValues.size(); i++)
-                    if (funcInfo.defaultValues[i]) { required = i; break; }
-
-                if (evaluated.size() < required)
-                    Error("Too few arguments: expected at least "
-                        + std::to_string(required) + ", got "
-                        + std::to_string(evaluated.size()), line);
-                if (evaluated.size() > funcInfo.paramTypes.size())
-                    Error("Too many arguments: expected "
-                        + std::to_string(funcInfo.paramTypes.size()) + ", got "
-                        + std::to_string(evaluated.size()), line);
-            }
-
-            std::vector<Value*> args;
-            for (size_t i = 0; i < funcInfo.paramTypes.size(); i++)
-            {
-                TypedValue arg;
-                if (i < evaluated.size())
-                    arg = evaluated[i];
-                else
+                auto* spread = dynamic_cast<SpreadExpr*>(call->args[i].get());
+                if (!spread)
                 {
-                    if (!funcInfo.defaultValues[i])
-                        Error("Missing argument " + std::to_string(i + 1)
-                            + " and no default value available", line);
-                    arg = EvaluateRValue(funcInfo.defaultValues[i]);
+                    vals.push_back(EvaluateRValue(call->args[i].get()));
+                    continue;
                 }
-                if (arg.type != funcInfo.paramTypes[i])
-                    arg = CastValue(arg, funcInfo.paramTypes[i], line);
-                args.push_back(arg.value);
-            }
-            for (size_t i = funcInfo.paramTypes.size(); i < evaluated.size(); i++)
-                args.push_back(PromoteVarArg(evaluated[i]));
 
-            return args;
+                if (i + 1 != call->args.size())
+                    Error("A '..' spread must be the last argument", spread->line);
+                TypedValue pack = EvaluateRValue(spread->operand.get());
+                if (!FindPackInfo(pack.type))
+                    Error("Only a variadic parameter can be spread with '..'", spread->line);
+                spreadIndex = (int)i;
+                vals.push_back(pack);
+            }
+            return vals;
         };
 
         if (auto* ident = dynamic_cast<Identifier*>(call->callee.get()))
         {
-            if (ident->name == "va_start")
-            {
-                if (call->args.size() != 2)
-                    Error("va_start requires exactly 2 arguments: va_list and last named parameter", call->line);
-
-                TypedValue vaListArg = EvaluateLValue(call->args[0].get());
-
-                const FunctionInfo& vaStart = m_functions.at("llvm.va_start").front();
-
-                Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-                m_builder.CreateCall(vaStart.function, {vaListPtr});
-                return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
-            }
-
-            if (ident->name == "va_end")
-            {
-                if (call->args.size() != 1)
-                    Error("va_end requires exactly 1 argument: va_list", call->line);
-
-                TypedValue vaListArg = EvaluateLValue(call->args[0].get());
-
-                const FunctionInfo& vaEnd = m_functions.at("llvm.va_end").front();
-
-                Value* vaListPtr = m_builder.CreateBitCast(vaListArg.value, m_builder.getPtrTy());
-                m_builder.CreateCall(vaEnd.function, {vaListPtr});
-                return TypedValue(nullptr, TypeInfo(m_builder.getVoidTy(), false));
-            }
-
             if (!ident->generic_args.empty() ||
                 m_functions.find(ident->name) != m_functions.end() ||
                 m_genericProcs.find(ident->name) != m_genericProcs.end())
@@ -2415,8 +2629,8 @@ private:
                 argTypes.reserve(evaluated.size());
                 for (auto& v : evaluated) argTypes.push_back(v.type);
 
-                FunctionInfo func = ResolveCall(ident, argTypes, call->line);
-                auto args = buildArgs(func, evaluated, call->line);
+                FunctionInfo func = ResolveCall(ident, argTypes, spreadIndex, call->line);
+                auto args = BuildCallArgs(func, evaluated, spreadIndex, call->line);
                 auto* result = m_builder.CreateCall(func.function, args);
                 return TypedValue(result, func.returnType);
             }
@@ -2427,7 +2641,7 @@ private:
 
             const FunctionInfo& funcInfo = *var.type.functionInfo;
             auto evaluated = evaluateArgs();
-            auto args = buildArgs(funcInfo, evaluated, call->line);
+            auto args = BuildCallArgs(funcInfo, evaluated, spreadIndex, call->line);
             Value* funcPtr = m_builder.CreateLoad(var.type.llvmType, var.storage);
             FunctionType* funcType = cast<FunctionType>(var.type.pointeeType);
             auto* result = m_builder.CreateCall(funcType, funcPtr, args);
@@ -2440,7 +2654,7 @@ private:
 
         const FunctionInfo& funcInfo = *calleeValue.type.functionInfo;
         auto evaluated = evaluateArgs();
-        auto args = buildArgs(funcInfo, evaluated, call->line);
+        auto args = BuildCallArgs(funcInfo, evaluated, spreadIndex, call->line);
         FunctionType* funcType = cast<FunctionType>(calleeValue.type.pointeeType);
         auto* result = m_builder.CreateCall(funcType, calleeValue.value, args);
         return TypedValue(result, funcInfo.returnType);
@@ -2455,6 +2669,13 @@ private:
         
         TypedValue base = EvaluateLValue(access->array.get());
         Type* baseType = base.type.llvmType;
+
+        if (const StructInfo* pack = FindPackInfo(base.type))
+        {
+            Value* data = m_builder.CreateLoad(m_builder.getPtrTy(), m_builder.CreateStructGEP(baseType, base.value, 0));
+            Value* gep = m_builder.CreateInBoundsGEP(pack->packElem.llvmType, data, index.value);
+            return TypedValue(gep, pack->packElem);
+        }
         
         if (baseType->isArrayTy())
         {
@@ -2509,8 +2730,30 @@ private:
         Error("Cannot index non-array/non-pointer type", access->line);
     }
 
+    std::optional<TypedValue> TryEnumValue(MemberAccess* access)
+    {
+        auto* id = dynamic_cast<Identifier*>(access->object.get());
+        if (!id || !id->generic_args.empty() || IsValueName(id->name))
+            return std::nullopt;
+
+        auto it = m_enums.find(id->name);
+        if (it == m_enums.end())
+            return std::nullopt;
+
+        auto valueIt = it->second.values.find(access->member);
+        if (valueIt == it->second.values.end())
+            Error("Unknown enum value: " + id->name + "." + access->member, access->line);
+
+        const TypeInfo& baseType = it->second.baseType;
+        auto* val = llvm::ConstantInt::get(baseType.llvmType, valueIt->second, !baseType.isUnsigned);
+        return TypedValue(val, baseType);
+    }
+
     TypedValue EvaluateMemberAccess(MemberAccess* access)
     {
+        if (TryEnumValue(access))
+            Error("Cannot assign to or take the address of enum value " + access->member, access->line);
+
         TypedValue structPtr = EvaluateLValue(access->object.get());
         
         Type* structType = structPtr.type.llvmType;
@@ -3122,15 +3365,13 @@ private:
             {"usize", [](auto& b) { return b.getInt64Ty(); }},
             {"f32", [](auto& b) { return b.getFloatTy(); }},
             {"f64", [](auto& b) { return b.getDoubleTy(); }},
-            {"va_list", [](auto& b) { 
-                return ArrayType::get(b.getInt8Ty(), 32);
-            }}
+            {"typeid", [](auto& b) { return b.getInt64Ty(); }}
         };
         
         auto it = typeMap.find(name);
         if (it != typeMap.end())
         {
-            outIsUnsigned = (name[0] == 'u' && name != "u0");
+            outIsUnsigned = (name[0] == 'u' && name != "u0") || name == "typeid";
             return it->second(m_builder);
         }
         
@@ -3142,6 +3383,9 @@ private:
     {
         if (value.type == targetType)
             return value;
+
+        if (IsAnyType(targetType))
+            return IsAnyType(value.type) ? TypedValue(value.value, targetType) : BoxAny(value, line);
         
         Type* fromType = value.type.llvmType;
         Type* toType = targetType.llvmType;
@@ -3412,6 +3656,7 @@ private:
     std::vector<std::string> m_aliasResolutionStack;
     std::unordered_map<std::string, Variable> m_locals;
     std::unordered_map<std::string, Variable> m_globals;
+    StructType* m_anyType = nullptr;
     
     LLVMContext& m_context;
     IRBuilder<> m_builder;

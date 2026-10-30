@@ -91,7 +91,7 @@ struct BuildConfig
 };
 
 constexpr const char* MAIN_FLOOF = R"(pub main() -> i32 {
-    printf("Hello Floof!\n");
+    println("Hello Floof!");
     return 0;
 })";
 
@@ -133,6 +133,13 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
 {
     std::map<std::string, std::unique_ptr<ModuleAST>> modules;
 
+    {
+        static const std::string builtinName = BUILTIN_MODULE_NAME;
+        Lexer lexer(BUILTIN_MODULE_SOURCE);
+        Parser parser(lexer, builtinName);
+        modules.emplace(builtinName, parser.ParseModule());
+    }
+
     for (const auto& entry : fs::recursive_directory_iterator(srcDir))
     {
         if (!entry.is_regular_file() || entry.path().extension() != ".floof")
@@ -145,6 +152,9 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
         auto rel = fs::relative(entry.path(), srcDir).replace_extension("").string();
         std::replace(rel.begin(), rel.end(), '/', '.');
         std::replace(rel.begin(), rel.end(), '\\', '.');
+
+        if (rel == BUILTIN_MODULE_NAME)
+            throw std::runtime_error("Module name '" + rel + "' is reserved for the builtin module");
 
         Lexer lexer(buf.str());
         Parser parser(lexer, rel);

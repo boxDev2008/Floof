@@ -85,7 +85,7 @@
       "patterns": [
         {
           "name": "storage.type.primitive.flooflang",
-          "match": "\\b(u0|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|usize)\\b"
+          "match": "\\b(u0|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|usize|any|typeid)\\b"
         },
         {
           "name": "entity.name.type.flooflang",
@@ -113,26 +113,42 @@
         }
       ]
     },
+    "generic-params": {
+      "patterns": [
+        { "match": "\\b(integer|signed|unsigned|float|numeric|pointer)\\b", "name": "support.type.constraint.flooflang" },
+        { "match": "\\b[A-Z][a-zA-Z0-9_]*\\b", "name": "entity.name.type.flooflang" },
+        { "match": "\\b(u0|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|usize|any|typeid)\\b", "name": "storage.type.primitive.flooflang" },
+        { "match": "\\|", "name": "keyword.operator.constraint.flooflang" },
+        { "match": ":", "name": "punctuation.separator.constraint.flooflang" },
+        { "match": "\\*", "name": "keyword.operator.pointer.flooflang" },
+        { "match": ",", "name": "punctuation.separator.comma.flooflang" }
+      ]
+    },
     "function-declaration": {
       "patterns": [
         {
-          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|va_arg)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(<)([^>]*)(>)?\\s*(?=\\()",
+          "match": "(?<=\\bstruct\\s)\\s*([a-zA-Z_][a-zA-Z0-9_]*)\\s*(<)([^>]*)(>)",
+          "captures": {
+            "1": { "name": "entity.name.type.flooflang" },
+            "2": { "name": "punctuation.definition.generic.begin.flooflang" },
+            "3": { "patterns": [{ "include": "#generic-params" }] },
+            "4": { "name": "punctuation.definition.generic.end.flooflang" }
+          }
+        },
+        {
+          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|typeof)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(<)([^>]*)(>)?\\s*(?=\\()",
           "captures": {
             "1": { "name": "keyword.other.flooflang" },
             "2": { "name": "entity.name.function.flooflang" },
             "3": { "name": "punctuation.definition.generic.begin.flooflang" },
             "4": {
-              "patterns": [
-                { "match": "\\b[A-Z][a-zA-Z0-9_]*\\b", "name": "entity.name.type.flooflang" },
-                { "match": "\\b(u0|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|usize)\\b", "name": "storage.type.primitive.flooflang" },
-                { "match": ",", "name": "punctuation.separator.comma.flooflang" }
-              ]
+              "patterns": [{ "include": "#generic-params" }]
             },
             "5": { "name": "punctuation.definition.generic.end.flooflang" }
           }
         },
         {
-          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|va_arg)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
+          "match": "^\\s*((?:(?:pub|extern)\\s+)*)(?!(?:if|while|for|match|return|sizeof|cast|typeof)\\b)([a-zA-Z_][a-zA-Z0-9_]*)\\s*(?=\\()",
           "captures": {
             "1": { "name": "keyword.other.flooflang" },
             "2": { "name": "entity.name.function.flooflang" }
@@ -148,11 +164,7 @@
             "1": { "name": "entity.name.function.call.flooflang" },
             "2": { "name": "punctuation.definition.generic.begin.flooflang" },
             "3": {
-              "patterns": [
-                { "match": "\\b[A-Z][a-zA-Z0-9_]*\\b", "name": "entity.name.type.flooflang" },
-                { "match": "\\b(u0|i8|i16|i32|i64|u8|u16|u32|u64|f32|f64|bool|char|usize)\\b", "name": "storage.type.primitive.flooflang" },
-                { "match": ",", "name": "punctuation.separator.comma.flooflang" }
-              ]
+              "patterns": [{ "include": "#generic-params" }]
             },
             "4": { "name": "punctuation.definition.generic.end.flooflang" }
           }

@@ -149,9 +149,13 @@ struct ReturnStmt : StmtNode {
     std::unique_ptr<ExprNode> value;
 };
 
-struct VaArgExpr : ExprNode {
-    std::unique_ptr<ExprNode> va_list;
+struct TypeofExpr : ExprNode {
+    std::unique_ptr<ExprNode> operand;
     std::unique_ptr<TypeNode> type;
+};
+
+struct SpreadExpr : ExprNode {
+    std::unique_ptr<ExprNode> operand;
 };
 
 struct TernaryExpr : ExprNode {
@@ -191,6 +195,8 @@ struct ForStmt : StmtNode {
     std::unique_ptr<BlockStmt> body;
 };
 
+typedef std::vector<std::unique_ptr<TypeNode>> GenericConstraint;
+
 struct StructField {
     std::string name;
     std::unique_ptr<TypeNode> type;
@@ -200,6 +206,7 @@ struct StructField {
 struct StructDecl : ASTNode {
     std::string name;
     std::vector<std::string> generic_params;
+    std::vector<GenericConstraint> generic_constraints;
     std::vector<std::unique_ptr<StructField>> fields;
     AttributeList attributes;
     bool is_packed = false;
@@ -233,20 +240,17 @@ struct MatchStmt : StmtNode {
     std::vector<std::unique_ptr<MatchCase>> cases;
 };
 
-struct EnumAccess : ExprNode {
-    std::string enum_name;
-    std::string value_name;
-};
-
 struct Parameter {
     std::string name;
     std::unique_ptr<TypeNode> type;
     std::unique_ptr<ExprNode> default_value;
+    bool is_variadic = false;
 };
 
 struct ProcDecl : ASTNode {
     std::string name;
     std::vector<std::string> generic_params;
+    std::vector<GenericConstraint> generic_constraints;
     std::vector<Parameter> params;
     std::unique_ptr<TypeNode> return_type;
     std::unique_ptr<BlockStmt> body;
@@ -254,6 +258,8 @@ struct ProcDecl : ASTNode {
     bool is_pub = false;
     bool is_extern = false;
     bool is_vararg = false;
+
+    bool HasVariadicParam() const { return !params.empty() && params.back().is_variadic; }
 };
 
 struct UsingDecl : ASTNode {
@@ -607,9 +613,7 @@ public:
             auto ternary = std::make_unique<TernaryExpr>();
             ternary->line = opLine;
             ternary->condition = std::move(expr);
-            m_ternaryThenDepth++;
             ternary->then_expr = ParseExpr();
-            m_ternaryThenDepth--;
             Expect(':', "Expected ':' in ternary expression");
             ternary->else_expr = ParseTernary();
             return ternary;
@@ -828,14 +832,7 @@ public:
                 call->line = opLine;
                 call->callee = std::move(expr);
                 
-                if (!Check(')'))
-                {
-                    do {
-                        call->args.push_back(ParseExpr());
-                    } while (Match(','));
-                }
-                
-                Expect(')', "Expected ')'");
+                ParseCallArgs(call->args);
                 expr = std::move(call);
             }
             else break;
@@ -978,33 +975,16 @@ public:
                 return cast;
             }
 
-            if (name == "va_arg" && Match('('))
+            if (name == "typeof" && Match('('))
             {
-                auto vaArg = std::make_unique<VaArgExpr>();
-                vaArg->line = primaryLine;
-                vaArg->va_list = ParseExpr();
-                Expect(',', "Expected ',' after va_list");
-                vaArg->type = ParseType();
-                Expect(')', "Expected ')' after va_arg type");
-                return vaArg;
+                auto typeofExpr = ParseTypeofOperand();
+                typeofExpr->line = primaryLine;
+                Expect(')', "Expected ')' after typeof operand");
+                return typeofExpr;
             }
 
             std::vector<std::unique_ptr<TypeNode>> genericArgs;
             TryParseGenericArgs(genericArgs);
-
-            // Inside a ternary's then-branch, `a : b` is the ternary separator; enum access
-            // there must be written without a space before the colon (Color:Red)
-            bool colonIsEnumAccess = m_ternaryThenDepth == 0 || !m_current.space_before;
-            if (genericArgs.empty() && colonIsEnumAccess && Match(':'))
-            {
-                Expect(TokenType_Identifier, "Expected enum value name after ':'");
-                std::string valueName = m_last.value;
-                auto enumAccess = std::make_unique<EnumAccess>();
-                enumAccess->line = primaryLine;
-                enumAccess->enum_name = name;
-                enumAccess->value_name = valueName;
-                return enumAccess;
-            }
 
             if (!m_parsingStatement && Match('{'))
             {
@@ -1226,14 +1206,7 @@ public:
                         call->line = postfixLine;
                         call->callee = std::move(expr);
                         
-                        if (!Check(')'))
-                        {
-                            do {
-                                call->args.push_back(ParseExpr());
-                            } while (Match(','));
-                        }
-                        
-                        Expect(')', "Expected ')'");
+                        ParseCallArgs(call->args);
                         expr = std::move(call);
                     }
                     else
@@ -1375,7 +1348,11 @@ public:
             if (Match("else"))
                 case_stmt->is_else = true;
             else
+            {
+                m_parsingStatement = true;
                 case_stmt->value = ParseExpr();
+                m_parsingStatement = false;
+            }
             
             case_stmt->body = ParseBlock();
             match->cases.push_back(std::move(case_stmt));
@@ -1395,7 +1372,7 @@ public:
         Expect(TokenType_Identifier, "Expected struct name");
         struct_decl->name = m_last.value;
         struct_decl->line = m_lexer.GetCurrentLine();
-        struct_decl->generic_params = ParseGenericParams();
+        struct_decl->generic_params = ParseGenericParams(struct_decl->generic_constraints);
             
         Expect('{', "Expected '{'");
 
@@ -1436,7 +1413,7 @@ public:
         proc->name = m_last.value;
         proc->line = m_lexer.GetCurrentLine();
         proc->is_extern = is_extern;
-        proc->generic_params = ParseGenericParams();
+        proc->generic_params = ParseGenericParams(proc->generic_constraints);
 
         if (is_extern && !proc->generic_params.empty())
             throw std::runtime_error("Extern proc '" + proc->name + "' cannot be generic on line "
@@ -1449,6 +1426,10 @@ public:
         {
             if ((Match('.') && Match('.') && Match('.')))
             {
+                if (!is_extern)
+                    throw std::runtime_error("C-style '...' is only allowed on extern procs; use a typed"
+                        " variadic parameter like 'args: ..any' instead on line "
+                        + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
                 proc->is_vararg = true;
                 Expect(')', "Expected ')' after '...'");
                 break;
@@ -1459,9 +1440,21 @@ public:
                 Parameter param;
                 param.name = m_last.value;
                 Expect(':', "Expected ':'");
+                param.is_variadic = Check('.') && PeekIs('.');
+                if (param.is_variadic)
+                {
+                    Advance();
+                    Advance();
+                }
                 param.type = ParseType();
 
-                if (Match('='))
+                if (param.is_variadic)
+                {
+                    if (!Check(')'))
+                        throw std::runtime_error("Variadic parameter '" + param.name + "' must be the last"
+                            " parameter on line " + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
+                }
+                else if (Match('='))
                 {
                     param.default_value = ParseExpr();
                     hasDefault = true;
@@ -1495,7 +1488,7 @@ private:
 
     uint32_t CurrentLine() const { return m_lexer.GetCurrentLine(); }
 
-    std::vector<std::string> ParseGenericParams(void)
+    std::vector<std::string> ParseGenericParams(std::vector<GenericConstraint>& outConstraints)
     {
         std::vector<std::string> params;
         if (!Match('<'))
@@ -1507,13 +1500,21 @@ private:
                 throw std::runtime_error("Duplicate type parameter '" + m_last.value + "' on line "
                     + std::to_string(m_lexer.GetCurrentLine()) + " in module " + m_moduleName);
             params.push_back(m_last.value);
+
+            GenericConstraint constraint;
+            if (Match(':'))
+            {
+                do {
+                    constraint.push_back(ParseType());
+                } while (Match('|'));
+            }
+            outConstraints.push_back(std::move(constraint));
         } while (Match(','));
 
         ExpectCloseAngle("Expected '>' after type parameters");
         return params;
     }
 
-    // Accepts '>' and splits '>>' / '>=' so nested generics like List<List<i32>> close properly
     void ExpectCloseAngle(const std::string& msg)
     {
         if (Match('>'))
@@ -1532,17 +1533,12 @@ private:
         Expect('>', msg);
     }
 
-    // Speculatively parses '<' Type {',' Type} '>' after an identifier in expression context.
-    // Like C#, it only commits when the closing '>' is followed by a token that can't continue
-    // a comparison, so `a < b` and `f(a < b, c > d)` still parse as comparisons.
     bool TryParseGenericArgs(std::vector<std::unique_ptr<TypeNode>>& out)
     {
         if (!Check('<') || !PeekIs(TokenType_Identifier))
             return false;
 
-        Lexer::State lexerState = m_lexer.SaveState();
-        Token current = m_current, last = m_last, next = m_next;
-        bool hasNext = m_hasNext;
+        State state = SaveState();
 
         try
         {
@@ -1561,12 +1557,89 @@ private:
         }
         catch (const std::runtime_error&) {}
 
-        m_lexer.RestoreState(lexerState);
-        m_current = current;
-        m_last = last;
-        m_next = next;
-        m_hasNext = hasNext;
+        RestoreState(state);
         return false;
+    }
+
+    std::unique_ptr<TypeofExpr> ParseTypeofOperand(void)
+    {
+        auto typeofExpr = std::make_unique<TypeofExpr>();
+        State start = SaveState();
+
+        try
+        {
+            auto type = ParseType();
+            if (Check(')'))
+                typeofExpr->type = std::move(type);
+        }
+        catch (const std::runtime_error&) {}
+
+        const TypeNode* type = typeofExpr->type.get();
+        if (type && (type->pointer_depth > 0 || type->is_const || type->is_function_type || !type->generic_args.empty()))
+            return typeofExpr;
+
+        if (!type)
+        {
+            RestoreState(start);
+            typeofExpr->operand = ParseExpr();
+            return typeofExpr;
+        }
+
+        State afterType = SaveState();
+        RestoreState(start);
+        try
+        {
+            auto operand = ParseExpr();
+            if (Check(')'))
+            {
+                typeofExpr->operand = std::move(operand);
+                return typeofExpr;
+            }
+        }
+        catch (const std::runtime_error&) {}
+
+        RestoreState(afterType);
+        return typeofExpr;
+    }
+
+    void ParseCallArgs(std::vector<std::unique_ptr<ExprNode>>& args)
+    {
+        if (!Check(')'))
+        {
+            do {
+                if (Check('.') && PeekIs('.'))
+                {
+                    auto spread = std::make_unique<SpreadExpr>();
+                    spread->line = CurrentLine();
+                    Advance();
+                    Advance();
+                    spread->operand = ParseExpr();
+                    args.push_back(std::move(spread));
+                }
+                else
+                    args.push_back(ParseExpr());
+            } while (Match(','));
+        }
+
+        Expect(')', "Expected ')'");
+    }
+
+    struct State
+    {
+        Lexer::State lexer;
+        Token current, last, next;
+        bool hasNext;
+    };
+
+    State SaveState(void) const { return {m_lexer.SaveState(), m_current, m_last, m_next, m_hasNext}; }
+
+    void RestoreState(const State& state)
+    {
+        m_lexer.RestoreState(state.lexer);
+        m_current = state.current;
+        m_last = state.last;
+        m_next = state.next;
+        m_hasNext = state.hasNext;
     }
 
     void Advance(void)
@@ -1634,5 +1707,4 @@ private:
     Token m_next;
     bool m_hasNext = false;
     bool m_parsingStatement = false;
-    int m_ternaryThenDepth = 0;
 };
