@@ -16,6 +16,7 @@
 #include <limits>
 
 #include "Builtin.h"
+#include "CAbi.h"
 
 using namespace llvm;
 
@@ -103,6 +104,7 @@ class CodeGenerator
         bool hasPack = false;       // last entry of paramTypes is a variadic pack of packElem
         TypeInfo packElem;
         std::string sourceName;
+        std::shared_ptr<const cabi::FunctionAbi> abi;
 
         FunctionInfo() : function(nullptr), isVarArg(false) {}
         
@@ -139,10 +141,13 @@ class CodeGenerator
 
 public:
     CodeGenerator(LLVMContext& ctx, const ModuleAST& ast, const std::string& moduleName, 
-                  std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable) 
+                  std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable,
+                  const Triple& triple, const DataLayout& dataLayout) 
         : m_context(ctx), m_builder(ctx), m_loopContext()
     {
         m_module = std::make_unique<Module>(moduleName, ctx);
+        m_module->setTargetTriple(triple);
+        m_module->setDataLayout(dataLayout);
 
         RegisterBuiltinTypes();
         ImportUsedModules(ast, moduleTable);
@@ -211,6 +216,8 @@ private:
                 *m_module, type.llvmType, decl->type->is_const,
                 GlobalValue::ExternalLinkage, nullptr, decl->name
             );
+            if (const AttributeNode* align = FindAttribute(decl->attributes, "align"))
+                globalVar->setAlignment(Align(AttributeResolver::AlignValue(*align)));
             m_globals[decl->name] = {type, globalVar, decl->type->is_const};
         }
     }
@@ -230,8 +237,6 @@ private:
                 DeclareFunction(proc.get(), GlobalValue::ExternalLinkage);
         }
 
-        // Generic bodies are instantiated in the importing module, so they need the
-        // defining module's extern declarations to be visible here as well
         if (exportsGenerics)
             for (const auto& proc : module.procs)
                 if (!proc->is_pub && proc->is_extern)
@@ -369,6 +374,15 @@ private:
             info.fieldDefaults[field->name] = field->default_value.get();
         }
 
+        if (const AttributeNode* align = FindAttribute(decl->attributes, "align"))
+        {
+            if (decl->is_packed)
+                Error("'@align' cannot be combined with 'packed' on struct '" + decl->name + "'", decl->line);
+            uint64_t n = AttributeResolver::AlignValue(*align);
+            if (n > 1)
+                memberTypes.push_back(ArrayType::get(FixedVectorType::get(m_builder.getInt8Ty(), (unsigned)n), 0));
+        }
+
         structType->setBody(memberTypes, decl->is_packed);
     }
 
@@ -434,6 +448,8 @@ private:
                 *m_module, type.llvmType, decl->type ? decl->type->is_const : false, 
                 linkage, initializer, decl->name
             );
+            if (const AttributeNode* align = FindAttribute(decl->attributes, "align"))
+                globalVar->setAlignment(Align(AttributeResolver::AlignValue(*align)));
             m_globals[decl->name] = {type, globalVar, decl->type ? decl->type->is_const : false};
         }
     }
@@ -443,10 +459,10 @@ private:
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
             if (!id->generic_args.empty())
-                return MakeFunctionValue(InstantiateGenericFunctionValue(id, expectedType), expectedType);
+                return MakeFunctionValue(InstantiateGenericFunctionValue(id, expectedType), expectedType, id->line);
 
             if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
-                return MakeFunctionValue(*chosen, expectedType);
+                return MakeFunctionValue(*chosen, expectedType, id->line);
 
             auto globalIt = m_globals.find(id->name);
             if (globalIt != m_globals.end())
@@ -651,6 +667,8 @@ private:
                 else fieldValues[idx] = Constant::getNullValue(ft->llvmType);
             }
 
+            for (unsigned i = fieldValues.size(); i < info.type->getNumElements(); i++)
+                fieldValues.push_back(Constant::getNullValue(info.type->getElementType(i)));
             return TypedValue(ConstantStruct::get(info.type, fieldValues), TypeInfo(info.type, false));
         }
 
@@ -1031,16 +1049,240 @@ private:
             : MangleOverloadName(proc->name, paramTypes);
 
         auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, proc->is_vararg);
-        auto* func = Function::Create(funcType, linkage, symbolName, m_module.get());
 
-        unsigned idx = 0;
-        for (auto& arg : func->args())
-            arg.setName(proc->params[idx++].name);
+        std::shared_ptr<cabi::FunctionAbi> abi;
+        if (proc->is_c_abi)
+        {
+            abi = std::make_shared<cabi::FunctionAbi>(LowerExternSignature(proc, returnType, paramTypes));
+            funcType = abi->loweredType;
+        }
+
+        auto* func = Function::Create(funcType, linkage, symbolName, m_module.get());
+        ApplyProcAttributes(func, proc, returnType.llvmType);
+
+        if (abi)
+            ApplyAbiAttributes(func, *abi);
+        else
+        {
+            unsigned idx = 0;
+            for (auto& arg : func->args())
+                arg.setName(proc->params[idx++].name);
+        }
 
         FunctionInfo info(func, paramTypes, returnType, proc->is_vararg, std::move(defaultValues), proc->name, proc->is_extern);
+        info.abi = abi;
         SetPackInfo(info, proc);
         overloads.push_back(info);
         return info;
+    }
+
+    static CallingConv::ID ResolveCallConv(const std::string& name)
+    {
+        if (name == "stdcall")    return CallingConv::X86_StdCall;
+        if (name == "fastcall")   return CallingConv::X86_FastCall;
+        if (name == "vectorcall") return CallingConv::X86_VectorCall;
+        if (name == "thiscall")   return CallingConv::X86_ThisCall;
+        if (name == "win64")      return CallingConv::Win64;
+        if (name == "sysv")       return CallingConv::X86_64_SysV;
+        return CallingConv::C;
+    }
+
+    CallingConv::ID ProcCallConv(const ProcDecl* proc)
+    {
+        const AttributeNode* cc = FindAttribute(proc->attributes, "callconv");
+        return cc ? ResolveCallConv(cc->args[0].value) : CallingConv::C;
+    }
+
+    cabi::FunctionAbi LowerExternSignature(const ProcDecl* proc, const TypeInfo& returnType,
+                                           const std::vector<TypeInfo>& paramTypes)
+    {
+        const Triple& triple = m_module->getTargetTriple();
+        cabi::Flavor flavor = cabi::FlavorFor(triple, ProcCallConv(proc));
+
+        std::vector<cabi::ParamType> params;
+        for (const auto& p : paramTypes)
+            params.push_back({p.llvmType, p.isUnsigned});
+
+        return cabi::Lower(flavor, m_module->getDataLayout(), m_context,
+                           {returnType.llvmType, returnType.isUnsigned}, params, proc->is_vararg);
+    }
+
+    static void AddExtAttr(AttrBuilder& b, cabi::Ext ext)
+    {
+        if (ext == cabi::Ext::ZExt) b.addAttribute(llvm::Attribute::ZExt);
+        if (ext == cabi::Ext::SExt) b.addAttribute(llvm::Attribute::SExt);
+    }
+
+    llvm::AttributeList BuildAbiAttributes(const cabi::FunctionAbi& abi, llvm::AttributeList base)
+    {
+        llvm::AttributeList attrs = base;
+        unsigned argNo = 0;
+
+        AttrBuilder retAttrs(m_context);
+        AddExtAttr(retAttrs, abi.ret.ext);
+        if (retAttrs.hasAttributes())
+            attrs = attrs.addRetAttributes(m_context, retAttrs);
+
+        if (abi.ret.kind == cabi::ArgKind::Indirect)
+        {
+            AttrBuilder b(m_context);
+            b.addStructRetAttr(abi.ret.type);
+            b.addAttribute(llvm::Attribute::NoAlias);
+            b.addAlignmentAttr(Align(abi.ret.align));
+            attrs = attrs.addParamAttributes(m_context, argNo++, b);
+        }
+
+        for (const auto& p : abi.params)
+        {
+            AttrBuilder b(m_context);
+            switch (p.kind)
+            {
+                case cabi::ArgKind::Direct:
+                    AddExtAttr(b, p.ext);
+                    break;
+                case cabi::ArgKind::Indirect:
+                    if (p.byval)
+                    {
+                        b.addByValAttr(p.type);
+                        b.addAlignmentAttr(Align(p.align));
+                    }
+                    break;
+                case cabi::ArgKind::Coerce:
+                    if (auto* st = dyn_cast<StructType>(p.coerceType))
+                    {
+                        argNo += st->getNumElements();
+                        continue;
+                    }
+                    break;
+                case cabi::ArgKind::Ignore:
+                    continue;
+            }
+            if (b.hasAttributes())
+                attrs = attrs.addParamAttributes(m_context, argNo, b);
+            argNo++;
+        }
+        return attrs;
+    }
+
+    void ApplyAbiAttributes(Function* func, const cabi::FunctionAbi& abi)
+    {
+        func->setAttributes(BuildAbiAttributes(abi, func->getAttributes()));
+    }
+
+    AllocaInst* CreateCoerceSlot(Type* type, Type* coerceType, const std::string& name)
+    {
+        const DataLayout& dl = m_module->getDataLayout();
+        Type* slotType = dl.getTypeAllocSize(coerceType) > dl.getTypeAllocSize(type) ? coerceType : type;
+        auto* slot = cast<AllocaInst>(CreateEntryAlloca(slotType, name));
+        slot->setAlignment(std::max(dl.getABITypeAlign(type), dl.getABITypeAlign(coerceType)));
+        return slot;
+    }
+
+    void ApplyProcAttributes(Function* func, const ProcDecl* proc, Type* returnType)
+    {
+        if (HasAttribute(proc->attributes, "inline"))
+        {
+            if (proc->is_extern)
+                Error("'@inline' cannot be applied to extern function '" + proc->name + "'", proc->line);
+            func->addFnAttr(llvm::Attribute::AlwaysInline);
+        }
+
+        if (HasAttribute(proc->attributes, "noreturn"))
+        {
+            if (!returnType->isVoidTy())
+                Error("'@noreturn' function '" + proc->name + "' must not have a return type", proc->line);
+            func->addFnAttr(llvm::Attribute::NoReturn);
+        }
+
+        if (const AttributeNode* align = FindAttribute(proc->attributes, "align"))
+            func->setAlignment(Align(AttributeResolver::AlignValue(*align)));
+
+        if (const AttributeNode* cc = FindAttribute(proc->attributes, "callconv"))
+            func->setCallingConv(ResolveCallConv(cc->args[0].value));
+    }
+
+    Value* CreateDirectCall(const FunctionInfo& info, ArrayRef<Value*> args)
+    {
+        Function* func = info.function;
+        const cabi::FunctionAbi* abi = info.abi.get();
+
+        std::vector<Value*> lowered;
+        AllocaInst* sretSlot = nullptr;
+
+        if (abi && abi->ret.kind == cabi::ArgKind::Indirect)
+        {
+            sretSlot = cast<AllocaInst>(CreateEntryAlloca(abi->ret.type, "sret.tmp"));
+            sretSlot->setAlignment(Align(abi->ret.align));
+            lowered.push_back(sretSlot);
+        }
+
+        for (size_t i = 0; i < args.size(); i++)
+        {
+            if (!abi || i >= abi->params.size())
+            {
+                lowered.push_back(args[i]);
+                continue;
+            }
+
+            const cabi::ArgInfo& p = abi->params[i];
+            switch (p.kind)
+            {
+                case cabi::ArgKind::Direct:
+                    lowered.push_back(args[i]);
+                    break;
+                case cabi::ArgKind::Ignore:
+                    break;
+                case cabi::ArgKind::Indirect:
+                {
+                    auto* copy = cast<AllocaInst>(CreateEntryAlloca(p.type, "arg.copy"));
+                    copy->setAlignment(Align(p.align));
+                    m_builder.CreateStore(args[i], copy);
+                    lowered.push_back(copy);
+                    break;
+                }
+                case cabi::ArgKind::Coerce:
+                {
+                    AllocaInst* slot = CreateCoerceSlot(p.type, p.coerceType, "arg.coerce");
+                    m_builder.CreateStore(args[i], slot);
+                    if (auto* st = dyn_cast<StructType>(p.coerceType))
+                    {
+                        for (unsigned j = 0; j < st->getNumElements(); j++)
+                        {
+                            Value* part = m_builder.CreateStructGEP(st, slot, j);
+                            lowered.push_back(m_builder.CreateLoad(st->getElementType(j), part));
+                        }
+                    }
+                    else
+                        lowered.push_back(m_builder.CreateLoad(p.coerceType, slot));
+                    break;
+                }
+            }
+        }
+
+        CallInst* call = m_builder.CreateCall(func->getFunctionType(), func, lowered);
+        call->setCallingConv(func->getCallingConv());
+        call->setAttributes(func->getAttributes());
+        if (func->doesNotReturn())
+            call->setDoesNotReturn();
+
+        if (!abi)
+            return call;
+
+        switch (abi->ret.kind)
+        {
+            case cabi::ArgKind::Indirect:
+                return m_builder.CreateLoad(abi->ret.type, sretSlot);
+            case cabi::ArgKind::Coerce:
+            {
+                AllocaInst* slot = CreateCoerceSlot(abi->ret.type, abi->ret.coerceType, "ret.coerce");
+                m_builder.CreateStore(call, slot);
+                return m_builder.CreateLoad(abi->ret.type, slot);
+            }
+            case cabi::ArgKind::Ignore:
+                return Constant::getNullValue(abi->ret.type);
+            default:
+                return call;
+        }
     }
 
     TypeInfo ResolveParamType(const Parameter& param)
@@ -1234,9 +1476,14 @@ private:
         return best->info;
     }
 
-    TypedValue MakeFunctionValue(const FunctionInfo& info, const TypeInfo* expectedType)
+    TypedValue MakeFunctionValue(const FunctionInfo& info, const TypeInfo* expectedType, uint32_t line = 0)
     {
         Function* func = info.function;
+        if (func->getCallingConv() != CallingConv::C)
+            Error("Function '" + info.sourceName + "' has a '@callconv' and cannot be used as a function value", line);
+        if (info.abi && info.abi->changesType)
+            Error("Extern function '" + info.sourceName + "' passes or returns a struct by value and cannot be "
+                "used as a function value; wrap it in a Floof function instead", line);
         if (expectedType && expectedType->functionInfo)
         {
             TypeInfo type = *expectedType;
@@ -1560,6 +1807,7 @@ private:
         auto* funcType = FunctionType::get(info.returnType.llvmType, paramLLVMTypes, proc->is_vararg);
         std::string symbolName = MangleOverloadName(proc->name + "<" + argKey + ">", info.paramTypes);
         info.function = Function::Create(funcType, Function::InternalLinkage, symbolName, m_module.get());
+        ApplyProcAttributes(info.function, proc, info.returnType.llvmType);
 
         unsigned idx = 0;
         for (auto& arg : info.function->args())
@@ -1838,6 +2086,9 @@ private:
         uint32_t scopeId = m_currentScope;
         for (const auto& stmt : block->statements)
         {
+            if (m_builder.GetInsertBlock()->hasTerminator())
+                break;
+
             if (auto* s = dynamic_cast<VarDecl*>(stmt.get()))
                 GenerateVarDecl(s);
             else if (auto* s = dynamic_cast<ExprStmt*>(stmt.get()))
@@ -2133,7 +2384,11 @@ private:
 
     void GenerateExprStmt(ExprStmt* stmt)
     {
-        EvaluateRValue(stmt->expr.get());
+        TypedValue result = EvaluateRValue(stmt->expr.get());
+
+        if (auto* call = dyn_cast_or_null<CallInst>(result.value))
+            if (call->doesNotReturn() && !m_builder.GetInsertBlock()->hasTerminator())
+                m_builder.CreateUnreachable();
     }
 
     void GenerateReturn(ReturnStmt* stmt, const TypeInfo& returnType)
@@ -2432,10 +2687,10 @@ private:
         if (auto* id = dynamic_cast<Identifier*>(node))
         {
             if (!id->generic_args.empty())
-                return MakeFunctionValue(InstantiateGenericFunctionValue(id, expectedType), expectedType);
+                return MakeFunctionValue(InstantiateGenericFunctionValue(id, expectedType), expectedType, id->line);
 
             if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
-                return MakeFunctionValue(*chosen, expectedType);
+                return MakeFunctionValue(*chosen, expectedType, id->line);
 
             if (auto typeId = TryTypeNameAsValue(id))
                 return *typeId;
@@ -2727,7 +2982,7 @@ private:
 
                 FunctionInfo func = ResolveCall(ident, argTypes, spreadIndex, call->line);
                 auto args = BuildCallArgs(func, evaluated, spreadIndex, call->line);
-                auto* result = m_builder.CreateCall(func.function, args);
+                Value* result = CreateDirectCall(func, args);
                 return TypedValue(result, func.returnType);
             }
 
@@ -3248,7 +3503,6 @@ private:
         return TypedValue(result, resultType);
     }
 
-    // Short-circuiting && and ||: the right operand is only evaluated when needed.
     TypedValue EvaluateLogicalExpr(BinaryExpr* binary)
     {
         const bool isAnd = binary->op == TokenType_AndAnd;

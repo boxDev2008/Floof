@@ -76,7 +76,7 @@ struct BuildConfig
 
         cfg.projectName = tbl["project"]["name"].as_string()->get();
         if ((cfg.isDebug = tbl["build"]["debug"].as_boolean()->get()))
-            cfg.flags.insert("debug");
+            cfg.flags.insert("DEBUG");
 
         if (auto paths = tbl["linker"]["library_paths"].as_array())
             for (const auto& v : *paths)
@@ -113,6 +113,34 @@ static void initLLVM(void)
     llvm::InitializeAllTargetMCs();
     llvm::InitializeAllAsmParsers();
     llvm::InitializeAllAsmPrinters();
+}
+
+static void addTargetFlags(std::set<std::string>& flags, const llvm::Triple& triple)
+{
+    if (triple.isOSWindows())                 flags.insert("WIN32");
+    if (triple.isOSDarwin())                  flags.insert("DARWIN");
+    if (triple.isOSLinux())                   flags.insert("LINUX");
+    if (triple.isAndroid())                   flags.insert("ANDROID");
+    if (triple.isOSFreeBSD() || triple.isOSNetBSD() || triple.isOSOpenBSD() || triple.isOSDragonFly())
+                                              flags.insert("BSD_FAMILY");
+    if (!triple.isOSWindows())                flags.insert("POSIX");
+
+    switch (triple.getArch())
+    {
+        case llvm::Triple::x86_64:  flags.insert("X86_64");  break;
+        case llvm::Triple::x86:     flags.insert("X86");     break;
+        case llvm::Triple::aarch64: flags.insert("AARCH64"); break;
+        case llvm::Triple::riscv64: flags.insert("RISCV64"); break;
+        case llvm::Triple::riscv32: flags.insert("RISCV32"); break;
+        case llvm::Triple::wasm32:  flags.insert("WASM32");  break;
+        case llvm::Triple::wasm64:  flags.insert("WASM64");  break;
+        default: break;
+    }
+
+    if (triple.isArch64Bit())      flags.insert("ARCH_64_BIT");
+    else if (triple.isArch32Bit()) flags.insert("ARCH_32_BIT");
+
+    flags.insert(triple.isLittleEndian() ? "LITTLE_ENDIAN" : "BIG_ENDIAN");
 }
 
 static llvm::TargetMachine* makeTargetMachine(void)
@@ -158,10 +186,12 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
 
         Lexer lexer(buf.str());
         Parser parser(lexer, rel);
-        auto module = parser.ParseModule();
-        filter.FilterModule(*module);
-        modules.emplace(rel, std::move(module));
+        modules.emplace(rel, parser.ParseModule());
     }
+
+    AttributeResolver(modules, BUILTIN_MODULE_NAME).ResolveAll();
+    for (auto& [name, module] : modules)
+        filter.FilterModule(*module);
 
     return modules;
 }
@@ -194,11 +224,10 @@ static std::string compileModule(
 
     CodeGenerator cg(ctx,
         const_cast<ModuleAST&>(ast), name,
-        const_cast<std::map<std::string, std::unique_ptr<ModuleAST>>&>(allModules));
+        const_cast<std::map<std::string, std::unique_ptr<ModuleAST>>&>(allModules),
+        tm->getTargetTriple(), tm->createDataLayout());
 
     auto mod = cg.GetModule();
-    mod->setTargetTriple(tm->getTargetTriple());
-    mod->setDataLayout(tm->createDataLayout());
 
     fs::path obj = projectDir / "obj" / (name + ".o");
     std::error_code ec;
@@ -329,17 +358,12 @@ static void cmdBuild(const fs::path& dir, const std::set<std::string> &cliFlags 
 
     auto cfg = BuildConfig::load(dir / "build.toml");
     cfg.flags.insert(cliFlags.begin(), cliFlags.end());
-#if defined(_WIN32)
-    cfg.flags.insert("platform_windows");
-#elif defined(__APPLE__)
-    cfg.flags.insert("platform_macos");
-#else
-    cfg.flags.insert("platform_linux");
-#endif
+
+    auto tm = std::unique_ptr<llvm::TargetMachine>(makeTargetMachine());
+    addTargetFlags(cfg.flags, tm->getTargetTriple());
 
     auto modules = parseSourceFiles(dir / "src", AttributeFilter(cfg.flags));
     auto requiredLibraries = collectRequiredLibraries(modules);
-    auto tm = std::unique_ptr<llvm::TargetMachine>(makeTargetMachine());
     auto objectFiles = compileAll(modules, tm.get(), dir);
 
     link(objectFiles, cfg, dir, requiredLibraries);

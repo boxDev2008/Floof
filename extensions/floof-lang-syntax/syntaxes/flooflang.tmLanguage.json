@@ -46,22 +46,11 @@
     "attributes": {
       "patterns": [
         {
-          "name": "meta.attribute.flooflang",
-          "begin": "@",
-          "beginCaptures": {
-            "0": { "name": "punctuation.definition.attribute.flooflang" }
-          },
-          "end": "$",
-          "patterns": [
-            {
-              "name": "entity.other.attribute-name.flooflang",
-              "match": "[a-zA-Z_][a-zA-Z0-9_]*"
-            },
-            {
-              "name": "punctuation.separator.comma.flooflang",
-              "match": ","
-            }
-          ]
+          "match": "(@)([a-zA-Z_][a-zA-Z0-9_]*)",
+          "captures": {
+            "1": { "name": "punctuation.definition.attribute.flooflang" },
+            "2": { "name": "entity.other.attribute-name.flooflang" }
+          }
         }
       ]
     },
@@ -73,7 +62,7 @@
         },
         {
           "name": "keyword.other.flooflang",
-          "match": "\\b(using|require|pub|struct|enum|const|extern|packed|typename|new|free)\\b"
+          "match": "\\b(using|require|pub|struct|enum|const|extern|packed|typename|new|free|attrdef)\\b"
         },
         {
           "name": "constant.language.boolean.flooflang",

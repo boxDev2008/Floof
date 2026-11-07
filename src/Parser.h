@@ -6,6 +6,8 @@
 #include <stdexcept>
 #include <cstdint>
 #include <algorithm>
+#include <map>
+#include <unordered_map>
 
 #include "Lexer.h"
 
@@ -14,11 +16,26 @@ struct ASTNode {
     uint32_t line = 0;
 };
 
-struct Attribute {
-    std::set<std::string> flags;
+struct AttributeNode {
+    std::string name;
+    std::vector<Token> args;
+    uint32_t line = 0;
 };
 
-typedef std::vector<Attribute> AttributeList;
+typedef std::vector<AttributeNode> AttributeList;
+
+inline const AttributeNode* FindAttribute(const AttributeList& list, const std::string& name)
+{
+    for (const auto& attr : list)
+        if (attr.name == name)
+            return &attr;
+    return nullptr;
+}
+
+inline bool HasAttribute(const AttributeList& list, const std::string& name)
+{
+    return FindAttribute(list, name) != nullptr;
+}
 
 struct TypeNode : ASTNode {
     std::string name;
@@ -133,6 +150,7 @@ struct GlobalVarDecl : StmtNode {
     std::string name;
     std::unique_ptr<TypeNode> type;
     std::unique_ptr<ExprNode> init;
+    AttributeList attributes;
     bool is_pub = false;
 };
 
@@ -261,6 +279,7 @@ struct ProcDecl : ASTNode {
     AttributeList attributes;
     bool is_pub = false;
     bool is_extern = false;
+    bool is_c_abi = false;
     bool is_vararg = false;
 
     bool HasVariadicParam() const { return !params.empty() && params.back().is_variadic; }
@@ -282,6 +301,13 @@ struct AliasDecl : ASTNode {
     bool is_pub = false;
 };
 
+struct AttrDef : ASTNode {
+    std::string name;
+    std::vector<std::string> params;
+    AttributeList attributes;
+    bool is_pub = false;
+};
+
 struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<UsingDecl>> usings;
     std::vector<std::unique_ptr<StructDecl>> structs;
@@ -290,6 +316,230 @@ struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<GlobalVarDecl>> globals;
     std::vector<std::unique_ptr<ProcDecl>> procs;
     std::vector<std::unique_ptr<RequireDecl>> requires_;
+    std::vector<std::unique_ptr<AttrDef>> attrdefs;
+};
+
+class AttributeResolver
+{
+public:
+    enum DeclKind { Decl_Proc, Decl_Struct, Decl_Enum, Decl_Global, Decl_Require };
+
+    static bool IsBuiltin(const std::string& name)
+    {
+        return name == "align" || name == "callconv" || name == "feat" ||
+               name == "noreturn" || name == "inline";
+    }
+
+    static bool IsKnownCallConv(const std::string& name)
+    {
+        static const std::set<std::string> names = {
+            "c", "cdecl", "stdcall", "fastcall", "vectorcall", "thiscall", "win64", "sysv"
+        };
+        return names.count(name) > 0;
+    }
+
+    static uint64_t AlignValue(const AttributeNode& attr)
+    {
+        return std::stoull(attr.args[0].value, nullptr, 0);
+    }
+
+    AttributeResolver(std::map<std::string, std::unique_ptr<ModuleAST>>& modules, const std::string& builtinModule)
+        : m_modules(modules), m_builtinModule(builtinModule) {}
+
+    void ResolveAll(void)
+    {
+        for (auto& [name, module] : m_modules)
+            for (const auto& def : module->attrdefs)
+            {
+                if (IsBuiltin(def->name))
+                    Fail("Cannot redefine builtin attribute '@" + def->name + "'", def->line, name);
+                m_defModule[def.get()] = name;
+            }
+
+        for (auto& [name, module] : m_modules)
+            m_scopes[name] = CollectVisible(name);
+
+        for (auto& [name, module] : m_modules)
+        {
+            for (auto& d : module->procs)     Resolve(d->attributes, Decl_Proc, name);
+            for (auto& d : module->structs)   Resolve(d->attributes, Decl_Struct, name);
+            for (auto& d : module->enums)     Resolve(d->attributes, Decl_Enum, name);
+            for (auto& d : module->globals)   Resolve(d->attributes, Decl_Global, name);
+            for (auto& d : module->requires_) Resolve(d->attributes, Decl_Require, name);
+
+            for (auto& def : module->attrdefs)
+                if (def->params.empty())
+                {
+                    AttributeList out;
+                    std::vector<const AttrDef*> stack;
+                    AttributeNode use{def->name, {}, def->line};
+                    Expand(use, m_scopes[name], stack, name, out);
+                }
+        }
+    }
+
+private:
+    using DefMap = std::unordered_map<std::string, const AttrDef*>;
+
+    std::map<std::string, std::unique_ptr<ModuleAST>>& m_modules;
+    std::string m_builtinModule;
+    std::unordered_map<const AttrDef*, std::string> m_defModule;
+    std::unordered_map<std::string, DefMap> m_scopes;
+
+    [[noreturn]] static void Fail(const std::string& msg, uint32_t line, const std::string& module)
+    {
+        throw std::runtime_error(msg + " on line " + std::to_string(line) + " in module " + module);
+    }
+
+    static void AddDef(DefMap& map, const AttrDef* def, uint32_t line, const std::string& module)
+    {
+        auto [it, inserted] = map.emplace(def->name, def);
+        if (!inserted && it->second != def)
+            Fail("Attribute '@" + def->name + "' is defined in more than one visible module", line, module);
+    }
+
+    DefMap CollectVisible(const std::string& moduleName)
+    {
+        DefMap map;
+        const ModuleAST& self = *m_modules.at(moduleName);
+        for (const auto& def : self.attrdefs)
+            AddDef(map, def.get(), def->line, moduleName);
+
+        std::set<std::string> visited{moduleName};
+        std::vector<std::string> pending;
+        if (moduleName != m_builtinModule && m_modules.count(m_builtinModule))
+            pending.push_back(m_builtinModule);
+        for (const auto& use : self.usings)
+            pending.push_back(use->name);
+
+        while (!pending.empty())
+        {
+            std::string name = pending.back();
+            pending.pop_back();
+            if (!visited.insert(name).second)
+                continue;
+
+            auto it = m_modules.find(name);
+            if (it == m_modules.end())
+                continue;
+
+            for (const auto& def : it->second->attrdefs)
+                if (def->is_pub)
+                    AddDef(map, def.get(), def->line, moduleName);
+            for (const auto& use : it->second->usings)
+                if (use->is_pub)
+                    pending.push_back(use->name);
+        }
+        return map;
+    }
+
+    static void ValidateBuiltin(const AttributeNode& attr, const std::string& module)
+    {
+        auto expectArgs = [&](size_t n) {
+            if (attr.args.size() != n)
+                Fail("Attribute '@" + attr.name + "' expects " + std::to_string(n) + " argument(s)", attr.line, module);
+        };
+
+        if (attr.name == "noreturn" || attr.name == "inline")
+            expectArgs(0);
+        else if (attr.name == "align")
+        {
+            expectArgs(1);
+            uint64_t value = 0;
+            if (attr.args[0].type == TokenType_Number)
+            {
+                try { value = AlignValue(attr); } catch (...) { value = 0; }
+            }
+            if (value == 0 || (value & (value - 1)) != 0)
+                Fail("'@align' expects a power-of-two integer, got '" + attr.args[0].value + "'", attr.line, module);
+        }
+        else if (attr.name == "callconv")
+        {
+            expectArgs(1);
+            const Token& arg = attr.args[0];
+            if ((arg.type != TokenType_String && arg.type != TokenType_Identifier) || !IsKnownCallConv(arg.value))
+                Fail("Unknown calling convention '" + arg.value + "' (expected one of: c, cdecl, stdcall, "
+                     "fastcall, vectorcall, thiscall, win64, sysv)", attr.line, module);
+        }
+        else if (attr.name == "feat")
+        {
+            if (attr.args.empty())
+                Fail("'@feat' expects at least one feature name", attr.line, module);
+            for (const auto& arg : attr.args)
+                if (arg.type != TokenType_Identifier && arg.type != TokenType_String)
+                    Fail("'@feat' arguments must be feature names, got '" + arg.value + "'", attr.line, module);
+        }
+    }
+
+    void Expand(const AttributeNode& attr, const DefMap& scope, std::vector<const AttrDef*>& stack,
+                const std::string& module, AttributeList& out)
+    {
+        if (IsBuiltin(attr.name))
+        {
+            ValidateBuiltin(attr, module);
+            out.push_back(attr);
+            return;
+        }
+
+        auto it = scope.find(attr.name);
+        if (it == scope.end())
+            Fail("Unknown attribute '@" + attr.name + "'", attr.line, module);
+
+        const AttrDef* def = it->second;
+        if (std::find(stack.begin(), stack.end(), def) != stack.end())
+            Fail("Attribute '@" + attr.name + "' is defined in terms of itself", attr.line, module);
+        if (attr.args.size() != def->params.size())
+            Fail("Attribute '@" + attr.name + "' expects " + std::to_string(def->params.size()) +
+                 " argument(s), got " + std::to_string(attr.args.size()), attr.line, module);
+
+        stack.push_back(def);
+        const DefMap& defScope = m_scopes.at(m_defModule.at(def));
+        for (const auto& inner : def->attributes)
+        {
+            AttributeNode copy = inner;
+            copy.line = attr.line;
+            for (auto& arg : copy.args)
+            {
+                if (arg.type != TokenType_Identifier) continue;
+                auto p = std::find(def->params.begin(), def->params.end(), arg.value);
+                if (p != def->params.end())
+                    arg = attr.args[p - def->params.begin()];
+            }
+            Expand(copy, defScope, stack, module, out);
+        }
+        stack.pop_back();
+    }
+
+    void Resolve(AttributeList& attributes, DeclKind kind, const std::string& module)
+    {
+        if (attributes.empty())
+            return;
+
+        AttributeList out;
+        for (const auto& attr : attributes)
+        {
+            std::vector<const AttrDef*> stack;
+            Expand(attr, m_scopes.at(module), stack, module, out);
+        }
+
+        static const char* kindNames[] = { "functions", "structs", "enums", "global variables", "require declarations" };
+        for (size_t i = 0; i < out.size(); i++)
+        {
+            const AttributeNode& attr = out[i];
+            bool allowed = attr.name == "feat" ||
+                (attr.name == "align" && (kind == Decl_Proc || kind == Decl_Struct || kind == Decl_Global)) ||
+                (kind == Decl_Proc && (attr.name == "callconv" || attr.name == "noreturn" || attr.name == "inline"));
+            if (!allowed)
+                Fail("Attribute '@" + attr.name + "' cannot be applied to " + kindNames[kind], attr.line, module);
+
+            if (attr.name != "feat")
+                for (size_t j = 0; j < i; j++)
+                    if (out[j].name == attr.name)
+                        Fail("Duplicate attribute '@" + attr.name + "'", attr.line, module);
+        }
+
+        attributes = std::move(out);
+    }
 };
 
 class AttributeFilter
@@ -304,6 +554,7 @@ public:
         FilterItems(module.enums);
         FilterItems(module.procs);
         FilterItems(module.requires_);
+        FilterItems(module.globals);
     }
 
 private:
@@ -312,9 +563,12 @@ private:
     bool ShouldKeepItem(const AttributeList& attributes) const
     {
         for (const auto& attr : attributes)
-            for (const auto& flag : attr.flags)
-                if (m_flags.find(flag) == m_flags.end())
+        {
+            if (attr.name != "feat") continue;
+            for (const auto& flag : attr.args)
+                if (m_flags.find(flag.value) == m_flags.end())
                     return false;
+        }
 
         return true;
     }
@@ -339,23 +593,73 @@ public:
         Advance();
     }
 
-    AttributeList ParseAttributeList(void)
+    AttributeList ParseAttributeList(bool commaSeparated = false)
     {
         AttributeList attributes;
 
-        while (Match('@'))
+        while (Check('@'))
         {
-            Attribute attr;
+            AttributeNode attr;
+            attr.line = CurrentLine();
+            Advance();
+            Expect(TokenType_Identifier, "Expected attribute name after '@'");
+            attr.name = m_last.value;
 
-            do {
-                Expect(TokenType_Identifier, "Expected flag name after '@'");
-                attr.flags.insert(m_last.value);
-            } while (Match(','));
+            if (Match('('))
+            {
+                if (!Check(')'))
+                {
+                    do {
+                        if (!Match(TokenType_Identifier) && !Match(TokenType_Number) && !Match(TokenType_String))
+                            throw std::runtime_error("Expected identifier, number or string as argument of '@"
+                                + attr.name + "' on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+                        attr.args.push_back(m_last);
+                    } while (Match(','));
+                }
+                Expect(')', "Expected ')' after attribute arguments");
+            }
 
             attributes.push_back(std::move(attr));
+
+            if (commaSeparated && !Match(','))
+                break;
+            if (!commaSeparated && Check(',') && PeekIs('@'))
+                Advance();
         }
 
         return attributes;
+    }
+
+    std::unique_ptr<AttrDef> ParseAttrDef(void)
+    {
+        auto def = std::make_unique<AttrDef>();
+        def->line = CurrentLine();
+        Expect('@', "Expected '@' after 'attrdef'");
+        Expect(TokenType_Identifier, "Expected attribute name after '@'");
+        def->name = m_last.value;
+
+        if (Match('('))
+        {
+            if (!Check(')'))
+            {
+                do {
+                    Expect(TokenType_Identifier, "Expected parameter name in attrdef");
+                    if (std::find(def->params.begin(), def->params.end(), m_last.value) != def->params.end())
+                        throw std::runtime_error("Duplicate attrdef parameter '" + m_last.value + "' on line "
+                            + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+                    def->params.push_back(m_last.value);
+                } while (Match(','));
+            }
+            Expect(')', "Expected ')' after attrdef parameters");
+        }
+
+        Expect('=', "Expected '=' after attrdef name");
+        def->attributes = ParseAttributeList(true);
+        if (def->attributes.empty())
+            throw std::runtime_error("attrdef '@" + def->name + "' must contain at least one attribute on line "
+                + std::to_string(def->line) + " in module " + m_moduleName);
+        Expect(';', "Expected ';' after attrdef");
+        return def;
     }
 
     std::unique_ptr<ModuleAST> ParseModule(void)
@@ -364,20 +668,31 @@ public:
         
         while (m_current.type != TokenType_EOF)
         {
-            AttributeList attributes = ParseAttributeList();
+            if (Check('@'))
+                throw std::runtime_error("Attributes go after the declaration, e.g. 'foo() @inline { }' or "
+                    "'struct Foo @align(16) { }', on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+
             if (Check(TokenType_Identifier))
             {
                 uint32_t declLine = CurrentLine();
                 const bool is_pub = Match("pub");
                 const bool is_extern = Match("extern");
+                bool is_c_abi = false;
+                if (is_extern && Match(TokenType_String))
+                {
+                    if (m_last.value != "C")
+                        throw std::runtime_error("Unknown extern ABI \"" + m_last.value + "\" (only \"C\" is supported) on line "
+                            + std::to_string(declLine) + " in module " + m_moduleName);
+                    is_c_abi = true;
+                }
                 const bool is_packed = Match("packed");
 
                 if (Check(TokenType_Identifier) && (PeekIs('(') || PeekIs('<')))
                 {
                     std::unique_ptr<ProcDecl> proc = ParseProcDecl(is_extern);
+                    proc->is_c_abi = is_c_abi;
                     proc->is_pub = is_pub;
                     proc->line = declLine;
-                    proc->attributes = std::move(attributes);
                     module->procs.push_back(std::move(proc));
                 }
                 else if (Match("struct"))
@@ -386,7 +701,6 @@ public:
                     decl->is_pub = is_pub;
                     decl->is_packed = is_packed;
                     decl->line = declLine;
-                    decl->attributes = std::move(attributes);
                     module->structs.push_back(std::move(decl));
                 }
                 else if (Match("enum"))
@@ -394,8 +708,13 @@ public:
                     std::unique_ptr<EnumDecl> decl = ParseEnumDecl();
                     decl->is_pub = is_pub;
                     decl->line = declLine;
-                    decl->attributes = std::move(attributes);
                     module->enums.push_back(std::move(decl));
+                }
+                else if (Match("attrdef"))
+                {
+                    auto def = ParseAttrDef();
+                    def->is_pub = is_pub;
+                    module->attrdefs.push_back(std::move(def));
                 }
                 else if (Match("using"))
                 {
@@ -416,9 +735,9 @@ public:
                 {
                     auto require_decl = std::make_unique<RequireDecl>();
                     require_decl->line = declLine;
-                    require_decl->attributes = std::move(attributes);
                     Expect(TokenType_String, "Expected library name string after 'require'");
                     require_decl->library = m_last.value;
+                    require_decl->attributes = ParseAttributeList();
                     Expect(';', "Expected ';' after require declaration");
                     module->requires_.push_back(std::move(require_decl));
                 }
@@ -440,6 +759,8 @@ public:
                     uint32_t varLine = CurrentLine();
                     Advance();
                     
+                    AttributeList varAttributes = ParseAttributeList();
+
                     if (Check(':'))
                     {
                         auto var = std::make_unique<GlobalVarDecl>();
@@ -449,6 +770,7 @@ public:
                         Expect(':', "Expected ':'");
                         
                         var->is_pub = is_pub;
+                        var->attributes = std::move(varAttributes);
 
                         if (Check(TokenType_Identifier) || Check('('))
                             var->type = ParseType();
@@ -1318,6 +1640,7 @@ public:
         if (Match(':'))
             enum_decl->base_type = ParseType();
 
+        enum_decl->attributes = ParseAttributeList();
         Expect('{', "Expected '{'");
         
         while (!Check('}'))
@@ -1421,6 +1744,7 @@ public:
         struct_decl->name = m_last.value;
         struct_decl->line = m_lexer.GetCurrentLine();
         struct_decl->generic_params = ParseGenericParams(struct_decl->generic_constraints);
+        struct_decl->attributes = ParseAttributeList();
             
         Expect('{', "Expected '{'");
 
@@ -1524,6 +1848,8 @@ public:
 
         if (Match(TokenType_Arrow))
             proc->return_type = ParseType();
+
+        proc->attributes = ParseAttributeList();
 
         if (is_extern)
             Expect(';', "Expected ';' after extern proc declaration");
