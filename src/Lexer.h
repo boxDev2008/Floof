@@ -22,6 +22,8 @@ enum TokenType
     TokenType_StarEqual,     // *=
     TokenType_SlashEqual,    // /=
     TokenType_PercentEqual,  // %=
+    TokenType_AndAnd,        // &&
+    TokenType_OrOr,          // ||
     TokenType_EOF
 };
 
@@ -378,5 +380,7 @@ const std::unordered_map<std::string, TokenType> Lexer::two_char_ops = {
     {"-=", TokenType_MinusEqual},
     {"*=", TokenType_StarEqual},
     {"/=", TokenType_SlashEqual},
-    {"%=", TokenType_PercentEqual}
+    {"%=", TokenType_PercentEqual},
+    {"&&", TokenType_AndAnd},
+    {"||", TokenType_OrOr}
 };

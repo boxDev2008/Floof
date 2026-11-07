@@ -609,7 +609,7 @@ public:
 
     std::unique_ptr<ExprNode> ParseTernary(void)
     {
-        auto expr = ParseBitwiseOr();
+        auto expr = ParseLogicalOr();
 
         if (Match('?'))
         {
@@ -621,6 +621,46 @@ public:
             Expect(':', "Expected ':' in ternary expression");
             ternary->else_expr = ParseTernary();
             return ternary;
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExprNode> ParseLogicalOr(void)
+    {
+        auto expr = ParseLogicalAnd();
+
+        while (true)
+        {
+            uint32_t opLine = CurrentLine();
+            if (!Match(TokenType_OrOr)) break;
+
+            auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
+            binary->left = std::move(expr);
+            binary->op = TokenType_OrOr;
+            binary->right = ParseLogicalAnd();
+            expr = std::move(binary);
+        }
+
+        return expr;
+    }
+
+    std::unique_ptr<ExprNode> ParseLogicalAnd(void)
+    {
+        auto expr = ParseBitwiseOr();
+
+        while (true)
+        {
+            uint32_t opLine = CurrentLine();
+            if (!Match(TokenType_AndAnd)) break;
+
+            auto binary = std::make_unique<BinaryExpr>();
+            binary->line = opLine;
+            binary->left = std::move(expr);
+            binary->op = TokenType_AndAnd;
+            binary->right = ParseBitwiseOr();
+            expr = std::move(binary);
         }
 
         return expr;

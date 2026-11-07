@@ -691,6 +691,13 @@ private:
                 case '^': result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Xor,  lhsConst, rhsConst); break;
                 case TokenType_LeftShift:  result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::Shl,  lhsConst, rhsConst); break;
                 case TokenType_RightShift: result = llvm::ConstantFoldBinaryInstruction(llvm::Instruction::LShr, lhsConst, rhsConst); break;
+                case TokenType_AndAnd:
+                case TokenType_OrOr:
+                {
+                    bool l = !lhsConst->isNullValue(), r = !rhsConst->isNullValue();
+                    bool v = binary->op == TokenType_AndAnd ? (l && r) : (l || r);
+                    return TypedValue(m_builder.getInt1(v), TypeInfo(m_builder.getInt1Ty(), false));
+                }
                 default: Error("Unsupported binary operator in constant expression", binary->line);
             }
             return TypedValue(result, commonType);
@@ -3180,6 +3187,9 @@ private:
             return resultValue;
         }
 
+        if (binary->op == TokenType_AndAnd || binary->op == TokenType_OrOr)
+            return EvaluateLogicalExpr(binary);
+
         TypedValue lhs = EvaluateRValue(binary->left.get());
         TypedValue rhs = EvaluateRValue(binary->right.get());
 
@@ -3236,6 +3246,36 @@ private:
         }
         
         return TypedValue(result, resultType);
+    }
+
+    // Short-circuiting && and ||: the right operand is only evaluated when needed.
+    TypedValue EvaluateLogicalExpr(BinaryExpr* binary)
+    {
+        const bool isAnd = binary->op == TokenType_AndAnd;
+
+        TypedValue lhs = EnsureBooleanType(EvaluateRValue(binary->left.get()), binary->line);
+
+        auto* function = m_builder.GetInsertBlock()->getParent();
+        auto* lhsBB = m_builder.GetInsertBlock();
+        auto* rhsBB = BasicBlock::Create(m_context, isAnd ? "and.rhs" : "or.rhs", function);
+        auto* endBB = BasicBlock::Create(m_context, isAnd ? "and.end" : "or.end", function);
+
+        if (isAnd)
+            m_builder.CreateCondBr(lhs.value, rhsBB, endBB);
+        else
+            m_builder.CreateCondBr(lhs.value, endBB, rhsBB);
+
+        m_builder.SetInsertPoint(rhsBB);
+        TypedValue rhs = EnsureBooleanType(EvaluateRValue(binary->right.get()), binary->line);
+        rhsBB = m_builder.GetInsertBlock();  // rhs may have created new blocks
+        m_builder.CreateBr(endBB);
+
+        m_builder.SetInsertPoint(endBB);
+        auto* phi = m_builder.CreatePHI(m_builder.getInt1Ty(), 2, isAnd ? "and" : "or");
+        phi->addIncoming(m_builder.getInt1(!isAnd), lhsBB);
+        phi->addIncoming(rhs.value, rhsBB);
+
+        return TypedValue(phi, TypeInfo(m_builder.getInt1Ty(), false));
     }
 
     std::optional<TypedValue> TryPointerArithmetic(char op, TypedValue& lhs, TypedValue& rhs)
