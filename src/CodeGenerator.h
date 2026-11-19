@@ -7,6 +7,7 @@
 #include <llvm/Support/TargetSelect.h>
 #include <llvm/IR/LegacyPassManager.h>
 #include <llvm/Support/FileSystem.h>
+#include <llvm/Support/MathExtras.h>
 #include <llvm/TargetParser/Host.h>
 #include <llvm/Target/TargetMachine.h>
 #include <llvm/Target/TargetOptions.h>
@@ -74,6 +75,7 @@ class CodeGenerator
     {
         StructType* type;
         std::unordered_map<std::string, unsigned> fieldIndices;
+        std::vector<unsigned> fieldOrder;
         std::unordered_map<std::string, TypeInfo> fieldTypes;
         std::unordered_map<std::string, ExprNode*> fieldDefaults;
 
@@ -362,26 +364,49 @@ private:
         StructInfo& info = m_structs[name];
         info.type = structType;
 
+        const DataLayout& dl = m_module->getDataLayout();
         std::vector<Type*> memberTypes;
-        for (unsigned i = 0; i < decl->fields.size(); i++)
-        {
-            const auto& field = decl->fields[i];
-            TypeInfo fieldType = ResolveType(field->type.get());
+        uint64_t offset = 0;
+        uint64_t maxAlign = 1;
+        bool explicitAlign = false;
 
-            memberTypes.push_back(fieldType.llvmType);
-            info.fieldIndices[field->name] = i;
+        for (const auto& field : decl->fields)
+        {
+            TypeInfo fieldType = ResolveType(field->type.get());
+            uint64_t natural = decl->is_packed ? 1 : dl.getABITypeAlign(fieldType.llvmType).value();
+            uint64_t wanted = natural;
+
+            if (const AttributeNode* align = FindAttribute(field->attributes, "align"))
+            {
+                if (decl->is_packed)
+                    Error("'@align' cannot be used on fields of packed struct '" + decl->name + "'", align->line);
+                wanted = std::max(natural, AttributeResolver::AlignValue(*align));
+                explicitAlign = true;
+            }
+
+            uint64_t target = alignTo(offset, wanted);
+            if (target != alignTo(offset, natural))
+                memberTypes.push_back(ArrayType::get(FixedVectorType::get(m_builder.getInt8Ty(), 1), target - offset));
+            offset = target + dl.getTypeAllocSize(fieldType.llvmType);
+            maxAlign = std::max(maxAlign, wanted);
+
+            info.fieldIndices[field->name] = (unsigned)memberTypes.size();
+            info.fieldOrder.push_back((unsigned)memberTypes.size());
             info.fieldTypes[field->name] = fieldType;
             info.fieldDefaults[field->name] = field->default_value.get();
+            memberTypes.push_back(fieldType.llvmType);
         }
 
         if (const AttributeNode* align = FindAttribute(decl->attributes, "align"))
         {
             if (decl->is_packed)
                 Error("'@align' cannot be combined with 'packed' on struct '" + decl->name + "'", decl->line);
-            uint64_t n = AttributeResolver::AlignValue(*align);
-            if (n > 1)
-                memberTypes.push_back(ArrayType::get(FixedVectorType::get(m_builder.getInt8Ty(), (unsigned)n), 0));
+            maxAlign = std::max(maxAlign, AttributeResolver::AlignValue(*align));
+            explicitAlign = true;
         }
+
+        if (explicitAlign && maxAlign > 1)
+            memberTypes.push_back(ArrayType::get(FixedVectorType::get(m_builder.getInt8Ty(), (unsigned)maxAlign), 0));
 
         structType->setBody(memberTypes, decl->is_packed);
     }
@@ -395,7 +420,11 @@ private:
                 Error("Unknown field name '" + fi.name + "' in struct initializer", line);
             return it->second;
         }
-        return positionalIndex;
+        if (info.fieldOrder.empty())
+            return positionalIndex;
+        if (positionalIndex >= info.fieldOrder.size())
+            Error("Too many fields in struct initializer", line);
+        return info.fieldOrder[positionalIndex];
     }
     
     void DeclareGlobalVariables(const ModuleAST& ast)
@@ -634,7 +663,7 @@ private:
                 Error("Unknown struct: " + structName, structInit->line);
 
             const StructInfo& info = it->second;
-            std::vector<Constant*> fieldValues(info.fieldIndices.size(), nullptr);
+            std::vector<Constant*> fieldValues(info.type->getNumElements(), nullptr);
 
             for (unsigned i = 0; i < structInit->fields.size(); i++)
             {
@@ -667,8 +696,9 @@ private:
                 else fieldValues[idx] = Constant::getNullValue(ft->llvmType);
             }
 
-            for (unsigned i = fieldValues.size(); i < info.type->getNumElements(); i++)
-                fieldValues.push_back(Constant::getNullValue(info.type->getElementType(i)));
+            for (unsigned i = 0; i < fieldValues.size(); i++)
+                if (!fieldValues[i])
+                    fieldValues[i] = Constant::getNullValue(info.type->getElementType(i));
             return TypedValue(ConstantStruct::get(info.type, fieldValues), TypeInfo(info.type, false));
         }
 
@@ -2246,7 +2276,7 @@ private:
         if (init->fields.size() > info.fieldIndices.size())
             Error("Too many fields in struct initializer", init->line);
 
-        std::vector<bool> fieldSet(info.fieldIndices.size(), false);
+        std::vector<bool> fieldSet(info.type->getNumElements(), false);
 
         for (unsigned i = 0; i < init->fields.size(); i++)
         {

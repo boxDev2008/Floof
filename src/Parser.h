@@ -223,6 +223,7 @@ struct StructField {
     std::string name;
     std::unique_ptr<TypeNode> type;
     std::unique_ptr<ExprNode> default_value;
+    AttributeList attributes;
 };
 
 struct StructDecl : ASTNode {
@@ -322,7 +323,7 @@ struct ModuleAST : ASTNode {
 class AttributeResolver
 {
 public:
-    enum DeclKind { Decl_Proc, Decl_Struct, Decl_Enum, Decl_Global, Decl_Require };
+    enum DeclKind { Decl_Proc, Decl_Struct, Decl_Enum, Decl_Global, Decl_Require, Decl_Field };
 
     static bool IsBuiltin(const std::string& name)
     {
@@ -362,7 +363,12 @@ public:
         for (auto& [name, module] : m_modules)
         {
             for (auto& d : module->procs)     Resolve(d->attributes, Decl_Proc, name);
-            for (auto& d : module->structs)   Resolve(d->attributes, Decl_Struct, name);
+            for (auto& d : module->structs)
+            {
+                Resolve(d->attributes, Decl_Struct, name);
+                for (auto& f : d->fields)
+                    Resolve(f->attributes, Decl_Field, name);
+            }
             for (auto& d : module->enums)     Resolve(d->attributes, Decl_Enum, name);
             for (auto& d : module->globals)   Resolve(d->attributes, Decl_Global, name);
             for (auto& d : module->requires_) Resolve(d->attributes, Decl_Require, name);
@@ -522,12 +528,12 @@ private:
             Expand(attr, m_scopes.at(module), stack, module, out);
         }
 
-        static const char* kindNames[] = { "functions", "structs", "enums", "global variables", "require declarations" };
+        static const char* kindNames[] = { "functions", "structs", "enums", "global variables", "require declarations", "struct fields" };
         for (size_t i = 0; i < out.size(); i++)
         {
             const AttributeNode& attr = out[i];
-            bool allowed = attr.name == "feat" ||
-                (attr.name == "align" && (kind == Decl_Proc || kind == Decl_Struct || kind == Decl_Global)) ||
+            bool allowed = (attr.name == "feat" && kind != Decl_Field) ||
+                (attr.name == "align" && (kind == Decl_Proc || kind == Decl_Struct || kind == Decl_Global || kind == Decl_Field)) ||
                 (kind == Decl_Proc && (attr.name == "callconv" || attr.name == "noreturn" || attr.name == "inline"));
             if (!allowed)
                 Fail("Attribute '@" + attr.name + "' cannot be applied to " + kindNames[kind], attr.line, module);
@@ -1757,6 +1763,7 @@ public:
 
             Expect(':', "Expected ':'");
             field->type = ParseType();
+            field->attributes = ParseAttributeList();
 
             if (Match('='))
                 field->default_value = ParseExpr();

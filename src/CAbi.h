@@ -104,6 +104,8 @@ inline bool Classify(llvm::Type* t, uint64_t offset, Eightbytes& eb, const llvm:
 
     if (auto* at = llvm::dyn_cast<llvm::ArrayType>(t))
     {
+        if (at->getElementType()->isVectorTy())
+            return true;
         uint64_t elemSize = dl.getTypeAllocSize(at->getElementType());
         for (uint64_t i = 0; i < at->getNumElements(); i++)
             if (!Classify(at->getElementType(), offset + i * elemSize, eb, dl))
