@@ -62,7 +62,7 @@
         },
         {
           "name": "keyword.other.flooflang",
-          "match": "\\b(using|require|pub|struct|enum|const|extern|packed|typename|new|free|attrdef)\\b"
+          "match": "\\b(using|namespace|require|pub|struct|enum|const|extern|packed|typename|new|free|attrdef)\\b"
         },
         {
           "name": "constant.language.boolean.flooflang",

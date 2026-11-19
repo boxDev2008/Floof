@@ -16,6 +16,17 @@ struct ASTNode {
     uint32_t line = 0;
 };
 
+struct NamespaceScope {
+    std::string path;
+    std::vector<std::string> usings;
+    const NamespaceScope* parent = nullptr;
+};
+
+inline std::string QualifyName(const NamespaceScope* ns, const std::string& name)
+{
+    return (!ns || ns->path.empty()) ? name : ns->path + "." + name;
+}
+
 struct AttributeNode {
     std::string name;
     std::vector<Token> args;
@@ -110,6 +121,7 @@ struct ArrayAccess : ExprNode {
 struct MemberAccess : ExprNode {
     std::unique_ptr<ExprNode> object;
     std::string member;
+    std::vector<std::unique_ptr<TypeNode>> generic_args;
 };
 
 struct FieldInit {
@@ -151,6 +163,7 @@ struct GlobalVarDecl : StmtNode {
     std::unique_ptr<TypeNode> type;
     std::unique_ptr<ExprNode> init;
     AttributeList attributes;
+    const NamespaceScope* ns = nullptr;
     bool is_pub = false;
 };
 
@@ -232,6 +245,7 @@ struct StructDecl : ASTNode {
     std::vector<GenericConstraint> generic_constraints;
     std::vector<std::unique_ptr<StructField>> fields;
     AttributeList attributes;
+    const NamespaceScope* ns = nullptr;
     bool is_packed = false;
     bool is_pub = false;
 };
@@ -248,6 +262,7 @@ struct EnumDecl : ASTNode
     std::vector<EnumValue> values;
     std::unique_ptr<TypeNode> base_type;
     AttributeList attributes;
+    const NamespaceScope* ns = nullptr;
     bool is_pub = false;
 };
 
@@ -278,6 +293,7 @@ struct ProcDecl : ASTNode {
     std::unique_ptr<TypeNode> return_type;
     std::unique_ptr<BlockStmt> body;
     AttributeList attributes;
+    const NamespaceScope* ns = nullptr;
     bool is_pub = false;
     bool is_extern = false;
     bool is_c_abi = false;
@@ -299,6 +315,7 @@ struct RequireDecl : ASTNode {
 struct AliasDecl : ASTNode {
     std::string name;
     std::unique_ptr<TypeNode> target;
+    const NamespaceScope* ns = nullptr;
     bool is_pub = false;
 };
 
@@ -310,6 +327,7 @@ struct AttrDef : ASTNode {
 };
 
 struct ModuleAST : ASTNode {
+    std::vector<std::unique_ptr<NamespaceScope>> scopes;
     std::vector<std::unique_ptr<UsingDecl>> usings;
     std::vector<std::unique_ptr<StructDecl>> structs;
     std::vector<std::unique_ptr<EnumDecl>> enums;
@@ -592,6 +610,234 @@ private:
     }
 };
 
+class NamespaceResolver
+{
+public:
+    NamespaceResolver(std::map<std::string, std::unique_ptr<ModuleAST>>& modules)
+        : m_modules(modules) {}
+
+    void ResolveAll(void)
+    {
+        for (auto& [name, module] : m_modules)
+            for (const auto& scope : module->scopes)
+                for (std::string path = scope->path; !path.empty(); )
+                {
+                    m_namespaces.insert(path);
+                    size_t dot = path.rfind('.');
+                    path = dot == std::string::npos ? "" : path.substr(0, dot);
+                }
+
+        for (auto& [name, module] : m_modules)
+        {
+            m_moduleName = &name;
+
+            for (const auto& use : module->usings)
+                if (!m_modules.count(use->name) && !m_namespaces.count(use->name))
+                    Fail("Unknown module or namespace '" + use->name + "'", use->line);
+
+            for (auto& decl : module->globals)
+            {
+                m_scope = decl->ns;
+                RewriteExpr(decl->init);
+            }
+            for (auto& decl : module->structs)
+            {
+                m_scope = decl->ns;
+                for (auto& field : decl->fields)
+                    RewriteExpr(field->default_value);
+            }
+            for (auto& decl : module->enums)
+            {
+                m_scope = decl->ns;
+                for (auto& value : decl->values)
+                    RewriteExpr(value.expr);
+            }
+            for (auto& proc : module->procs)
+            {
+                m_scope = proc->ns;
+                for (auto& param : proc->params)
+                    RewriteExpr(param.default_value);
+                if (!proc->body)
+                    continue;
+
+                m_locals.emplace_back();
+                for (const auto& param : proc->params)
+                    m_locals.back().insert(param.name);
+                RewriteBlock(proc->body.get());
+                m_locals.pop_back();
+            }
+        }
+    }
+
+private:
+    std::map<std::string, std::unique_ptr<ModuleAST>>& m_modules;
+    std::set<std::string> m_namespaces;
+    std::vector<std::set<std::string>> m_locals;
+    const NamespaceScope* m_scope = nullptr;
+    const std::string* m_moduleName = nullptr;
+
+    [[noreturn]] void Fail(const std::string& msg, uint32_t line) const
+    {
+        throw std::runtime_error(msg + " on line " + std::to_string(line) + " in module " + *m_moduleName);
+    }
+
+    bool IsLocal(const std::string& name) const
+    {
+        for (const auto& scope : m_locals)
+            if (scope.count(name))
+                return true;
+        return false;
+    }
+
+    bool IsNamespace(const std::string& path) const
+    {
+        std::string outer = m_scope ? m_scope->path : "";
+        while (true)
+        {
+            if (m_namespaces.count(outer.empty() ? path : outer + "." + path))
+                return true;
+            if (outer.empty())
+                return false;
+            size_t dot = outer.rfind('.');
+            outer = dot == std::string::npos ? "" : outer.substr(0, dot);
+        }
+    }
+
+    void CollapseQualifiedName(std::unique_ptr<ExprNode>& expr)
+    {
+        std::vector<MemberAccess*> chain;
+        ExprNode* node = expr.get();
+        while (auto* member = dynamic_cast<MemberAccess*>(node))
+        {
+            chain.push_back(member);
+            node = member->object.get();
+        }
+        std::reverse(chain.begin(), chain.end());
+
+        auto* root = dynamic_cast<Identifier*>(node);
+        if (chain.empty() || !root || !root->generic_args.empty() || IsLocal(root->name) || !IsNamespace(root->name))
+            return;
+
+        std::string path = root->name;
+        size_t used = 0;
+        while (used < chain.size() && chain[used]->generic_args.empty() && IsNamespace(path + "." + chain[used]->member))
+            path += "." + chain[used++]->member;
+
+        if (used == chain.size())
+            Fail("Namespace '" + path + "' cannot be used as a value", chain.back()->line);
+
+        MemberAccess* target = chain[used];
+        auto qualified = std::make_unique<Identifier>();
+        qualified->line = target->line;
+        qualified->name = path + "." + target->member;
+        qualified->generic_args = std::move(target->generic_args);
+
+        if (used + 1 < chain.size())
+            chain[used + 1]->object = std::move(qualified);
+        else
+            expr = std::move(qualified);
+    }
+
+    void RewriteExpr(std::unique_ptr<ExprNode>& expr)
+    {
+        if (!expr)
+            return;
+
+        if (dynamic_cast<MemberAccess*>(expr.get()))
+            CollapseQualifiedName(expr);
+
+        ExprNode* node = expr.get();
+        if (auto* e = dynamic_cast<MemberAccess*>(node))
+        {
+            if (!e->generic_args.empty())
+                Fail("Type arguments can only be given to a function, but '" + e->member + "' is a member", e->line);
+            RewriteExpr(e->object);
+        }
+        else if (auto* e = dynamic_cast<BinaryExpr*>(node))  { RewriteExpr(e->left); RewriteExpr(e->right); }
+        else if (auto* e = dynamic_cast<UnaryExpr*>(node))   RewriteExpr(e->operand);
+        else if (auto* e = dynamic_cast<CallExpr*>(node))
+        {
+            RewriteExpr(e->callee);
+            for (auto& arg : e->args)
+                RewriteExpr(arg);
+        }
+        else if (auto* e = dynamic_cast<ArrayAccess*>(node)) { RewriteExpr(e->array); RewriteExpr(e->index); }
+        else if (auto* e = dynamic_cast<StructInit*>(node))
+        {
+            for (auto& field : e->fields)
+                RewriteExpr(field.value);
+        }
+        else if (auto* e = dynamic_cast<ArrayInit*>(node))
+        {
+            for (auto& element : e->elements)
+                RewriteExpr(element);
+        }
+        else if (auto* e = dynamic_cast<NewExpr*>(node))     RewriteExpr(e->count);
+        else if (auto* e = dynamic_cast<CastExpr*>(node))    RewriteExpr(e->operand);
+        else if (auto* e = dynamic_cast<TypeofExpr*>(node))  RewriteExpr(e->operand);
+        else if (auto* e = dynamic_cast<SpreadExpr*>(node))  RewriteExpr(e->operand);
+        else if (auto* e = dynamic_cast<TernaryExpr*>(node))
+        {
+            RewriteExpr(e->condition);
+            RewriteExpr(e->then_expr);
+            RewriteExpr(e->else_expr);
+        }
+    }
+
+    void RewriteBlock(BlockStmt* block)
+    {
+        if (!block)
+            return;
+        m_locals.emplace_back();
+        for (auto& stmt : block->statements)
+            RewriteStmt(stmt.get());
+        m_locals.pop_back();
+    }
+
+    void RewriteVarDecl(VarDecl* decl)
+    {
+        RewriteExpr(decl->init);
+        m_locals.back().insert(decl->name);
+    }
+
+    void RewriteStmt(StmtNode* stmt)
+    {
+        if (auto* s = dynamic_cast<VarDecl*>(stmt))          RewriteVarDecl(s);
+        else if (auto* s = dynamic_cast<ExprStmt*>(stmt))    RewriteExpr(s->expr);
+        else if (auto* s = dynamic_cast<ReturnStmt*>(stmt))  RewriteExpr(s->value);
+        else if (auto* s = dynamic_cast<FreeStmt*>(stmt))    RewriteExpr(s->value);
+        else if (auto* s = dynamic_cast<BlockStmt*>(stmt))   RewriteBlock(s);
+        else if (auto* s = dynamic_cast<IfStmt*>(stmt))
+        {
+            RewriteExpr(s->condition);
+            RewriteBlock(s->then_branch.get());
+            RewriteBlock(s->else_branch.get());
+        }
+        else if (auto* s = dynamic_cast<WhileStmt*>(stmt))   { RewriteExpr(s->condition); RewriteBlock(s->then_branch.get()); }
+        else if (auto* s = dynamic_cast<DoWhileStmt*>(stmt)) { RewriteBlock(s->then_branch.get()); RewriteExpr(s->condition); }
+        else if (auto* s = dynamic_cast<ForStmt*>(stmt))
+        {
+            m_locals.emplace_back();
+            if (s->init_decl)
+                RewriteVarDecl(s->init_decl.get());
+            RewriteExpr(s->init_expr);
+            RewriteExpr(s->condition);
+            RewriteExpr(s->increment);
+            RewriteBlock(s->body.get());
+            m_locals.pop_back();
+        }
+        else if (auto* s = dynamic_cast<MatchStmt*>(stmt))
+        {
+            RewriteExpr(s->value);
+            for (auto& c : s->cases)
+            {
+                RewriteExpr(c->value);
+                RewriteBlock(c->body.get());
+            }
+        }
+    }
+};
+
 class Parser {
 public:
     Parser(Lexer& lex, const std::string &moduleName) : m_lexer(lex), m_moduleName(moduleName)
@@ -671,144 +917,214 @@ public:
     std::unique_ptr<ModuleAST> ParseModule(void)
     {
         std::unique_ptr<ModuleAST> module = std::make_unique<ModuleAST>();
-        
+        module->scopes.push_back(std::make_unique<NamespaceScope>());
+        m_ns = module->scopes.back().get();
+
         while (m_current.type != TokenType_EOF)
+            ParseTopLevel(*module);
+
+        return module;
+    }
+
+    void ParseNamespace(ModuleAST& module)
+    {
+        uint32_t line = CurrentLine();
+        Advance();
+        Expect(TokenType_Identifier, "Expected namespace name after 'namespace'");
+        std::string path = m_last.value;
+        while (Match('.'))
         {
-            if (Check('@'))
-                throw std::runtime_error("Attributes go after the declaration, e.g. 'foo() @inline { }' or "
-                    "'struct Foo @align(16) { }', on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+            Expect(TokenType_Identifier, "Expected identifier after '.' in namespace name");
+            path += '.' + m_last.value;
+        }
 
-            if (Check(TokenType_Identifier))
+        auto scope = std::make_unique<NamespaceScope>();
+        scope->parent = m_ns;
+        scope->path = m_ns->path.empty() ? path : m_ns->path + "." + path;
+        NamespaceScope* inner = scope.get();
+        module.scopes.push_back(std::move(scope));
+
+        auto fail = [&](const std::string& msg) {
+            throw std::runtime_error(msg + " on line " + std::to_string(line) + " in module " + m_moduleName);
+        };
+
+        if (Match(';'))
+        {
+            bool hasDecls = !module.structs.empty() || !module.enums.empty() || !module.aliases.empty() ||
+                !module.globals.empty() || !module.procs.empty() || !module.attrdefs.empty();
+            if (m_ns->parent || m_hasBlockNamespace || m_hasFileNamespace)
+                fail("A file-scoped namespace must be the only namespace declaration in the file");
+            if (hasDecls)
+                fail("A file-scoped namespace must come before any declarations");
+            m_hasFileNamespace = true;
+            m_ns = inner;
+            return;
+        }
+
+        if (m_hasFileNamespace)
+            fail("Namespace blocks cannot be used in a file with a file-scoped namespace");
+        m_hasBlockNamespace = true;
+
+        Expect('{', "Expected '{' or ';' after namespace name");
+        NamespaceScope* outer = m_ns;
+        m_ns = inner;
+        while (!Check('}'))
+        {
+            if (m_current.type == TokenType_EOF)
+                fail("Unterminated namespace '" + inner->path + "'");
+            ParseTopLevel(module);
+        }
+        Expect('}', "Expected '}' after namespace body");
+        m_ns = outer;
+    }
+
+    void ParseTopLevel(ModuleAST& moduleRef)
+    {
+        ModuleAST* module = &moduleRef;
+        if (Check(TokenType_Identifier) && m_current.value == "namespace" && PeekIs(TokenType_Identifier))
+        {
+            ParseNamespace(moduleRef);
+            return;
+        }
+
+        if (Check('@'))
+            throw std::runtime_error("Attributes go after the declaration, e.g. 'foo() @inline { }' or "
+                "'struct Foo @align(16) { }', on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+
+        if (Check(TokenType_Identifier))
+        {
+            uint32_t declLine = CurrentLine();
+            const bool is_pub = Match("pub");
+            const bool is_extern = Match("extern");
+            bool is_c_abi = false;
+            if (is_extern && Match(TokenType_String))
             {
-                uint32_t declLine = CurrentLine();
-                const bool is_pub = Match("pub");
-                const bool is_extern = Match("extern");
-                bool is_c_abi = false;
-                if (is_extern && Match(TokenType_String))
-                {
-                    if (m_last.value != "C")
-                        throw std::runtime_error("Unknown extern ABI \"" + m_last.value + "\" (only \"C\" is supported) on line "
-                            + std::to_string(declLine) + " in module " + m_moduleName);
-                    is_c_abi = true;
-                }
-                const bool is_packed = Match("packed");
+                if (m_last.value != "C")
+                    throw std::runtime_error("Unknown extern ABI \"" + m_last.value + "\" (only \"C\" is supported) on line "
+                        + std::to_string(declLine) + " in module " + m_moduleName);
+                is_c_abi = true;
+            }
+            const bool is_packed = Match("packed");
 
-                if (Check(TokenType_Identifier) && (PeekIs('(') || PeekIs('<')))
+            if (Check(TokenType_Identifier) && (PeekIs('(') || PeekIs('<')))
+            {
+                std::unique_ptr<ProcDecl> proc = ParseProcDecl(is_extern);
+                proc->is_c_abi = is_c_abi;
+                proc->is_pub = is_pub;
+                proc->line = declLine;
+                proc->ns = m_ns;
+                module->procs.push_back(std::move(proc));
+            }
+            else if (Match("struct"))
+            {
+                std::unique_ptr<StructDecl> decl = ParseStructDecl();
+                decl->is_pub = is_pub;
+                decl->is_packed = is_packed;
+                decl->line = declLine;
+                decl->ns = m_ns;
+                module->structs.push_back(std::move(decl));
+            }
+            else if (Match("enum"))
+            {
+                std::unique_ptr<EnumDecl> decl = ParseEnumDecl();
+                decl->is_pub = is_pub;
+                decl->line = declLine;
+                decl->ns = m_ns;
+                module->enums.push_back(std::move(decl));
+            }
+            else if (Match("attrdef"))
+            {
+                auto def = ParseAttrDef();
+                def->is_pub = is_pub;
+                module->attrdefs.push_back(std::move(def));
+            }
+            else if (Match("using"))
+            {
+                auto using_decl = std::make_unique<UsingDecl>();
+                using_decl->line = declLine;
+                Expect(TokenType_Identifier, "Expected module name after 'using'");
+                using_decl->name = m_last.value;
+                using_decl->is_pub = is_pub;
+                while (Match('.'))
                 {
-                    std::unique_ptr<ProcDecl> proc = ParseProcDecl(is_extern);
-                    proc->is_c_abi = is_c_abi;
-                    proc->is_pub = is_pub;
-                    proc->line = declLine;
-                    module->procs.push_back(std::move(proc));
+                    Expect(TokenType_Identifier, "Expected identifier after '.'");
+                    using_decl->name += '.' + m_last.value;
                 }
-                else if (Match("struct"))
-                {
-                    std::unique_ptr<StructDecl> decl = ParseStructDecl();
-                    decl->is_pub = is_pub;
-                    decl->is_packed = is_packed;
-                    decl->line = declLine;
-                    module->structs.push_back(std::move(decl));
-                }
-                else if (Match("enum"))
-                {
-                    std::unique_ptr<EnumDecl> decl = ParseEnumDecl();
-                    decl->is_pub = is_pub;
-                    decl->line = declLine;
-                    module->enums.push_back(std::move(decl));
-                }
-                else if (Match("attrdef"))
-                {
-                    auto def = ParseAttrDef();
-                    def->is_pub = is_pub;
-                    module->attrdefs.push_back(std::move(def));
-                }
-                else if (Match("using"))
-                {
-                    auto using_decl = std::make_unique<UsingDecl>();
-                    using_decl->line = declLine;
-                    Expect(TokenType_Identifier, "Expected module name after 'using'");
-                    using_decl->name = m_last.value;
-                    using_decl->is_pub = is_pub;
-                    while (Match('.'))
-                    {
-                        Expect(TokenType_Identifier, "Expected identifier after '.'");
-                        using_decl->name += '.' + m_last.value;
-                    }
-                    Expect(';', "Expected ';' after using declaration");
-                    module->usings.push_back(std::move(using_decl));
-                }
-                else if (Match("require"))
-                {
-                    auto require_decl = std::make_unique<RequireDecl>();
-                    require_decl->line = declLine;
-                    Expect(TokenType_String, "Expected library name string after 'require'");
-                    require_decl->library = m_last.value;
-                    require_decl->attributes = ParseAttributeList();
-                    Expect(';', "Expected ';' after require declaration");
-                    module->requires_.push_back(std::move(require_decl));
-                }
-                else if (Check(TokenType_Identifier) && m_current.value == "typename" && !PeekIs(':') && Match("typename"))
-                {
-                    std::unique_ptr<AliasDecl> alias = std::make_unique<AliasDecl>();
-                    alias->line = declLine;
-                    alias->is_pub = is_pub;
-                    Expect(TokenType_Identifier, "Expected alias name after '='");
-                    alias->name = m_last.value;
-                    Expect('=', "Expected '=' after type in alias declaration");
-                    alias->target = ParseType();
-                    Expect(';', "Expected ';' after type alias declaration");
-                    module->aliases.push_back(std::move(alias));
-                }
-                else
-                {
-                    std::string name = m_current.value;
-                    uint32_t varLine = CurrentLine();
-                    Advance();
-                    
-                    AttributeList varAttributes = ParseAttributeList();
-
-                    if (Check(':'))
-                    {
-                        auto var = std::make_unique<GlobalVarDecl>();
-                        var->name = name;
-                        var->line = varLine;
-                        
-                        Expect(':', "Expected ':'");
-                        
-                        var->is_pub = is_pub;
-                        var->attributes = std::move(varAttributes);
-
-                        if (Check(TokenType_Identifier) || Check('('))
-                            var->type = ParseType();
-                        
-                        if (Match('='))
-                        {
-                            var->init = ParseExpr();
-                        }
-                        
-                        Expect(';', "Expected ';'");
-                        module->globals.push_back(std::move(var));
-                    }
-                    else
-                    {
-                        throw std::runtime_error("Unexpected token at top level: " + name + " on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
-                    }
-                }
+                Expect(';', "Expected ';' after using declaration");
+                m_ns->usings.push_back(using_decl->name);
+                module->usings.push_back(std::move(using_decl));
+            }
+            else if (Match("require"))
+            {
+                auto require_decl = std::make_unique<RequireDecl>();
+                require_decl->line = declLine;
+                Expect(TokenType_String, "Expected library name string after 'require'");
+                require_decl->library = m_last.value;
+                require_decl->attributes = ParseAttributeList();
+                Expect(';', "Expected ';' after require declaration");
+                module->requires_.push_back(std::move(require_decl));
+            }
+            else if (Check(TokenType_Identifier) && m_current.value == "typename" && !PeekIs(':') && Match("typename"))
+            {
+                std::unique_ptr<AliasDecl> alias = std::make_unique<AliasDecl>();
+                alias->line = declLine;
+                alias->is_pub = is_pub;
+                alias->ns = m_ns;
+                Expect(TokenType_Identifier, "Expected alias name after '='");
+                alias->name = m_last.value;
+                Expect('=', "Expected '=' after type in alias declaration");
+                alias->target = ParseType();
+                Expect(';', "Expected ';' after type alias declaration");
+                module->aliases.push_back(std::move(alias));
             }
             else
             {
-                std::string msg = "Unexpected token at module level: ";
-                if (m_current.type == TokenType_Identifier)
-                    msg += m_current.value;
-                else if (m_current.type < 256)
-                    msg += std::string(1, (char)m_current.type);
+                std::string name = m_current.value;
+                uint32_t varLine = CurrentLine();
+                Advance();
+                
+                AttributeList varAttributes = ParseAttributeList();
+
+                if (Check(':'))
+                {
+                    auto var = std::make_unique<GlobalVarDecl>();
+                    var->name = name;
+                    var->line = varLine;
+                    
+                    Expect(':', "Expected ':'");
+                    
+                    var->is_pub = is_pub;
+                    var->ns = m_ns;
+                    var->attributes = std::move(varAttributes);
+
+                    if (Check(TokenType_Identifier) || Check('('))
+                        var->type = ParseType();
+                    
+                    if (Match('='))
+                    {
+                        var->init = ParseExpr();
+                    }
+                    
+                    Expect(';', "Expected ';'");
+                    module->globals.push_back(std::move(var));
+                }
                 else
-                    msg += "token type " + std::to_string(m_current.type);
-                throw std::runtime_error(msg + " on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+                {
+                    throw std::runtime_error("Unexpected token at top level: " + name + " on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+                }
             }
         }
-        
-        return module;
+        else
+        {
+            std::string msg = "Unexpected token at module level: ";
+            if (m_current.type == TokenType_Identifier)
+                msg += m_current.value;
+            else if (m_current.type < 256)
+                msg += std::string(1, (char)m_current.type);
+            else
+                msg += "token type " + std::to_string(m_current.type);
+            throw std::runtime_error(msg + " on line " + std::to_string(CurrentLine()) + " in module " + m_moduleName);
+        }
     }
 
     std::unique_ptr<TypeNode> ParseType(bool allowArrayDims = true)
@@ -856,15 +1172,14 @@ public:
             return type;
         }
         
-        if (Check(TokenType_Identifier))
+        Expect(TokenType_Identifier, "Expected type name");
+        type->name = m_last.value;
+
+        while (Check('.') && PeekIs(TokenType_Identifier))
         {
-            type->name = m_current.value;
             Advance();
-        }
-        else
-        {
-            Expect(TokenType_Identifier, "Expected type name");
-            type->name = m_last.value;
+            Expect(TokenType_Identifier, "Expected type name after '.'");
+            type->name += '.' + m_last.value;
         }
 
         if (Match('<'))
@@ -1166,8 +1481,11 @@ public:
 
     std::unique_ptr<ExprNode> ParsePostfix(void)
     {
-        auto expr = ParsePrimary();
-        
+        return ParsePostfixOps(ParsePrimary());
+    }
+
+    std::unique_ptr<ExprNode> ParsePostfixOps(std::unique_ptr<ExprNode> expr)
+    {
         while (true)
         {
             uint32_t opLine = CurrentLine();
@@ -1187,6 +1505,21 @@ public:
                 member->object = std::move(expr);
                 Expect(TokenType_Identifier, "Expected member name");
                 member->member = m_last.value;
+                TryParseGenericArgs(member->generic_args);
+
+                std::string path;
+                if (!m_parsingStatement && Check('{') && DottedPath(member->object.get(), path))
+                {
+                    auto init = std::make_unique<StructInit>();
+                    init->line = opLine;
+                    init->type_name = path + "." + member->member;
+                    init->type_args = std::move(member->generic_args);
+                    Advance();
+                    ParseStructInitFields(*init);
+                    expr = std::move(init);
+                    continue;
+                }
+
                 expr = std::move(member);
             }
             else if (Match('('))
@@ -1202,6 +1535,46 @@ public:
         }
         
         return expr;
+    }
+
+    static bool DottedPath(const ExprNode* expr, std::string& out)
+    {
+        if (auto* id = dynamic_cast<const Identifier*>(expr))
+        {
+            if (!id->generic_args.empty())
+                return false;
+            out = id->name;
+            return true;
+        }
+        if (auto* member = dynamic_cast<const MemberAccess*>(expr))
+        {
+            if (!member->generic_args.empty() || !DottedPath(member->object.get(), out))
+                return false;
+            out += "." + member->member;
+            return true;
+        }
+        return false;
+    }
+
+    void ParseStructInitFields(StructInit& init)
+    {
+        if (!Check('}'))
+        {
+            do {
+                if (Check('}')) break;
+                FieldInit fi;
+                if (Check(TokenType_Identifier) && PeekIs(':'))
+                {
+                    fi.name = m_current.value;
+                    Advance();
+                    Advance();
+                }
+                fi.value = ParseExpr();
+                init.fields.push_back(std::move(fi));
+            } while (Match(','));
+        }
+
+        Expect('}', "Expected '}'");
     }
 
     NumberType ClassifyNumberLiteral(const std::string& value, std::string& outNumericPart)
@@ -1368,24 +1741,7 @@ public:
                 init->line = primaryLine;
                 init->type_name = name;
                 init->type_args = std::move(genericArgs);
-                
-                if (!Check('}'))
-                {
-                    do {
-                        if (Check('}')) break;
-                        FieldInit fi;
-                        if (Check(TokenType_Identifier) && PeekIs(':'))
-                        {
-                            fi.name = m_current.value;
-                            Advance();
-                            Advance();
-                        }
-                        fi.value = ParseExpr();
-                        init->fields.push_back(std::move(fi));
-                    } while (Match(','));
-                }
-                
-                Expect('}', "Expected '}'");
+                ParseStructInitFields(*init);
                 return init;
             }
             
@@ -1553,43 +1909,7 @@ public:
                 ident->line = identLine;
                 TryParseGenericArgs(ident->generic_args);
                 
-                std::unique_ptr<ExprNode> expr = std::move(ident);
-                
-                while (true)
-                {
-                    uint32_t postfixLine = CurrentLine();
-                    if (Match('['))
-                    {
-                        auto access = std::make_unique<ArrayAccess>();
-                        access->line = postfixLine;
-                        access->array = std::move(expr);
-                        access->index = ParseExpr();
-                        Expect(']', "Expected ']'");
-                        expr = std::move(access);
-                    }
-                    else if (Match('.'))
-                    {
-                        auto member = std::make_unique<MemberAccess>();
-                        member->line = postfixLine;
-                        member->object = std::move(expr);
-                        Expect(TokenType_Identifier, "Expected member name");
-                        member->member = m_last.value;
-                        expr = std::move(member);
-                    }
-                    else if (Match('('))
-                    {
-                        auto call = std::make_unique<CallExpr>();
-                        call->line = postfixLine;
-                        call->callee = std::move(expr);
-                        
-                        ParseCallArgs(call->args);
-                        expr = std::move(call);
-                    }
-                    else
-                    {
-                        break;
-                    }
-                }
+                std::unique_ptr<ExprNode> expr = ParsePostfixOps(std::move(ident));
                 
                 uint32_t assignLine = CurrentLine();
                 if (Match('=') || Match(TokenType_PlusEqual) || Match(TokenType_MinusEqual) ||
@@ -2088,4 +2408,7 @@ private:
     Token m_next;
     bool m_hasNext = false;
     bool m_parsingStatement = false;
+    NamespaceScope* m_ns = nullptr;
+    bool m_hasFileNamespace = false;
+    bool m_hasBlockNamespace = false;
 };

@@ -189,6 +189,7 @@ static std::map<std::string, std::unique_ptr<ModuleAST>> parseSourceFiles(const 
         modules.emplace(rel, parser.ParseModule());
     }
 
+    NamespaceResolver(modules).ResolveAll();
     AttributeResolver(modules, BUILTIN_MODULE_NAME).ResolveAll();
     for (auto& [name, module] : modules)
         filter.FilterModule(*module);

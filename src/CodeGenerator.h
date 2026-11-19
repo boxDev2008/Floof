@@ -78,6 +78,7 @@ class CodeGenerator
         std::vector<unsigned> fieldOrder;
         std::unordered_map<std::string, TypeInfo> fieldTypes;
         std::unordered_map<std::string, ExprNode*> fieldDefaults;
+        const NamespaceScope* ns = nullptr;
 
         // Set for instances of generic structs, used to infer type arguments from struct args
         const StructDecl* genericDecl = nullptr;
@@ -107,6 +108,7 @@ class CodeGenerator
         TypeInfo packElem;
         std::string sourceName;
         std::shared_ptr<const cabi::FunctionAbi> abi;
+        const NamespaceScope* ns = nullptr;
 
         FunctionInfo() : function(nullptr), isVarArg(false) {}
         
@@ -150,8 +152,10 @@ public:
         m_module = std::make_unique<Module>(moduleName, ctx);
         m_module->setTargetTriple(triple);
         m_module->setDataLayout(dataLayout);
+        m_ns = ast.scopes.empty() ? nullptr : ast.scopes.front().get();
 
         RegisterBuiltinTypes();
+        IndexNamespacedDecls(moduleName, moduleTable);
         ImportUsedModules(ast, moduleTable);
         RegisterAliases(ast);
         RegisterEnums(ast);
@@ -177,7 +181,8 @@ private:
             ImportModuleRecursively(BUILTIN_MODULE_NAME, moduleTable);
 
         for (const auto& use : ast.usings)
-            ImportModuleRecursively(use->name, moduleTable);
+            if (moduleTable.count(use->name))
+                ImportModuleRecursively(use->name, moduleTable);
     }
 
     std::unordered_set<std::string> m_importedModules;
@@ -196,54 +201,228 @@ private:
         
         for (const auto& use : module.usings)
         {
-            if (use->is_pub)
+            if (use->is_pub && moduleTable.count(use->name))
                 ImportModuleRecursively(use->name, moduleTable);
         }
-        
-        ImportModuleAliases(module);
-        ImportModuleEnums(module);
-        ImportModuleStructs(module);
-        ImportModuleGlobals(module);
-        ImportModuleFunctions(module);
+
+        const std::string& name = it->first;
+        for (const auto& decl : module.aliases) if (decl->is_pub) ImportDecl({&name, decl.get(), DeclKind::Alias});
+        for (const auto& decl : module.enums)   if (decl->is_pub) ImportDecl({&name, decl.get(), DeclKind::Enum});
+        for (const auto& decl : module.structs)
+            if (decl->is_pub && !decl->generic_params.empty())
+                ImportDecl({&name, decl.get(), DeclKind::Struct});
+        for (const auto& decl : module.structs)
+            if (decl->is_pub && decl->generic_params.empty())
+                ImportDecl({&name, decl.get(), DeclKind::Struct});
+        for (const auto& decl : module.globals) if (decl->is_pub) ImportDecl({&name, decl.get(), DeclKind::Global});
+        for (const auto& decl : module.procs)   if (decl->is_pub) ImportDecl({&name, decl.get(), DeclKind::Proc});
     }
 
-    void ImportModuleGlobals(const ModuleAST& module)
+    enum class DeclKind { Struct, Enum, Alias, Global, Proc };
+
+    struct ImportableDecl
     {
-        for (const auto& decl : module.globals)
+        const std::string* module;
+        const ASTNode* decl;
+        DeclKind kind;
+    };
+
+    void IndexNamespacedDecls(const std::string& selfName, const std::map<std::string, std::unique_ptr<ModuleAST>>& moduleTable)
+    {
+        m_moduleTable = &moduleTable;
+        for (const auto& [name, module] : moduleTable)
         {
-            if (!decl->is_pub) continue;
-            
-            TypeInfo type = ResolveType(decl->type.get());
-            auto* globalVar = new GlobalVariable(
-                *m_module, type.llvmType, decl->type->is_const,
-                GlobalValue::ExternalLinkage, nullptr, decl->name
-            );
-            if (const AttributeNode* align = FindAttribute(decl->attributes, "align"))
-                globalVar->setAlignment(Align(AttributeResolver::AlignValue(*align)));
-            m_globals[decl->name] = {type, globalVar, decl->type->is_const};
+            if (name == selfName)
+                continue;
+
+            auto add = [&](const auto& decl, DeclKind kind) {
+                if (decl->is_pub && decl->ns && !decl->ns->path.empty())
+                    m_namespacedDecls[QualifyName(decl->ns, decl->name)].push_back({&name, decl.get(), kind});
+            };
+            for (const auto& decl : module->structs) add(decl, DeclKind::Struct);
+            for (const auto& decl : module->enums)   add(decl, DeclKind::Enum);
+            for (const auto& decl : module->aliases) add(decl, DeclKind::Alias);
+            for (const auto& decl : module->globals) add(decl, DeclKind::Global);
+            for (const auto& decl : module->procs)   add(decl, DeclKind::Proc);
         }
     }
 
-    void ImportModuleFunctions(const ModuleAST& module)
+    void ImportNamespaced(const std::string& key, DeclKind kind)
     {
-        bool exportsGenerics = false;
-        for (const auto& proc : module.procs)
+        auto it = m_namespacedDecls.find(key);
+        if (it == m_namespacedDecls.end())
+            return;
+        for (const auto& entry : it->second)
+            if (entry.kind == kind)
+                ImportDecl(entry);
+    }
+
+    void ImportDecl(const ImportableDecl& entry)
+    {
+        if (!m_importedDecls.insert(entry.decl).second)
+            return;
+
+        switch (entry.kind)
         {
-            if (!proc->is_pub) continue;
-            if (!proc->generic_params.empty())
+            case DeclKind::Alias:
             {
-                m_genericProcs[proc->name].push_back(proc.get());
-                exportsGenerics = true;
+                auto* decl = static_cast<const AliasDecl*>(entry.decl);
+                RejectDuplicate(m_aliases, decl->ns, decl->name, entry);
+                m_aliases[QualifyName(decl->ns, decl->name)] = const_cast<AliasDecl*>(decl);
+                break;
             }
-            else
-                DeclareFunction(proc.get(), GlobalValue::ExternalLinkage);
-        }
+            case DeclKind::Enum:
+            {
+                auto* decl = static_cast<const EnumDecl*>(entry.decl);
+                RejectDuplicate(m_enums, decl->ns, decl->name, entry);
+                RegisterEnum(decl);
+                break;
+            }
+            case DeclKind::Struct:
+            {
+                auto* decl = static_cast<const StructDecl*>(entry.decl);
+                RejectDuplicate(m_structs, decl->ns, decl->name, entry);
+                RejectDuplicate(m_genericStructs, decl->ns, decl->name, entry);
+                if (!decl->generic_params.empty())
+                    m_genericStructs[QualifyName(decl->ns, decl->name)] = decl;
+                else
+                    RegisterStruct(decl, QualifyName(decl->ns, decl->name));
+                break;
+            }
+            case DeclKind::Global:
+            {
+                auto* decl = static_cast<const GlobalVarDecl*>(entry.decl);
+                RejectDuplicate(m_globals, decl->ns, decl->name, entry);
+                ImportGlobal(decl);
+                break;
+            }
+            case DeclKind::Proc:
+            {
+                auto* proc = static_cast<const ProcDecl*>(entry.decl);
+                if (proc->generic_params.empty())
+                {
+                    DeclareFunction(proc, GlobalValue::ExternalLinkage);
+                    break;
+                }
 
-        if (exportsGenerics)
-            for (const auto& proc : module.procs)
-                if (!proc->is_pub && proc->is_extern)
-                    DeclareFunction(proc.get(), GlobalValue::ExternalLinkage);
+                m_genericProcs[QualifyName(proc->ns, proc->name)].push_back(proc);
+
+                if (m_privateExternsDeclared.insert(*entry.module).second)
+                    for (const auto& other : m_moduleTable->at(*entry.module)->procs)
+                        if (!other->is_pub && other->is_extern && m_importedDecls.insert(other.get()).second)
+                            DeclareFunction(other.get(), GlobalValue::ExternalLinkage);
+                break;
+            }
+        }
     }
+
+    template <typename Table>
+    void RejectDuplicate(const Table& table, const NamespaceScope* ns, const std::string& name, const ImportableDecl& entry)
+    {
+        std::string key = QualifyName(ns, name);
+        if (table.count(key))
+            Error("'" + key + "' is declared more than once (also in module '" + *entry.module + "')", entry.decl->line);
+    }
+
+    void ImportGlobal(const GlobalVarDecl* decl)
+    {
+        NamespaceGuard guard(*this, decl->ns);
+        std::string name = QualifyName(decl->ns, decl->name);
+        TypeInfo type = ResolveType(decl->type.get());
+        auto* globalVar = new GlobalVariable(
+            *m_module, type.llvmType, decl->type->is_const,
+            GlobalValue::ExternalLinkage, nullptr, name
+        );
+        if (const AttributeNode* align = FindAttribute(decl->attributes, "align"))
+            globalVar->setAlignment(Align(AttributeResolver::AlignValue(*align)));
+        m_globals[name] = {type, globalVar, decl->type->is_const};
+    }
+
+    struct NamespaceGuard
+    {
+        CodeGenerator& gen;
+        const NamespaceScope* saved;
+        NamespaceGuard(CodeGenerator& g, const NamespaceScope* ns) : gen(g), saved(g.m_ns) { if (ns) gen.m_ns = ns; }
+        ~NamespaceGuard() { gen.m_ns = saved; }
+    };
+
+    DeclKind KindOfTable(const void* table) const
+    {
+        if (table == &m_structs || table == &m_genericStructs) return DeclKind::Struct;
+        if (table == &m_enums)   return DeclKind::Enum;
+        if (table == &m_aliases) return DeclKind::Alias;
+        if (table == &m_globals) return DeclKind::Global;
+        return DeclKind::Proc;
+    }
+
+    template <typename Table>
+    typename Table::mapped_type* FindSymbol(Table& table, const std::string& name, std::string* outKey = nullptr)
+    {
+        using Entry = typename Table::mapped_type;
+        const DeclKind kind = KindOfTable(&table);
+
+        auto probe = [&](const std::string& key) -> Entry* {
+            ImportNamespaced(key, kind);
+            auto it = table.find(key);
+            if (it == table.end())
+                return nullptr;
+            if (outKey)
+                *outKey = key;
+            return &it->second;
+        };
+
+        if (!m_ns)
+            return probe(name);
+
+        for (const NamespaceScope* scope = m_ns; scope; scope = scope->parent)
+        {
+            const size_t stop = scope->parent ? scope->parent->path.size() : 0;
+            std::string path = scope->path;
+            bool innermost = true;
+
+            while (true)
+            {
+                if (Entry* entry = probe(path.empty() ? name : path + "." + name))
+                    return entry;
+
+                if (innermost)
+                {
+                    innermost = false;
+                    Entry* hit = nullptr;
+                    std::string hitKey;
+                    for (const auto& use : scope->usings)
+                    {
+                        std::string key = use + "." + name;
+                        Entry* entry = probe(key);
+                        if (entry && hit && entry != hit)
+                            Error("'" + name + "' is ambiguous between '" + hitKey + "' and '" + key + "'");
+                        if (entry)
+                        {
+                            hit = entry;
+                            hitKey = key;
+                        }
+                    }
+                    if (hit)
+                    {
+                        if (outKey)
+                            *outKey = hitKey;
+                        return hit;
+                    }
+                }
+
+                if (path.size() <= stop)
+                    break;
+                size_t dot = path.rfind('.');
+                path = dot == std::string::npos ? "" : path.substr(0, dot);
+                if (scope->parent && path.size() <= stop)
+                    break;
+            }
+        }
+        return nullptr;
+    }
+
+    template <typename Table>
+    bool HasSymbol(Table& table, const std::string& name) { return FindSymbol(table, name) != nullptr; }
 
     void DeclareUserFunctions(const ModuleAST& ast)
     {
@@ -251,7 +430,7 @@ private:
         {
             if (!proc->generic_params.empty())
             {
-                m_genericProcs[proc->name].push_back(proc.get());
+                m_genericProcs[QualifyName(proc->ns, proc->name)].push_back(proc.get());
                 continue;
             }
 
@@ -283,52 +462,28 @@ private:
             RegisterEnum(decl.get());
     }
 
-    void ImportModuleEnums(const ModuleAST& ast)
-    {
-        for (const auto& decl : ast.enums)
-            if (decl->is_pub)
-                RegisterEnum(decl.get());
-    }
-    
     void RegisterStructs(const ModuleAST& ast)
     {
         for (const auto& decl : ast.structs)
             if (!decl->generic_params.empty())
-                m_genericStructs[decl->name] = decl.get();
+                m_genericStructs[QualifyName(decl->ns, decl->name)] = decl.get();
 
         for (const auto& decl : ast.structs)
             if (decl->generic_params.empty())
-                RegisterStruct(decl.get(), decl->name);
-    }
-
-    void ImportModuleStructs(const ModuleAST& ast)
-    {
-        for (const auto& decl : ast.structs)
-            if (decl->is_pub && !decl->generic_params.empty())
-                m_genericStructs[decl->name] = decl.get();
-
-        for (const auto& decl : ast.structs)
-            if (decl->is_pub && decl->generic_params.empty())
-                RegisterStruct(decl.get(), decl->name);
+                RegisterStruct(decl.get(), QualifyName(decl->ns, decl->name));
     }
 
     void RegisterAliases(const ModuleAST& ast)
     {
         for (const auto& decl : ast.aliases)
-            m_aliases[decl->name] = decl.get();
-    }
-
-    void ImportModuleAliases(const ModuleAST& module)
-    {
-        for (const auto& decl : module.aliases)
-            if (decl->is_pub)
-                m_aliases[decl->name] = decl.get();
+            m_aliases[QualifyName(decl->ns, decl->name)] = decl.get();
     }
 
     void RegisterEnum(const EnumDecl* decl)
     {
+        NamespaceGuard guard(*this, decl->ns);
         EnumInfo info;
-        info.name = decl->name;
+        info.name = QualifyName(decl->ns, decl->name);
 
         TypeInfo baseType = decl->base_type
             ? ResolveType(decl->base_type.get())
@@ -354,15 +509,17 @@ private:
             info.values[val.name] = resolved;
         }
 
-        m_enums[decl->name] = info;
+        m_enums[info.name] = info;
     }
 
     void RegisterStruct(const StructDecl* decl, const std::string& name)
     {
+        NamespaceGuard guard(*this, decl->ns);
         auto* structType = StructType::create(m_context, name);
 
         StructInfo& info = m_structs[name];
         info.type = structType;
+        info.ns = decl->ns;
 
         const DataLayout& dl = m_module->getDataLayout();
         std::vector<Type*> memberTypes;
@@ -431,6 +588,8 @@ private:
     {
         for (const auto& decl : ast.globals)
         {
+            NamespaceGuard guard(*this, decl->ns);
+            const std::string name = QualifyName(decl->ns, decl->name);
             TypeInfo type;
             Constant* initializer = nullptr;
             
@@ -475,11 +634,11 @@ private:
             auto linkage = decl->is_pub ? GlobalValue::ExternalLinkage : GlobalValue::InternalLinkage;
             auto* globalVar = new GlobalVariable(
                 *m_module, type.llvmType, decl->type ? decl->type->is_const : false, 
-                linkage, initializer, decl->name
+                linkage, initializer, name
             );
             if (const AttributeNode* align = FindAttribute(decl->attributes, "align"))
                 globalVar->setAlignment(Align(AttributeResolver::AlignValue(*align)));
-            m_globals[decl->name] = {type, globalVar, decl->type ? decl->type->is_const : false};
+            m_globals[name] = {type, globalVar, decl->type ? decl->type->is_const : false};
         }
     }
 
@@ -493,14 +652,13 @@ private:
             if (const FunctionInfo* chosen = PickFunctionValueOverload(id->name, expectedType, id->line))
                 return MakeFunctionValue(*chosen, expectedType, id->line);
 
-            auto globalIt = m_globals.find(id->name);
-            if (globalIt != m_globals.end())
+            if (Variable* global = FindSymbol(m_globals, id->name))
             {
-                GlobalVariable* globalVar = cast<GlobalVariable>(globalIt->second.storage);
+                GlobalVariable* globalVar = cast<GlobalVariable>(global->storage);
                 if (globalVar->hasInitializer())
-                    return TypedValue(globalVar->getInitializer(), globalIt->second.type);
+                    return TypedValue(globalVar->getInitializer(), global->type);
                 else
-                    return TypedValue(globalVar, globalIt->second.type);
+                    return TypedValue(globalVar, global->type);
             }
 
             if (auto typeId = TryTypeNameAsValue(id))
@@ -690,6 +848,7 @@ private:
 
                 if (defaultExpr)
                 {
+                    NamespaceGuard guard(*this, info.ns);
                     TypedValue defVal = EvaluateConstantExpr(defaultExpr, ft);
                     fieldValues[idx] = llvm::cast<Constant>(defVal.value);
                 }
@@ -890,14 +1049,14 @@ private:
     bool IsValueName(const std::string& name)
     {
         return (!m_scopes.empty() && IsVariableAccessibleInCurrentScope(name)) ||
-            m_globals.count(name) || m_functions.count(name) || m_genericProcs.count(name);
+            HasSymbol(m_globals, name) || HasSymbol(m_functions, name) || HasSymbol(m_genericProcs, name);
     }
 
     bool IsTypeName(const std::string& name)
     {
         bool isUnsigned;
-        return GetBuiltinType(name, isUnsigned) || m_typeBindings.count(name) || m_structs.count(name) ||
-            m_enums.count(name) || m_aliases.count(name) || m_genericStructs.count(name);
+        return GetBuiltinType(name, isUnsigned) || m_typeBindings.count(name) || HasSymbol(m_structs, name) ||
+            HasSymbol(m_enums, name) || HasSymbol(m_aliases, name) || HasSymbol(m_genericStructs, name);
     }
 
     // A bare type name used as a value, as in `typeof(x) == i32`
@@ -1041,6 +1200,8 @@ private:
 
     FunctionInfo DeclareFunction(const ProcDecl* proc, GlobalValue::LinkageTypes linkage)
     {
+        NamespaceGuard guard(*this, proc->ns);
+        const std::string qualifiedName = QualifyName(proc->ns, proc->name);
         std::vector<Type*> paramLLVMTypes;
         std::vector<TypeInfo> paramTypes;
         std::vector<ExprNode*> defaultValues;
@@ -1057,7 +1218,7 @@ private:
             ? ResolveType(proc->return_type.get())
             : TypeInfo(Type::getVoidTy(m_context), false);
 
-        auto& overloads = m_functions[proc->name];
+        auto& overloads = m_functions[qualifiedName];
 
         if (proc->is_extern)
             for (const auto& existing : overloads)
@@ -1076,7 +1237,7 @@ private:
 
         std::string symbolName = (proc->is_extern || proc->name == "main")
             ? proc->name
-            : MangleOverloadName(proc->name, paramTypes);
+            : MangleOverloadName(qualifiedName, paramTypes);
 
         auto* funcType = FunctionType::get(returnType.llvmType, paramLLVMTypes, proc->is_vararg);
 
@@ -1087,7 +1248,11 @@ private:
             funcType = abi->loweredType;
         }
 
-        auto* func = Function::Create(funcType, linkage, symbolName, m_module.get());
+        Function* func = proc->is_extern ? m_module->getFunction(symbolName) : nullptr;
+        if (func && func->getFunctionType() != funcType)
+            Error("Extern function '" + proc->name + "' is declared elsewhere with a different signature", proc->line);
+        if (!func)
+            func = Function::Create(funcType, linkage, symbolName, m_module.get());
         ApplyProcAttributes(func, proc, returnType.llvmType);
 
         if (abi)
@@ -1101,6 +1266,7 @@ private:
 
         FunctionInfo info(func, paramTypes, returnType, proc->is_vararg, std::move(defaultValues), proc->name, proc->is_extern);
         info.abi = abi;
+        info.ns = proc->ns;
         SetPackInfo(info, proc);
         overloads.push_back(info);
         return info;
@@ -1355,11 +1521,11 @@ private:
         const TypeInfo* expectedType,
         uint32_t line)
     {
-        auto it = m_functions.find(name);
-        if (it == m_functions.end())
+        auto* overloads = FindSymbol(m_functions, name);
+        if (!overloads)
             return nullptr;
 
-        const auto& candidates = it->second;
+        const auto& candidates = *overloads;
         if (candidates.size() == 1)
             return &candidates[0];
 
@@ -1416,27 +1582,26 @@ private:
         std::vector<OverloadCandidate> candidates;
 
         if (callee->generic_args.empty())
-        {
-            auto it = m_functions.find(name);
-            if (it != m_functions.end())
-                for (const auto& f : it->second)
+            if (auto* overloads = FindSymbol(m_functions, name))
+                for (const auto& f : *overloads)
                     candidates.push_back({f});
-        }
 
-        auto genIt = m_genericProcs.find(name);
-        if (genIt == m_genericProcs.end() && !callee->generic_args.empty())
+        auto* genericSet = FindSymbol(m_genericProcs, name);
+        if (!genericSet && !callee->generic_args.empty())
             Error("'" + name + "' is not a generic function", line);
 
         std::string constraintNotes;
 
-        if (genIt != m_genericProcs.end())
+        if (genericSet)
         {
+            const std::vector<const ProcDecl*> templates = *genericSet;
             std::vector<TypeInfo> explicitArgs;
             for (const auto& arg : callee->generic_args)
                 explicitArgs.push_back(ResolveType(arg.get()));
 
-            for (const ProcDecl* tmpl : genIt->second)
+            for (const ProcDecl* tmpl : templates)
             {
+                NamespaceGuard guard(*this, tmpl->ns);
                 std::vector<TypeInfo> typeArgs;
                 if (!callee->generic_args.empty())
                 {
@@ -1559,11 +1724,12 @@ private:
         const std::vector<std::unique_ptr<TypeNode>>& argNodes,
         uint32_t line)
     {
-        auto it = m_genericStructs.find(name);
-        if (it == m_genericStructs.end())
+        std::string key;
+        auto* found = FindSymbol(m_genericStructs, name, &key);
+        if (!found)
             Error("Type '" + name + "' is not a generic struct", line);
 
-        const StructDecl* decl = it->second;
+        const StructDecl* decl = *found;
         if (argNodes.size() != decl->generic_params.size())
             Error("Generic struct '" + name + "' expects " + std::to_string(decl->generic_params.size())
                 + " type argument(s), got " + std::to_string(argNodes.size()), line);
@@ -1572,11 +1738,15 @@ private:
         for (const auto& arg : argNodes)
             typeArgs.push_back(ResolveType(arg.get()));
 
-        std::string instanceName = name + "<" + MangleTypeArgs(typeArgs) + ">";
+        std::string instanceName = key + "<" + MangleTypeArgs(typeArgs) + ">";
         if (m_structs.find(instanceName) != m_structs.end())
             return instanceName;
 
-        std::string failure = CheckGenericConstraints(name, decl->generic_params, decl->generic_constraints, typeArgs);
+        std::string failure;
+        {
+            NamespaceGuard guard(*this, decl->ns);
+            failure = CheckGenericConstraints(name, decl->generic_params, decl->generic_constraints, typeArgs);
+        }
         if (!failure.empty())
             Error(failure, line);
 
@@ -1691,11 +1861,15 @@ private:
         if (bindingIt != m_typeBindings.end() && bindingIt->second.llvmType->isStructTy())
             return StructNameFor(bindingIt->second.llvmType);
 
+        std::string key;
+        if (FindSymbol(m_structs, init->type_name, &key))
+            return key;
+
         // Allows `Alias{ ... }` where Alias names a struct (e.g. typename IntList = List<i32>)
-        auto aliasIt = m_aliases.find(init->type_name);
-        if (m_structs.find(init->type_name) == m_structs.end() && aliasIt != m_aliases.end())
+        if (AliasDecl** alias = FindSymbol(m_aliases, init->type_name))
         {
-            TypeInfo aliased = ResolveType(aliasIt->second->target.get());
+            NamespaceGuard guard(*this, (*alias)->ns);
+            TypeInfo aliased = ResolveType((*alias)->target.get());
             if (aliased.llvmType->isStructTy())
                 return StructNameFor(aliased.llvmType);
         }
@@ -1722,8 +1896,8 @@ private:
         if (!param->generic_args.empty())
         {
             const StructInfo* info = arg.llvmType->isStructTy() ? FindStructInfo(arg.llvmType) : nullptr;
-            if (!info || !info->genericDecl || info->genericDecl->name != param->name ||
-                info->genericArgs.size() != param->generic_args.size())
+            const StructDecl** decl = info && info->genericDecl ? FindSymbol(m_genericStructs, param->name) : nullptr;
+            if (!decl || *decl != info->genericDecl || info->genericArgs.size() != param->generic_args.size())
                 return true;
 
             for (size_t i = 0; i < param->generic_args.size(); i++)
@@ -1798,12 +1972,14 @@ private:
 
     FunctionInfo ResolveGenericSignature(const ProcDecl* proc, const std::vector<TypeInfo>& typeArgs)
     {
+        NamespaceGuard guard(*this, proc->ns);
         auto savedBindings = std::move(m_typeBindings);
         m_typeBindings = BindTypeParams(proc->generic_params, typeArgs);
 
         FunctionInfo info;
         info.isVarArg = proc->is_vararg;
         info.sourceName = proc->name;
+        info.ns = proc->ns;
         for (const auto& param : proc->params)
         {
             info.paramTypes.push_back(ResolveParamType(param));
@@ -1835,7 +2011,7 @@ private:
 
         // Instances are emitted into every module that uses them, so keep them internal
         auto* funcType = FunctionType::get(info.returnType.llvmType, paramLLVMTypes, proc->is_vararg);
-        std::string symbolName = MangleOverloadName(proc->name + "<" + argKey + ">", info.paramTypes);
+        std::string symbolName = MangleOverloadName(QualifyName(proc->ns, proc->name) + "<" + argKey + ">", info.paramTypes);
         info.function = Function::Create(funcType, Function::InternalLinkage, symbolName, m_module.get());
         ApplyProcAttributes(info.function, proc, info.returnType.llvmType);
 
@@ -1850,16 +2026,17 @@ private:
 
     FunctionInfo InstantiateGenericFunctionValue(Identifier* id, const TypeInfo* expectedType)
     {
-        auto genIt = m_genericProcs.find(id->name);
-        if (genIt == m_genericProcs.end())
+        auto* genericSet = FindSymbol(m_genericProcs, id->name);
+        if (!genericSet)
             Error("'" + id->name + "' is not a generic function", id->line);
+        const std::vector<const ProcDecl*> templates = *genericSet;
 
         std::vector<TypeInfo> typeArgs;
         for (const auto& arg : id->generic_args)
             typeArgs.push_back(ResolveType(arg.get()));
 
         const ProcDecl* chosen = nullptr;
-        for (const ProcDecl* tmpl : genIt->second)
+        for (const ProcDecl* tmpl : templates)
         {
             if (tmpl->generic_params.size() != typeArgs.size())
                 continue;
@@ -1878,7 +2055,11 @@ private:
         if (!chosen)
             Error("No overload of generic function '" + id->name + "' matches the given type arguments", id->line);
 
-        std::string failure = CheckGenericConstraints(id->name, chosen->generic_params, chosen->generic_constraints, typeArgs);
+        std::string failure;
+        {
+            NamespaceGuard guard(*this, chosen->ns);
+            failure = CheckGenericConstraints(id->name, chosen->generic_params, chosen->generic_constraints, typeArgs);
+        }
         if (!failure.empty())
             Error(failure, id->line);
 
@@ -1908,6 +2089,7 @@ private:
 
     void DefineFunctionBody(const ProcDecl* proc, const FunctionInfo& funcInfo)
     {
+        NamespaceGuard guard(*this, proc->ns);
         m_scopes.clear();
         m_locals.clear();
 
@@ -2310,7 +2492,11 @@ private:
 
             if (defaultExpr)
             {
-                TypedValue defValue = EvaluateRValue(defaultExpr, fieldType);
+                TypedValue defValue;
+                {
+                    NamespaceGuard guard(*this, info.ns);
+                    defValue = EvaluateRValue(defaultExpr, fieldType);
+                }
                 if (defValue.type != *fieldType)
                     defValue = CastValue(defValue, *fieldType, 0);
                 m_builder.CreateStore(defValue.value, fieldPtr);
@@ -2940,6 +3126,7 @@ private:
                 if (i >= funcInfo.defaultValues.size() || !funcInfo.defaultValues[i])
                     Error("Missing argument " + std::to_string(i + 1)
                         + " and no default value available", line);
+                NamespaceGuard guard(*this, funcInfo.ns);
                 arg = EvaluateRValue(funcInfo.defaultValues[i]);
             }
             if (arg.type != funcInfo.paramTypes[i])
@@ -3002,8 +3189,7 @@ private:
         if (auto* ident = dynamic_cast<Identifier*>(call->callee.get()))
         {
             if (!ident->generic_args.empty() ||
-                m_functions.find(ident->name) != m_functions.end() ||
-                m_genericProcs.find(ident->name) != m_genericProcs.end())
+                HasSymbol(m_functions, ident->name) || HasSymbol(m_genericProcs, ident->name))
             {
                 auto evaluated = evaluateArgs();
                 std::vector<TypeInfo> argTypes;
@@ -3114,15 +3300,15 @@ private:
         if (!id || !id->generic_args.empty() || IsValueName(id->name))
             return std::nullopt;
 
-        auto it = m_enums.find(id->name);
-        if (it == m_enums.end())
+        EnumInfo* info = FindSymbol(m_enums, id->name);
+        if (!info)
             return std::nullopt;
 
-        auto valueIt = it->second.values.find(access->member);
-        if (valueIt == it->second.values.end())
+        auto valueIt = info->values.find(access->member);
+        if (valueIt == info->values.end())
             Error("Unknown enum value: " + id->name + "." + access->member, access->line);
 
-        const TypeInfo& baseType = it->second.baseType;
+        const TypeInfo& baseType = info->baseType;
         auto* val = llvm::ConstantInt::get(baseType.llvmType, valueIt->second, !baseType.isUnsigned);
         return TypedValue(val, baseType);
     }
@@ -3676,6 +3862,7 @@ private:
         TypeInfo resolved;
         try
         {
+            NamespaceGuard guard(*this, alias->ns);
             resolved = ResolveType(alias->target.get());
         }
         catch (...)
@@ -3717,29 +3904,26 @@ private:
         
         if (!baseType)
         {
-            auto structIt = m_structs.find(node->name);
-            if (structIt != m_structs.end())
-                baseType = structIt->second.type;
+            if (StructInfo* info = FindSymbol(m_structs, node->name))
+                baseType = info->type;
         }
         
         if (!baseType)
         {
-            auto enumIt = m_enums.find(node->name);
-            if (enumIt != m_enums.end())
+            if (EnumInfo* info = FindSymbol(m_enums, node->name))
             {
-                baseType = enumIt->second.baseType.llvmType;
-                isUnsigned = enumIt->second.baseType.isUnsigned;
+                baseType = info->baseType.llvmType;
+                isUnsigned = info->baseType.isUnsigned;
             }
         }
 
         if (!baseType)
         {
-            auto aliasIt = m_aliases.find(node->name);
-            if (aliasIt != m_aliases.end())
-                return ResolveAliasedType(node, aliasIt->second);
+            if (AliasDecl** alias = FindSymbol(m_aliases, node->name))
+                return ResolveAliasedType(node, *alias);
         }
 
-        if (!baseType && m_genericStructs.find(node->name) != m_genericStructs.end())
+        if (!baseType && HasSymbol(m_genericStructs, node->name))
             Error("Generic struct '" + node->name + "' requires type arguments", node->line);
 
         if (!baseType)
@@ -3947,9 +4131,8 @@ private:
             scopeIdx = scope.parent;
         }
         
-        auto it = m_globals.find(name);
-        if (it != m_globals.end())
-            return it->second;
+        if (Variable* global = FindSymbol(m_globals, name))
+            return *global;
         
         Error("Unknown variable: " + name, line);
     }
@@ -4067,6 +4250,12 @@ private:
     std::unordered_map<std::string, Variable> m_locals;
     std::unordered_map<std::string, Variable> m_globals;
     StructType* m_anyType = nullptr;
+
+    const NamespaceScope* m_ns = nullptr;
+    const std::map<std::string, std::unique_ptr<ModuleAST>>* m_moduleTable = nullptr;
+    std::unordered_map<std::string, std::vector<ImportableDecl>> m_namespacedDecls;
+    std::unordered_set<const ASTNode*> m_importedDecls;
+    std::unordered_set<std::string> m_privateExternsDeclared;
     
     LLVMContext& m_context;
     IRBuilder<> m_builder;
