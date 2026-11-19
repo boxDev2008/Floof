@@ -20,6 +20,7 @@ struct NamespaceScope {
     std::string path;
     std::vector<std::string> usings;
     const NamespaceScope* parent = nullptr;
+    bool is_block = false;
 };
 
 inline std::string QualifyName(const NamespaceScope* ns, const std::string& name)
@@ -201,6 +202,11 @@ struct FreeStmt : StmtNode {
 
 struct BreakStmt : StmtNode { };
 
+struct UsingNamespaceStmt : StmtNode {
+    std::string name;
+    std::unique_ptr<NamespaceScope> scope;
+};
+
 struct ContinueStmt : StmtNode { };
 
 struct BlockStmt : StmtNode {
@@ -329,6 +335,7 @@ struct AttrDef : ASTNode {
 struct ModuleAST : ASTNode {
     std::vector<std::unique_ptr<NamespaceScope>> scopes;
     std::vector<std::unique_ptr<UsingDecl>> usings;
+    std::vector<std::unique_ptr<UsingDecl>> namespace_usings;
     std::vector<std::unique_ptr<StructDecl>> structs;
     std::vector<std::unique_ptr<EnumDecl>> enums;
     std::vector<std::unique_ptr<AliasDecl>> aliases;
@@ -632,8 +639,12 @@ public:
             m_moduleName = &name;
 
             for (const auto& use : module->usings)
-                if (!m_modules.count(use->name) && !m_namespaces.count(use->name))
-                    Fail("Unknown module or namespace '" + use->name + "'", use->line);
+                if (!m_modules.count(use->name))
+                    Fail("Unknown module '" + use->name + "'" + (m_namespaces.count(use->name)
+                        ? " (to open the namespace, write 'using namespace " + use->name + ";')" : ""), use->line);
+            for (const auto& use : module->namespace_usings)
+                if (!m_namespaces.count(use->name))
+                    Fail("Unknown namespace '" + use->name + "'", use->line);
 
             for (auto& decl : module->globals)
             {
@@ -788,10 +799,12 @@ private:
     {
         if (!block)
             return;
+        const NamespaceScope* outer = m_scope;
         m_locals.emplace_back();
         for (auto& stmt : block->statements)
             RewriteStmt(stmt.get());
         m_locals.pop_back();
+        m_scope = outer;
     }
 
     void RewriteVarDecl(VarDecl* decl)
@@ -802,7 +815,13 @@ private:
 
     void RewriteStmt(StmtNode* stmt)
     {
-        if (auto* s = dynamic_cast<VarDecl*>(stmt))          RewriteVarDecl(s);
+        if (auto* s = dynamic_cast<UsingNamespaceStmt*>(stmt))
+        {
+            if (!m_namespaces.count(s->name))
+                Fail("Unknown namespace '" + s->name + "'", s->line);
+            m_scope = s->scope.get();
+        }
+        else if (auto* s = dynamic_cast<VarDecl*>(stmt))     RewriteVarDecl(s);
         else if (auto* s = dynamic_cast<ExprStmt*>(stmt))    RewriteExpr(s->expr);
         else if (auto* s = dynamic_cast<ReturnStmt*>(stmt))  RewriteExpr(s->value);
         else if (auto* s = dynamic_cast<FreeStmt*>(stmt))    RewriteExpr(s->value);
@@ -1042,7 +1061,13 @@ public:
             {
                 auto using_decl = std::make_unique<UsingDecl>();
                 using_decl->line = declLine;
-                Expect(TokenType_Identifier, "Expected module name after 'using'");
+                const bool is_namespace = Check(TokenType_Identifier) && m_current.value == "namespace" &&
+                    PeekIs(TokenType_Identifier) && Match("namespace");
+                if (is_namespace && is_pub)
+                    throw std::runtime_error("'using namespace' cannot be 'pub' on line "
+                        + std::to_string(declLine) + " in module " + m_moduleName);
+                Expect(TokenType_Identifier, is_namespace ? "Expected namespace name after 'using namespace'"
+                                                          : "Expected module name after 'using'");
                 using_decl->name = m_last.value;
                 using_decl->is_pub = is_pub;
                 while (Match('.'))
@@ -1051,8 +1076,13 @@ public:
                     using_decl->name += '.' + m_last.value;
                 }
                 Expect(';', "Expected ';' after using declaration");
-                m_ns->usings.push_back(using_decl->name);
-                module->usings.push_back(std::move(using_decl));
+                if (is_namespace)
+                {
+                    m_ns->usings.push_back(using_decl->name);
+                    module->namespace_usings.push_back(std::move(using_decl));
+                }
+                else
+                    module->usings.push_back(std::move(using_decl));
             }
             else if (Match("require"))
             {
@@ -1782,6 +1812,38 @@ public:
     {
         uint32_t stmtLine = CurrentLine();
 
+        if (Check(TokenType_Identifier) && m_current.value == "using" && PeekIs(TokenType_Identifier))
+        {
+            Advance();
+            if (!Match("namespace"))
+                throw std::runtime_error("Only 'using namespace' can be used inside a function; modules are "
+                    "imported at the top of the file, on line " + std::to_string(stmtLine) + " in module " + m_moduleName);
+
+            auto stmt = std::make_unique<UsingNamespaceStmt>();
+            stmt->line = stmtLine;
+            Expect(TokenType_Identifier, "Expected namespace name after 'using namespace'");
+            stmt->name = m_last.value;
+            while (Match('.'))
+            {
+                Expect(TokenType_Identifier, "Expected identifier after '.'");
+                stmt->name += '.' + m_last.value;
+            }
+            Expect(';', "Expected ';' after using declaration");
+
+            stmt->scope = std::make_unique<NamespaceScope>();
+            stmt->scope->path = m_ns->path;
+            stmt->scope->is_block = true;
+            stmt->scope->parent = m_ns;
+            if (m_ns != m_blockOuter)
+            {
+                stmt->scope->usings = m_ns->usings;
+                stmt->scope->parent = m_ns->parent;
+            }
+            stmt->scope->usings.push_back(stmt->name);
+            m_ns = stmt->scope.get();
+            return stmt;
+        }
+
         if (Match("return"))
         {
             auto ret = std::make_unique<ReturnStmt>();
@@ -1946,10 +2008,15 @@ public:
         auto block = std::make_unique<BlockStmt>();
         block->line = blockLine;
         
+        NamespaceScope* outer = m_ns;
+        NamespaceScope* outerBlock = m_blockOuter;
+        m_blockOuter = m_ns;
         while (!Check('}') && !Check(TokenType_EOF))
         {
             block->statements.push_back(ParseStmt());
         }
+        m_ns = outer;
+        m_blockOuter = outerBlock;
         
         Expect('}', "Expected '}'");
         return block;
@@ -2409,6 +2476,7 @@ private:
     bool m_hasNext = false;
     bool m_parsingStatement = false;
     NamespaceScope* m_ns = nullptr;
+    NamespaceScope* m_blockOuter = nullptr;
     bool m_hasFileNamespace = false;
     bool m_hasBlockNamespace = false;
 };

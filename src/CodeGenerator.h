@@ -181,8 +181,7 @@ private:
             ImportModuleRecursively(BUILTIN_MODULE_NAME, moduleTable);
 
         for (const auto& use : ast.usings)
-            if (moduleTable.count(use->name))
-                ImportModuleRecursively(use->name, moduleTable);
+            ImportModuleRecursively(use->name, moduleTable);
     }
 
     std::unordered_set<std::string> m_importedModules;
@@ -201,7 +200,7 @@ private:
         
         for (const auto& use : module.usings)
         {
-            if (use->is_pub && moduleTable.count(use->name))
+            if (use->is_pub)
                 ImportModuleRecursively(use->name, moduleTable);
         }
 
@@ -374,8 +373,35 @@ private:
         if (!m_ns)
             return probe(name);
 
+        auto searchUsings = [&](const NamespaceScope* scope) -> Entry* {
+            Entry* hit = nullptr;
+            std::string hitKey;
+            for (const auto& use : scope->usings)
+            {
+                std::string key = use + "." + name;
+                Entry* entry = probe(key);
+                if (entry && hit && entry != hit)
+                    Error("'" + name + "' is ambiguous between '" + hitKey + "' and '" + key + "'");
+                if (entry)
+                {
+                    hit = entry;
+                    hitKey = key;
+                }
+            }
+            if (hit && outKey)
+                *outKey = hitKey;
+            return hit;
+        };
+
         for (const NamespaceScope* scope = m_ns; scope; scope = scope->parent)
         {
+            if (scope->is_block)
+            {
+                if (Entry* entry = searchUsings(scope))
+                    return entry;
+                continue;
+            }
+
             const size_t stop = scope->parent ? scope->parent->path.size() : 0;
             std::string path = scope->path;
             bool innermost = true;
@@ -388,26 +414,8 @@ private:
                 if (innermost)
                 {
                     innermost = false;
-                    Entry* hit = nullptr;
-                    std::string hitKey;
-                    for (const auto& use : scope->usings)
-                    {
-                        std::string key = use + "." + name;
-                        Entry* entry = probe(key);
-                        if (entry && hit && entry != hit)
-                            Error("'" + name + "' is ambiguous between '" + hitKey + "' and '" + key + "'");
-                        if (entry)
-                        {
-                            hit = entry;
-                            hitKey = key;
-                        }
-                    }
-                    if (hit)
-                    {
-                        if (outKey)
-                            *outKey = hitKey;
-                        return hit;
-                    }
+                    if (Entry* entry = searchUsings(scope))
+                        return entry;
                 }
 
                 if (path.size() <= stop)
@@ -2239,10 +2247,13 @@ private:
 
     void GenerateHostingAllocs(BlockStmt* block)
     {
+        NamespaceGuard guard(*this, nullptr);
         uint32_t scopeId = m_currentScope;
         for (const auto& stmt : block->statements)
         {
-            if (auto* decl = dynamic_cast<VarDecl*>(stmt.get()))
+            if (auto* s = dynamic_cast<UsingNamespaceStmt*>(stmt.get()))
+                m_ns = s->scope.get();
+            else if (auto* decl = dynamic_cast<VarDecl*>(stmt.get()))
                 GenerateVarDeclHosingAlloc(decl);
             else if (auto* s = dynamic_cast<IfStmt*>(stmt.get()))
             {
@@ -2295,13 +2306,16 @@ private:
     
     void GenerateBlock(BlockStmt* block, const TypeInfo& returnType)
     {
+        NamespaceGuard guard(*this, nullptr);
         uint32_t scopeId = m_currentScope;
         for (const auto& stmt : block->statements)
         {
             if (m_builder.GetInsertBlock()->hasTerminator())
                 break;
 
-            if (auto* s = dynamic_cast<VarDecl*>(stmt.get()))
+            if (auto* s = dynamic_cast<UsingNamespaceStmt*>(stmt.get()))
+                m_ns = s->scope.get();
+            else if (auto* s = dynamic_cast<VarDecl*>(stmt.get()))
                 GenerateVarDecl(s);
             else if (auto* s = dynamic_cast<ExprStmt*>(stmt.get()))
                 GenerateExprStmt(s);
